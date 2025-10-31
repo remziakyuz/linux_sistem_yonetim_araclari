@@ -1,0 +1,2 @@
+Her bir paket icin internete ihtiyacı ortadan kaldırmak için yerel repoya tüm paketler indirilir.
+
