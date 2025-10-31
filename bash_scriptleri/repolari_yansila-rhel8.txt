@@ -1,2 +1,6 @@
 Her bir paket icin internete ihtiyacı ortadan kaldırmak için yerel repoya tüm paketler indirilir.
 
+scripti çalıştırmadan repolist.txt dosyasına yansılanacak repoları yazınız.
+
+REPOLIST_FILE="/root/bin/repolist.txt"
+
