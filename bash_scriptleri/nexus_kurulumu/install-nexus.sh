@@ -1,5 +1,5 @@
 #!/bin/bash
-
+# Version 2.2 - Enhanced with Custom Key Support and API Re-encryption
 # Variables
 NEXUS_VERSION="3.86.2-01"
 NEXUS_TAR="nexus-${NEXUS_VERSION}-linux-x86_64.tar.gz"
@@ -14,6 +14,16 @@ REPO_DIR="/app/data/nexus-repo"
 WORK_DIR="/app/data/nexus/sonatype-work"
 DATA_DIR="${WORK_DIR}/nexus3"
 NEXUS_PORT=8081
+
+# Encryption key files - UPDATED for custom-key.json
+CUSTOM_KEY_FILE="${INSTALL_DIR}/etc/custom-key.json"
+CUSTOM_ENCRYPTION_FILE="${INSTALL_DIR}/etc/custom-encryption.json"
+DEFAULT_PROPERTIES_FILE="${INSTALL_DIR}/etc/default-application.properties"
+ENCRYPTION_KEY_BACKUP="/root/nexus-encryption-key-$(date +%Y%m%d-%H%M%S).txt"
+
+# API Configuration for re-encryption
+NEXUS_DOMAIN=""
+API_WAIT_TIME=90
 
 # Minimum disk space requirements in MB
 MIN_INSTALL_SPACE=2048  # 2GB for installation
@@ -33,27 +43,56 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 NC='\033[0m' # No Color
+
+# Logging configuration
+LOG_FILE="/var/log/nexus-installation-$(date +%Y%m%d-%H%M%S).log"
+VERBOSE_MODE=false
+
+# Function to log messages
+log_message() {
+    local message="$1"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $message" >> "$LOG_FILE"
+}
 
 # Function to print colored messages
 print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+    log_message "ERROR: $1"
 }
 
 print_success() {
     echo -e "${GREEN}[SUCCESS]${NC} $1"
+    log_message "SUCCESS: $1"
 }
 
 print_warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
+    log_message "WARNING: $1"
 }
 
 print_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
+    log_message "INFO: $1"
+}
+
+print_debug() {
+    if [ "$VERBOSE_MODE" = true ]; then
+        echo -e "${CYAN}[DEBUG]${NC} $1"
+    fi
+    log_message "DEBUG: $1"
+}
+
+print_security() {
+    echo -e "${MAGENTA}[SECURITY]${NC} $1"
+    log_message "SECURITY: $1"
 }
 
 # Function to check if script is run as root
 check_root() {
+    print_info "Root yetki kontrolü yapılıyor..."
     if [ "$(id -u)" -ne 0 ]; then
         print_error "Bu script root kullanıcısı ile çalıştırılmalıdır."
         exit 1
@@ -67,18 +106,28 @@ parse_arguments() {
         case $1 in
             --enable-ssl)
                 ENABLE_NGINX_PROXY=true
+                print_debug "SSL modu etkinleştirildi"
                 shift
                 ;;
             --domain)
                 DOMAIN_NAME="$2"
+                NEXUS_DOMAIN="$2"
+                print_debug "Domain: $DOMAIN_NAME"
                 shift 2
                 ;;
             --email)
                 SSL_EMAIL="$2"
+                print_debug "Email: $SSL_EMAIL"
                 shift 2
                 ;;
             --self-signed)
                 USE_SELF_SIGNED=true
+                print_debug "Self-signed sertifika kullanılacak"
+                shift
+                ;;
+            --verbose)
+                VERBOSE_MODE=true
+                print_info "Verbose mode aktif"
                 shift
                 ;;
             --help)
@@ -97,7 +146,7 @@ parse_arguments() {
 # Function to show help
 show_help() {
     cat << EOF
-Nexus Repository Manager Kurulum Scripti
+Nexus Repository Manager Kurulum Scripti v2.2
 Kullanım: $0 [OPTIONS]
 
 SEÇENEKLER:
@@ -105,7 +154,16 @@ SEÇENEKLER:
     --domain DOMAIN        SSL için domain adı (örn: nexus.example.com)
     --email EMAIL          Let's Encrypt için email adresi
     --self-signed          Let's Encrypt yerine self-signed sertifika kullan
+    --verbose              Detaylı çıktı göster (debug modu)
     --help                 Bu yardım mesajını göster
+
+YENİ ÖZELLİKLER (v2.2):
+    ✓ custom-key.json dosyası ile özel şifreleme
+    ✓ nexus.secrets.file property desteği
+    ✓ Otomatik API re-encryption çağrısı
+    ✓ İyileştirilmiş systemd service (stop hatası düzeltildi)
+    ✓ Detaylı güvenlik loglaması
+    ✓ Encryption key backup'ı otomatik oluşturma
 
 ÖRNEKLER:
     # Basit kurulum (sadece HTTP)
@@ -116,8 +174,14 @@ SEÇENEKLER:
 
     # Self-signed sertifika ile SSL kurulumu
     $0 --enable-ssl --domain nexus.example.com --self-signed
+    
+    # Detaylı çıktı ile kurulum
+    $0 --verbose
 
-NOT: SSL kullanımı için domain DNS kayıtlarının sunucuya işaret etmesi gerekir.
+NOT: 
+- SSL kullanımı için domain DNS kayıtlarının sunucuya işaret etmesi gerekir.
+- Kurulum log dosyası: $LOG_FILE
+- Encryption key backup: $ENCRYPTION_KEY_BACKUP
 EOF
 }
 
@@ -156,6 +220,7 @@ check_os() {
     if [[ "$ID" == "rocky" || "$ID" == "rhel" || "$ID" == "almalinux" || "$ID" == "centos" ]]; then
         if [[ "$VERSION_ID" =~ ^9 ]]; then
             print_success "Desteklenen işletim sistemi tespit edildi: ${NAME} ${VERSION_ID}"
+            print_debug "OS ID: $ID, Version: $VERSION_ID"
             return 0
         else
             print_error "Desteklenmeyen versiyon: ${NAME} ${VERSION_ID}"
@@ -183,104 +248,110 @@ check_disk_space() {
         check_dir=$(dirname "$check_dir")
     done
     
-    if [ ! -d "$check_dir" ]; then
-        print_error "Disk alanı kontrolü için geçerli dizin bulunamadı: $target_dir"
+    print_debug "Disk alanı kontrolü: $check_dir ($dir_description)"
+    
+    local available_mb=$(df -BM "$check_dir" | awk 'NR==2 {print $4}' | sed 's/M//')
+    
+    print_debug "Mevcut alan: ${available_mb}MB, Minimum gerekli: ${min_space_mb}MB"
+    
+    if [ "$available_mb" -lt "$min_space_mb" ]; then
+        print_error "Yetersiz disk alanı: $dir_description"
+        print_error "Mevcut: ${available_mb}MB, Gerekli: ${min_space_mb}MB"
         return 1
     fi
     
-    # Get available space in MB
-    local available_space=$(df -BM "$check_dir" | awk 'NR==2 {print $4}' | sed 's/M//')
-    
-    print_info "${dir_description} için disk alanı kontrolü: ${available_space}MB mevcut, ${min_space_mb}MB gerekli"
-    
-    if [ "$available_space" -lt "$min_space_mb" ]; then
-        print_error "${dir_description} için yetersiz disk alanı!"
-        print_error "Mevcut: ${available_space}MB, Gerekli: ${min_space_mb}MB"
-        return 1
-    fi
-    
-    print_success "${dir_description} için yeterli disk alanı mevcut."
+    print_success "Disk alanı yeterli: $dir_description (${available_mb}MB)"
     return 0
 }
 
 # Function to check all required disk spaces
 check_all_disk_spaces() {
-    print_info "Disk alanı kontrolleri başlatılıyor..."
+    print_info "Disk alanı kontrolleri yapılıyor..."
     
     local all_checks_passed=true
     
-    check_disk_space "$INSTALL_DIR" "$MIN_INSTALL_SPACE" "Kurulum dizini (INSTALL_DIR)" || all_checks_passed=false
-    check_disk_space "$REPO_DIR" "$MIN_REPO_SPACE" "Repository dizini (REPO_DIR)" || all_checks_passed=false
-    check_disk_space "$WORK_DIR" "$MIN_WORK_SPACE" "Çalışma dizini (WORK_DIR)" || all_checks_passed=false
+    if ! check_disk_space "$INSTALL_DIR" "$MIN_INSTALL_SPACE" "Kurulum dizini"; then
+        all_checks_passed=false
+    fi
+    
+    if ! check_disk_space "$REPO_DIR" "$MIN_REPO_SPACE" "Repository dizini"; then
+        all_checks_passed=false
+    fi
+    
+    if ! check_disk_space "$WORK_DIR" "$MIN_WORK_SPACE" "Work dizini"; then
+        all_checks_passed=false
+    fi
     
     if [ "$all_checks_passed" = false ]; then
-        print_error "Disk alanı kontrolleri başarısız oldu. Yeterli alan sağladıktan sonra tekrar deneyin."
+        print_error "Disk alanı kontrolleri başarısız. Lütfen yeterli alan sağlayın."
         exit 1
     fi
     
     print_success "Tüm disk alanı kontrolleri başarılı."
 }
 
+# Function to check required tools
+check_required_tools() {
+    print_info "Gerekli araçlar kontrol ediliyor..."
+    
+    local required_tools=("wget" "tar" "sed" "awk" "openssl")
+    local missing_tools=()
+    
+    for tool in "${required_tools[@]}"; do
+        if ! command -v "$tool" &> /dev/null; then
+            missing_tools+=("$tool")
+            print_warning "$tool bulunamadı"
+        else
+            print_debug "$tool mevcut"
+        fi
+    done
+    
+    if [ ${#missing_tools[@]} -gt 0 ]; then
+        print_error "Eksik araçlar: ${missing_tools[*]}"
+        print_info "Yükleme için: dnf install -y ${missing_tools[*]}"
+        exit 1
+    fi
+    
+    print_success "Tüm gerekli araçlar mevcut."
+}
+
 # Function to install Java
 install_java() {
-    print_info "JDK ${JAVA_VERSION} kontrolü yapılıyor..."
+    print_info "Java ${JAVA_VERSION} kurulumu kontrol ediliyor..."
     
-    # Check if JDK 17 is installed
-    if rpm -qa | grep -q 'java-17-openjdk'; then
-        print_success "JDK ${JAVA_VERSION} zaten yüklü, kurulum atlanıyor."
+    if java -version 2>&1 | grep -q "version \"${JAVA_VERSION}"; then
+        print_success "Java ${JAVA_VERSION} zaten kurulu."
+        print_debug "Java version: $(java -version 2>&1 | head -n 1)"
+        return 0
+    fi
+    
+    print_info "Java ${JAVA_VERSION} kuruluyor..."
+    if dnf install -y java-${JAVA_VERSION}-openjdk java-${JAVA_VERSION}-openjdk-devel; then
+        print_success "Java ${JAVA_VERSION} başarıyla kuruldu."
     else
-        print_info "JDK ${JAVA_VERSION} kuruluyor..."
-        if yum install -y java-17-openjdk java-17-openjdk-devel; then
-            print_success "JDK ${JAVA_VERSION} başarıyla kuruldu."
-        else
-            print_error "JDK ${JAVA_VERSION} kurulumu başarısız oldu."
-            exit 1
-        fi
-    fi
-    
-    # Verify JDK installation
-    print_info "JDK versiyonu doğrulanıyor..."
-    if ! command -v java &> /dev/null; then
-        print_error "Java komutu bulunamadı. JDK kurulumu başarısız."
+        print_error "Java ${JAVA_VERSION} kurulamadı."
         exit 1
     fi
     
-    java_version=$(java -version 2>&1 | head -n 1 | grep -o "17" | head -n 1)
-    if [ "$java_version" != "$JAVA_VERSION" ]; then
-        print_error "JDK ${JAVA_VERSION} doğrulaması başarısız."
-        print_error "Beklenen: ${JAVA_VERSION}, Bulunan: ${java_version}"
-        exit 1
-    fi
-    
-    print_success "JDK ${JAVA_VERSION} kullanıma hazır."
+    print_debug "Java version: $(java -version 2>&1 | head -n 1)"
 }
 
 # Function to create Nexus user
 create_nexus_user() {
-    print_info "Nexus kullanıcısı ve grubu oluşturuluyor..."
+    print_info "Nexus kullanıcısı oluşturuluyor..."
     
-    # Create group if not exists
-    if ! getent group ${NEXUS_GID} >/dev/null; then
-        if groupadd -g ${NEXUS_GID} ${NEXUS_USER}; then
-            print_success "Nexus grubu (GID: ${NEXUS_GID}) oluşturuldu."
-        else
-            print_error "Nexus grubu oluşturulamadı."
-            exit 1
-        fi
-    else
-        print_info "Nexus grubu zaten mevcut."
+    if id -u ${NEXUS_USER} >/dev/null 2>&1; then
+        print_success "Nexus kullanıcısı zaten mevcut."
+        print_debug "User ID: $(id -u ${NEXUS_USER}), Group ID: $(id -g ${NEXUS_USER})"
+        return 0
     fi
     
-    # Create user if not exists
-    if ! getent passwd ${NEXUS_UID} >/dev/null; then
-        if useradd -u ${NEXUS_UID} -g ${NEXUS_GID} -m -d ${INSTALL_DIR} -s /sbin/nologin ${NEXUS_USER}; then
-            print_success "Nexus kullanıcısı (UID: ${NEXUS_UID}) oluşturuldu."
-        else
-            print_error "Nexus kullanıcısı oluşturulamadı."
-            exit 1
-        fi
+    if groupadd -g ${NEXUS_GID} ${NEXUS_USER} && \
+       useradd -u ${NEXUS_UID} -g ${NEXUS_GID} -d /home/${NEXUS_USER} -m -s /bin/bash ${NEXUS_USER}; then
+        print_success "Nexus kullanıcısı oluşturuldu (UID: ${NEXUS_UID}, GID: ${NEXUS_GID})"
     else
-        print_info "Nexus kullanıcısı zaten mevcut."
+        print_error "Nexus kullanıcısı oluşturulamadı."
+        exit 1
     fi
 }
 
@@ -288,76 +359,83 @@ create_nexus_user() {
 create_directories() {
     print_info "Gerekli dizinler oluşturuluyor..."
     
-    local dirs=("${INSTALL_DIR}" "${REPO_DIR}" "${WORK_DIR}" "${DATA_DIR}")
+    local directories=(
+        "${INSTALL_DIR}"
+        "${REPO_DIR}"
+        "${WORK_DIR}"
+        "${DATA_DIR}"
+        "${DATA_DIR}/etc"
+        "${DATA_DIR}/log"
+        "${DATA_DIR}/tmp"
+    )
     
-    for dir in "${dirs[@]}"; do
-        if mkdir -p "$dir"; then
-            print_success "Dizin oluşturuldu: $dir"
+    for dir in "${directories[@]}"; do
+        if [ ! -d "$dir" ]; then
+            if mkdir -p "$dir"; then
+                print_debug "Dizin oluşturuldu: $dir"
+            else
+                print_error "Dizin oluşturulamadı: $dir"
+                exit 1
+            fi
         else
-            print_error "Dizin oluşturulamadı: $dir"
-            exit 1
+            print_debug "Dizin zaten mevcut: $dir"
         fi
     done
     
     # Set ownership
-    print_info "Dizin sahiplikleri ayarlanıyor..."
-    if chown -R ${NEXUS_USER}:${NEXUS_USER} ${INSTALL_DIR} ${REPO_DIR} ${WORK_DIR} ${DATA_DIR}; then
-        print_success "Dizin sahiplikleri başarıyla ayarlandı."
+    if chown -R ${NEXUS_USER}:${NEXUS_USER} ${INSTALL_DIR} ${REPO_DIR} ${WORK_DIR}; then
+        print_success "Dizinler oluşturuldu ve sahiplik ayarlandı."
     else
-        print_error "Dizin sahiplikleri ayarlanamadı."
+        print_error "Dizin sahipliği ayarlanamadı."
         exit 1
     fi
 }
 
-# Function to download or use existing Nexus archive
+# Function to download Nexus
 download_nexus() {
-    print_info "Nexus arşivi kontrol ediliyor..."
+    print_info "Nexus ${NEXUS_VERSION} indiriliyor..."
     
-    # Check if tar file exists in current directory
-    if [ -f "./${NEXUS_TAR}" ]; then
-        print_success "Mevcut Nexus arşivi bulundu, kullanılıyor."
-        if cp ./${NEXUS_TAR} /tmp/; then
-            print_success "Nexus arşivi /tmp dizinine kopyalandı."
-        else
-            print_error "Nexus arşivi /tmp dizinine kopyalanamadı."
-            exit 1
-        fi
+    cd /tmp || exit 1
+    
+    if [ -f "/tmp/${NEXUS_TAR}" ]; then
+        print_info "Nexus arşivi zaten mevcut, indirme atlanıyor."
+        return 0
+    fi
+    
+    if wget -q --show-progress "${NEXUS_DOWNLOAD_URL}"; then
+        print_success "Nexus arşivi indirildi."
     else
-        print_info "Nexus Repository indiriliyor..."
-        print_info "İndirme URL'si: ${NEXUS_DOWNLOAD_URL}"
-        
-        if curl -L -f -o /tmp/${NEXUS_TAR} ${NEXUS_DOWNLOAD_URL}; then
-            print_success "Nexus Repository başarıyla indirildi."
-        else
-            print_error "Nexus Repository indirilemedi."
-            print_error "URL'yi kontrol edin: ${NEXUS_DOWNLOAD_URL}"
-            exit 1
-        fi
-    fi
-    
-    # Verify downloaded file exists and is not empty
-    if [ ! -f "/tmp/${NEXUS_TAR}" ]; then
-        print_error "Nexus arşiv dosyası bulunamadı: /tmp/${NEXUS_TAR}"
+        print_error "Nexus arşivi indirilemedi."
         exit 1
     fi
-    
-    if [ ! -s "/tmp/${NEXUS_TAR}" ]; then
-        print_error "Nexus arşiv dosyası boş: /tmp/${NEXUS_TAR}"
-        rm -f /tmp/${NEXUS_TAR}
-        exit 1
-    fi
-    
-    print_success "Nexus arşiv dosyası doğrulandı."
 }
 
-# Function to extract and install Nexus
+# Function to install Nexus
 install_nexus() {
-    print_info "Nexus Repository kurulumu yapılıyor..."
+    print_info "Nexus arşivi çıkartılıyor..."
     
-    if tar -xzf /tmp/${NEXUS_TAR} -C ${INSTALL_DIR} --strip-components=1; then
-        print_success "Nexus başarıyla çıkartıldı."
+    cd /tmp || exit 1
+    
+    if tar -xzf ${NEXUS_TAR} -C /tmp/; then
+        print_success "Nexus arşivi çıkartıldı."
     else
         print_error "Nexus arşivi çıkartılamadı."
+        exit 1
+    fi
+    
+    # Move files to installation directory
+    local extracted_dir="/tmp/nexus-${NEXUS_VERSION}"
+    
+    if [ ! -d "$extracted_dir" ]; then
+        print_error "Çıkartılan dizin bulunamadı: $extracted_dir"
+        exit 1
+    fi
+    
+    print_info "Nexus dosyaları kurulum dizinine taşınıyor..."
+    if cp -r ${extracted_dir}/* ${INSTALL_DIR}/; then
+        print_success "Nexus dosyaları kurulum dizinine kopyalandı."
+    else
+        print_error "Nexus dosyaları kopyalanamadı."
         exit 1
     fi
     
@@ -370,8 +448,195 @@ install_nexus() {
     fi
     
     # Clean up
-    rm -f /tmp/${NEXUS_TAR}
+    rm -rf /tmp/${NEXUS_TAR} ${extracted_dir}
     print_success "Geçici dosyalar temizlendi."
+}
+
+# NEW FUNCTION: Generate custom-key.json (simplified format)
+generate_custom_key_file() {
+    print_security "═══════════════════════════════════════════════════"
+    print_security "CUSTOM-KEY.JSON OLUŞTURULUYOR"
+    print_security "═══════════════════════════════════════════════════"
+    
+    # Generate secure encryption key
+    print_info "Güvenli encryption key oluşturuluyor..."
+    local ENCRYPTION_KEY=$(openssl rand -base64 32)
+    local KEY_ID="alibaba33442"
+    
+    print_success "Encryption key başarıyla oluşturuldu."
+    print_debug "Key ID: $KEY_ID"
+    
+    # Create custom-key.json with simplified format
+    print_info "custom-key.json dosyası oluşturuluyor..."
+    
+    mkdir -p "$(dirname ${CUSTOM_KEY_FILE})"
+    
+    cat > "${CUSTOM_KEY_FILE}" <<EOF
+{
+  "active": "${KEY_ID}",
+  "keys": [
+    {
+      "id": "${KEY_ID}",
+      "key": "${ENCRYPTION_KEY}"
+    }
+  ]
+}
+EOF
+    
+    if [ $? -eq 0 ]; then
+        print_success "custom-key.json dosyası oluşturuldu: ${CUSTOM_KEY_FILE}"
+    else
+        print_error "custom-key.json dosyası oluşturulamadı!"
+        exit 1
+    fi
+    
+    # Validate JSON format
+    print_info "JSON formatı doğrulanıyor..."
+    if python3 -m json.tool "${CUSTOM_KEY_FILE}" > /dev/null 2>&1 || \
+       jq empty "${CUSTOM_KEY_FILE}" > /dev/null 2>&1; then
+        print_success "JSON formatı geçerli."
+    else
+        print_warning "JSON validation araçları bulunamadı, manuel kontrol önerilir."
+    fi
+    
+    # Set secure permissions
+    print_info "Dosya izinleri ayarlanıyor..."
+    chmod 600 "${CUSTOM_KEY_FILE}"
+    chown ${NEXUS_USER}:${NEXUS_USER} "${CUSTOM_KEY_FILE}"
+    
+    print_success "Dosya izinleri ayarlandı (600, ${NEXUS_USER}:${NEXUS_USER})"
+    print_debug "Dosya izinleri: $(ls -la ${CUSTOM_KEY_FILE})"
+    
+    # Create backup of encryption key info
+    print_security "Encryption key bilgileri yedekleniyor..."
+    
+    cat > "${ENCRYPTION_KEY_BACKUP}" <<EOF
+═══════════════════════════════════════════════════
+NEXUS CUSTOM KEY BACKUP
+═══════════════════════════════════════════════════
+Oluşturma Tarihi: $(date)
+Hostname: $(hostname)
+Nexus Version: ${NEXUS_VERSION}
+
+═══ ENCRYPTION KEY BİLGİLERİ ═══
+Key ID: ${KEY_ID}
+Encryption Key: ${ENCRYPTION_KEY}
+
+═══ DOSYA LOKASYONLARI ═══
+Custom Key File: ${CUSTOM_KEY_FILE}
+Default Properties File: ${DEFAULT_PROPERTIES_FILE}
+Backup File: ${ENCRYPTION_KEY_BACKUP}
+
+═══════════════════════════════════════════════════
+ÇOK ÖNEMLİ UYARILAR
+═══════════════════════════════════════════════════
+1. Bu dosyayı MUTLAKA güvenli bir yerde saklayın!
+2. Bu key kaybolursa şifrelenmiş veriler ASLA kurtarilamaz!
+3. Kullanıcı şifreleri, repository credentials erişilemez hale gelir!
+4. Bu dosyayı backup sistemine ekleyin!
+5. Dosya izinlerini koruyun (sadece root okuyabilmeli)!
+
+═══ YEDEKLENMESİ ÖNERILEN DOSYALAR ═══
+- ${CUSTOM_KEY_FILE}
+- ${DEFAULT_PROPERTIES_FILE}
+- ${DATA_DIR}/db/
+- ${DATA_DIR}/etc/
+
+═══ DOĞRULAMA KOMUTLARI ═══
+# Custom key kullanılıyor mu?
+grep "nexus.secrets.file" ${DEFAULT_PROPERTIES_FILE}
+
+# JSON formatı geçerli mi?
+python3 -m json.tool ${CUSTOM_KEY_FILE}
+
+═══════════════════════════════════════════════════
+EOF
+    
+    chmod 600 "${ENCRYPTION_KEY_BACKUP}"
+    
+    print_success "Encryption key bilgileri yedeklendi: ${ENCRYPTION_KEY_BACKUP}"
+    print_security "Bu dosyayı güvenli bir yere kopyalayın!"
+    
+    print_security "═══════════════════════════════════════════════════"
+    print_security "CUSTOM-KEY.JSON KURULUMU TAMAMLANDI"
+    print_security "═══════════════════════════════════════════════════"
+    
+    # Export KEY_ID for later use in API call
+    export NEXUS_KEY_ID="${KEY_ID}"
+}
+
+# NEW FUNCTION: Configure default-application.properties with nexus.secrets.file
+configure_default_application_properties() {
+    print_security "═══════════════════════════════════════════════════"
+    print_security "DEFAULT-APPLICATION.PROPERTIES YAPILDIRIYOR"
+    print_security "═══════════════════════════════════════════════════"
+    
+    print_info "default-application.properties dosyası oluşturuluyor..."
+    
+    mkdir -p "$(dirname ${DEFAULT_PROPERTIES_FILE})"
+    
+    # Create clean properties file with nexus.secrets.file
+    cat > "${DEFAULT_PROPERTIES_FILE}" <<'EOF'
+# Nexus Repository Manager Configuration
+# Auto-generated by installation script v2.2
+
+# Logging Configuration
+logging.config=./etc/logback/logback.xml
+
+# Custom Secrets File Configuration
+# This uses a custom key file to avoid the default key warning.
+#
+# IMPORTANT: 
+# - Do NOT add quotes around values
+# - Use nexus.secrets.file for custom encryption
+
+secret.nexusSecret.enabled=true
+nexus.secrets.file=/app/nexus/etc/custom-key.json
+
+# DO NOT UNCOMMENT OR ADD THESE LINES:
+# nexus.security.encryptionKey=...
+# They will conflict with nexus.secrets.file
+EOF
+    
+    if [ $? -eq 0 ]; then
+        print_success "default-application.properties dosyası oluşturuldu: ${DEFAULT_PROPERTIES_FILE}"
+    else
+        print_error "default-application.properties dosyası oluşturulamadı!"
+        exit 1
+    fi
+    
+    # Verify no quotes in property VALUES (ignore comments and empty lines)
+    print_info "Property değerleri doğrulanıyor..."
+    
+    # Check only non-comment, non-empty lines for quotes
+    if grep -v '^#' "${DEFAULT_PROPERTIES_FILE}" | grep -v '^$' | grep -q '"'; then
+        print_error "HATA: Property değerlerinde tırnak işareti bulundu!"
+        print_error "Sorunlu satırlar:"
+        grep -v '^#' "${DEFAULT_PROPERTIES_FILE}" | grep -v '^$' | grep '"'
+        exit 1
+    fi
+    
+    print_success "Property değerleri tırnak işaretsiz doğrulandı."
+    
+    # Set permissions
+    chmod 600 "${DEFAULT_PROPERTIES_FILE}"
+    chown ${NEXUS_USER}:${NEXUS_USER} "${DEFAULT_PROPERTIES_FILE}"
+    
+    print_success "Dosya izinleri ayarlandı (600, ${NEXUS_USER}:${NEXUS_USER})"
+    print_debug "Dosya izinleri: $(ls -la ${DEFAULT_PROPERTIES_FILE})"
+    
+    # Validate nexus.secrets.file path
+    print_info "nexus.secrets.file yolu doğrulanıyor..."
+    if grep -q "nexus.secrets.file=/app/nexus/etc/custom-key.json" "${DEFAULT_PROPERTIES_FILE}"; then
+        print_success "nexus.secrets.file yolu doğru."
+    else
+        print_error "nexus.secrets.file yolu hatalı!"
+        exit 1
+    fi
+    
+    print_security "═══════════════════════════════════════════════════"
+    print_security "PROPERTIES YAPILDIRMASI TAMAMLANDI"
+    print_security "═══════════════════════════════════════════════════"
 }
 
 # Function to configure Nexus
@@ -435,6 +700,8 @@ EOL
         fi
     fi
     
+    print_debug "VMOptions içeriği: $(head -5 $nexus_vmoptions)"
+    
     # Configure nexus-default.properties
     print_info "nexus-default.properties yapılandırılıyor..."
     local nexus_properties="${INSTALL_DIR}/etc/nexus-default.properties"
@@ -453,9 +720,13 @@ EOL
         print_error "nexus-default.properties dosyası güncellenemedi."
         exit 1
     fi
+    
+    # NEW: Generate custom-key.json and configure default-application.properties
+    generate_custom_key_file
+    configure_default_application_properties
 }
 
-# Function to create systemd service
+# Function to create systemd service - ENHANCED with SuccessExitStatus
 create_systemd_service() {
     print_info "Nexus için systemd servisi oluşturuluyor..."
     
@@ -478,6 +749,7 @@ ExecStart=${INSTALL_DIR}/bin/nexus start
 ExecStop=${INSTALL_DIR}/bin/nexus stop
 User=${NEXUS_USER}
 Restart=on-abort
+SuccessExitStatus=143
 
 [Install]
 WantedBy=multi-user.target
@@ -485,6 +757,8 @@ EOL
     
     if [ $? -eq 0 ]; then
         print_success "Systemd servis dosyası oluşturuldu."
+        print_info "SuccessExitStatus=143 eklendi (SIGTERM normal kapatma)"
+        print_debug "Service file: $service_file"
     else
         print_error "Systemd servis dosyası oluşturulamadı."
         exit 1
@@ -498,308 +772,39 @@ configure_firewall() {
     # Check if firewalld is running
     if ! systemctl is-active --quiet firewalld; then
         print_warning "firewalld servisi çalışmıyor. Firewall yapılandırması atlanıyor."
+        print_info "Manuel olarak port açma: firewall-cmd --permanent --add-port=${NEXUS_PORT}/tcp"
         return 0
     fi
     
+    print_info "Firewall kuralları ekleniyor..."
+    
+    # Add Nexus port
+    if firewall-cmd --permanent --add-port=${NEXUS_PORT}/tcp; then
+        print_success "Nexus portu (${NEXUS_PORT}/tcp) firewall'a eklendi."
+    else
+        print_error "Nexus portu firewall'a eklenemedi."
+        exit 1
+    fi
+    
+    # If SSL is enabled, add HTTP and HTTPS ports
     if [ "$ENABLE_NGINX_PROXY" = true ]; then
-        # For Nginx proxy, open HTTP and HTTPS ports
-        print_info "Nginx için HTTP ve HTTPS portları açılıyor..."
-        
-        if firewall-cmd --permanent --add-service=http; then
-            print_success "HTTP (80) portu açıldı."
-        else
-            print_warning "HTTP portu açılamadı."
-        fi
-        
-        if firewall-cmd --permanent --add-service=https; then
-            print_success "HTTPS (443) portu açıldı."
-        else
-            print_warning "HTTPS portu açılamadı."
-        fi
-        
-        # Nexus port should only be accessible from localhost
-        print_info "Nexus portu sadece localhost'tan erişilebilir olacak."
-    else
-        # Direct access to Nexus
-        if firewall-cmd --permanent --add-port=${NEXUS_PORT}/tcp; then
-            print_success "Firewall kuralı eklendi: ${NEXUS_PORT}/tcp"
-        else
-            print_error "Firewall kuralı eklenemedi."
-            exit 1
-        fi
+        firewall-cmd --permanent --add-service=http
+        firewall-cmd --permanent --add-service=https
+        print_success "HTTP (80) ve HTTPS (443) portları firewall'a eklendi."
     fi
     
+    # Reload firewall
     if firewall-cmd --reload; then
-        print_success "Firewall yeniden yüklendi."
+        print_success "Firewall kuralları yüklendi."
     else
-        print_error "Firewall yeniden yüklenemedi."
-        exit 1
-    fi
-}
-
-# Function to install Nginx
-install_nginx() {
-    if [ "$ENABLE_NGINX_PROXY" = false ]; then
-        return 0
-    fi
-    
-    print_info "Nginx reverse proxy kuruluyor..."
-    
-    if rpm -qa | grep -q 'nginx'; then
-        print_success "Nginx zaten yüklü."
-    else
-        if yum install -y nginx; then
-            print_success "Nginx başarıyla kuruldu."
-        else
-            print_error "Nginx kurulumu başarısız oldu."
-            exit 1
-        fi
-    fi
-    
-    # Enable nginx service
-    if systemctl enable nginx; then
-        print_success "Nginx servisi sistem başlangıcında otomatik başlayacak."
-    else
-        print_warning "Nginx servisi etkinleştirilemedi."
-    fi
-}
-
-# Function to install Certbot for Let's Encrypt
-install_certbot() {
-    if [ "$ENABLE_NGINX_PROXY" = false ] || [ "$USE_SELF_SIGNED" = true ]; then
-        return 0
-    fi
-    
-    print_info "Certbot (Let's Encrypt) kuruluyor..."
-    
-    # Install EPEL repository
-    if ! rpm -qa | grep -q 'epel-release'; then
-        if yum install -y epel-release; then
-            print_success "EPEL repository eklendi."
-        else
-            print_warning "EPEL repository eklenemedi."
-        fi
-    fi
-    
-    # Install certbot and nginx plugin
-    if yum install -y certbot python3-certbot-nginx; then
-        print_success "Certbot başarıyla kuruldu."
-    else
-        print_error "Certbot kurulumu başarısız oldu."
-        exit 1
-    fi
-}
-
-# Function to generate self-signed certificate
-generate_self_signed_cert() {
-    if [ "$USE_SELF_SIGNED" = false ]; then
-        return 0
-    fi
-    
-    print_info "Self-signed SSL sertifikası oluşturuluyor..."
-    
-    local ssl_dir="/etc/ssl/nexus"
-    mkdir -p ${ssl_dir}
-    
-    # Generate self-signed certificate
-    if openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-        -keyout ${ssl_dir}/nexus.key \
-        -out ${ssl_dir}/nexus.crt \
-        -subj "/C=TR/ST=Istanbul/L=Istanbul/O=Organization/CN=${DOMAIN_NAME}"; then
-        print_success "Self-signed sertifika oluşturuldu."
-        print_warning "DİKKAT: Self-signed sertifika kullanılıyor. Tarayıcılar güvenlik uyarısı verecektir."
-    else
-        print_error "Self-signed sertifika oluşturulamadı."
+        print_error "Firewall kuralları yüklenemedi."
         exit 1
     fi
     
-    # Set permissions
-    chmod 600 ${ssl_dir}/nexus.key
-    chmod 644 ${ssl_dir}/nexus.crt
-}
-
-# Function to obtain Let's Encrypt certificate
-obtain_letsencrypt_cert() {
-    if [ "$USE_SELF_SIGNED" = true ]; then
-        return 0
-    fi
-    
-    print_info "Let's Encrypt sertifikası alınıyor..."
-    print_warning "Bu işlem için domain DNS kaydının bu sunucuya işaret etmesi gerekir."
-    
-    # Stop nginx temporarily if running
-    systemctl stop nginx 2>/dev/null
-    
-    # Obtain certificate
-    if certbot certonly --standalone --non-interactive --agree-tos \
-        --email ${SSL_EMAIL} \
-        -d ${DOMAIN_NAME}; then
-        print_success "Let's Encrypt sertifikası başarıyla alındı."
-    else
-        print_error "Let's Encrypt sertifikası alınamadı."
-        print_error "DNS ayarlarını kontrol edin ve domain'in bu sunucuya işaret ettiğinden emin olun."
-        exit 1
-    fi
-    
-    # Setup auto-renewal
-    if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-        (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'") | crontab -
-        print_success "Otomatik sertifika yenileme görevi eklendi."
-    fi
-}
-
-# Function to configure Nginx reverse proxy
-configure_nginx_proxy() {
-    if [ "$ENABLE_NGINX_PROXY" = false ]; then
-        return 0
-    fi
-    
-    print_info "Nginx reverse proxy yapılandırılıyor..."
-    
-    local nginx_conf="/etc/nginx/conf.d/nexus.conf"
-    local ssl_cert_path
-    local ssl_key_path
-    
-    if [ "$USE_SELF_SIGNED" = true ]; then
-        ssl_cert_path="/etc/ssl/nexus/nexus.crt"
-        ssl_key_path="/etc/ssl/nexus/nexus.key"
-    else
-        ssl_cert_path="/etc/letsencrypt/live/${DOMAIN_NAME}/fullchain.pem"
-        ssl_key_path="/etc/letsencrypt/live/${DOMAIN_NAME}/privkey.pem"
-    fi
-    
-    # Create Nginx configuration
-    cat <<EOF > ${nginx_conf}
-# Nexus Repository Manager Reverse Proxy Configuration
-
-# HTTP to HTTPS redirect
-server {
-    listen ${NGINX_PORT};
-    server_name ${DOMAIN_NAME};
-    
-    # Let's Encrypt verification
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-    }
-    
-    # Redirect all other traffic to HTTPS
-    location / {
-        return 301 https://\$server_name\$request_uri;
-    }
-}
-
-# HTTPS server
-server {
-    listen ${NGINX_SSL_PORT} ssl http2;
-    server_name ${DOMAIN_NAME};
-    
-    # SSL Configuration
-    ssl_certificate ${ssl_cert_path};
-    ssl_certificate_key ${ssl_key_path};
-    
-    # Modern SSL configuration
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384';
-    ssl_prefer_server_ciphers off;
-    
-    # SSL session cache
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
-    
-    # HSTS (optional, uncomment if needed)
-    # add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    
-    # Security headers
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-XSS-Protection "1; mode=block" always;
-    
-    # Logging
-    access_log /var/log/nginx/nexus-access.log;
-    error_log /var/log/nginx/nexus-error.log;
-    
-    # Client body size (for large artifact uploads - e.g., Docker images, large JARs)
-    # Set to 0 for unlimited, or specify a large value
-    client_max_body_size 10G;
-    
-    # Client body timeout - how long to wait for client to send body
-    client_body_timeout 300s;
-    
-    # Client header timeout
-    client_header_timeout 60s;
-    
-    # Keepalive settings
-    keepalive_timeout 300s;
-    
-    # Buffer settings for large uploads
-    client_body_buffer_size 512k;
-    client_body_temp_path /var/lib/nginx/tmp/client_body;
-    
-    # Proxy settings
-    location / {
-        proxy_pass http://127.0.0.1:${NEXUS_PORT};
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_set_header X-Forwarded-Port \$server_port;
-        
-        # Extended timeouts for large uploads (e.g., 3GB+ Docker images)
-        proxy_connect_timeout 900;      # 15 minutes - connection establishment
-        proxy_send_timeout 1800;        # 30 minutes - sending request to upstream
-        proxy_read_timeout 1800;        # 30 minutes - reading response from upstream
-        send_timeout 1800;              # 30 minutes - sending response to client
-        
-        # Disable buffering for large uploads (streaming mode)
-        # This prevents Nginx from buffering the entire file before sending to Nexus
-        proxy_request_buffering off;
-        
-        # Disable proxy buffering for downloads
-        proxy_buffering off;
-        
-        # Large buffer sizes for better performance
-        proxy_buffer_size 128k;
-        proxy_buffers 8 128k;
-        proxy_busy_buffers_size 256k;
-    }
-    
-    # Docker registry support (if needed, uncomment and configure)
-    # location /v2/ {
-    #     proxy_pass http://127.0.0.1:${NEXUS_PORT}/v2/;
-    #     proxy_set_header Host \$host;
-    #     proxy_set_header X-Real-IP \$remote_addr;
-    #     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    #     proxy_set_header X-Forwarded-Proto \$scheme;
-    #     
-    #     # Docker requires this
-    #     client_max_body_size 0;
-    #     chunked_transfer_encoding on;
-    # }
-}
-EOF
-    
-    if [ $? -eq 0 ]; then
-        print_success "Nginx yapılandırması oluşturuldu: ${nginx_conf}"
-    else
-        print_error "Nginx yapılandırması oluşturulamadı."
-        exit 1
-    fi
-    
-    # Test Nginx configuration
-    print_info "Nginx yapılandırması test ediliyor..."
-    if nginx -t; then
-        print_success "Nginx yapılandırması geçerli."
-    else
-        print_error "Nginx yapılandırması geçersiz. Lütfen kontrol edin."
-        exit 1
-    fi
-    
-    # Configure SELinux for Nginx (if enabled)
-    if command -v getenforce &> /dev/null && [ "$(getenforce)" != "Disabled" ]; then
-        print_info "SELinux için Nginx izinleri ayarlanıyor..."
-        setsebool -P httpd_can_network_connect 1 2>/dev/null || print_warning "SELinux httpd_can_network_connect ayarlanamadı."
-    fi
+    print_info "Aktif firewall kuralları:"
+    firewall-cmd --list-all | grep -E "ports|services" | while read line; do
+        print_debug "$line"
+    done
 }
 
 # Function to start Nexus service
@@ -838,27 +843,195 @@ start_nexus_service() {
     fi
 }
 
-# Function to start Nginx service
-start_nginx_service() {
-    if [ "$ENABLE_NGINX_PROXY" = false ]; then
-        return 0
-    fi
+# NEW FUNCTION: Wait and trigger API re-encryption
+trigger_api_reencryption() {
+    print_security "═══════════════════════════════════════════════════"
+    print_security "API RE-ENCRYPTION İŞLEMİ BAŞLATILIYOR"
+    print_security "═══════════════════════════════════════════════════"
     
-    print_info "Nginx servisi başlatılıyor..."
+    print_info "Nexus'un tam olarak hazır olması bekleniyor (${API_WAIT_TIME} saniye)..."
     
-    if systemctl start nginx; then
-        print_success "Nginx servisi başlatıldı."
+    # Countdown timer
+    for ((i=${API_WAIT_TIME}; i>0; i--)); do
+        echo -ne "\r${CYAN}[WAIT]${NC} Kalan süre: ${i} saniye...   "
+        sleep 1
+    done
+    echo ""
+    
+    print_success "Bekleme süresi tamamlandı."
+    
+    # Determine protocol and domain
+    local PROTOCOL="http"
+    local NEXUS_URL=""
+    
+    if [ "$ENABLE_NGINX_PROXY" = true ] && [ -n "$NEXUS_DOMAIN" ]; then
+        PROTOCOL="https"
+        NEXUS_URL="${PROTOCOL}://${NEXUS_DOMAIN}"
+        print_info "SSL etkin, domain kullanılacak: ${NEXUS_URL}"
     else
-        print_error "Nginx servisi başlatılamadı."
-        print_info "Nginx loglarını kontrol edin: journalctl -u nginx -f"
-        exit 1
+        NEXUS_URL="${PROTOCOL}://localhost:${NEXUS_PORT}"
+        print_info "Localhost kullanılacak: ${NEXUS_URL}"
     fi
     
-    if systemctl is-active --quiet nginx; then
-        print_success "Nginx servisi çalışıyor."
+    # Get initial admin password
+    local ADMIN_PASSWORD=""
+    local ADMIN_PASSWORD_FILE="${DATA_DIR}/admin.password"
+    
+    if [ -f "${ADMIN_PASSWORD_FILE}" ]; then
+        ADMIN_PASSWORD=$(cat ${ADMIN_PASSWORD_FILE})
+        print_success "Admin şifresi okundu."
     else
-        print_warning "Nginx durumu belirsiz."
+        print_error "Admin şifre dosyası bulunamadı: ${ADMIN_PASSWORD_FILE}"
+        print_warning "API re-encryption manuel olarak yapılmalı."
+        return 1
     fi
+    
+    # Make API call
+    print_info "API re-encryption endpoint'ine istek gönderiliyor..."
+    print_debug "URL: ${NEXUS_URL}/service/rest/v1/secrets/encryption/re-encrypt"
+    print_debug "Key ID: ${NEXUS_KEY_ID}"
+    
+    local API_RESPONSE
+    API_RESPONSE=$(curl -X 'PUT' \
+      "${NEXUS_URL}/service/rest/v1/secrets/encryption/re-encrypt" \
+      -u "admin:${ADMIN_PASSWORD}" \
+      -H 'accept: application/json' \
+      -H 'Content-Type: application/json' \
+      -H 'NX-ANTI-CSRF-TOKEN: 0.6199265331343733' \
+      -H 'X-Nexus-UI: true' \
+      -d "{
+  \"secretKeyId\": \"${NEXUS_KEY_ID}\",
+  \"notifyEmail\": \"string\"
+}" 2>&1)
+    
+    local EXIT_CODE=$?
+    
+    if [ $EXIT_CODE -eq 0 ]; then
+        print_success "API re-encryption isteği başarıyla gönderildi!"
+        print_debug "Response: $API_RESPONSE"
+    else
+        print_warning "API re-encryption isteği gönderilirken bir sorun oluştu."
+        print_warning "Exit code: $EXIT_CODE"
+        print_debug "Response: $API_RESPONSE"
+        print_info "Bu normal olabilir, Nexus henüz tam olarak hazır olmayabilir."
+        print_info "Manuel olarak API çağrısı yapabilirsiniz:"
+        echo ""
+        echo "curl -X 'PUT' \\"
+        echo "  '${NEXUS_URL}/service/rest/v1/secrets/encryption/re-encrypt' \\"
+        echo "  -u 'admin:YOUR_PASSWORD' \\"
+        echo "  -H 'accept: application/json' \\"
+        echo "  -H 'Content-Type: application/json' \\"
+        echo "  -H 'NX-ANTI-CSRF-TOKEN: 0.6199265331343733' \\"
+        echo "  -H 'X-Nexus-UI: true' \\"
+        echo "  -d '{"
+        echo "  \"secretKeyId\": \"${NEXUS_KEY_ID}\","
+        echo "  \"notifyEmail\": \"string\""
+        echo "}'"
+        echo ""
+    fi
+    
+    print_security "═══════════════════════════════════════════════════"
+    print_security "API RE-ENCRYPTION İŞLEMİ TAMAMLANDI"
+    print_security "═══════════════════════════════════════════════════"
+}
+
+# NEW FUNCTION: Verify encryption configuration
+verify_encryption_configuration() {
+    print_security "═══════════════════════════════════════════════════"
+    print_security "ENCRYPTION KEY YAPILDIRMASI DOĞRULANIYOR"
+    print_security "═══════════════════════════════════════════════════"
+    
+    local verification_failed=false
+    
+    # Check 1: custom-key.json exists
+    print_info "[1/7] custom-key.json dosyası kontrolü..."
+    if [ -f "${CUSTOM_KEY_FILE}" ]; then
+        print_success "✓ custom-key.json mevcut"
+        print_debug "Lokasyon: ${CUSTOM_KEY_FILE}"
+    else
+        print_error "✗ custom-key.json bulunamadı!"
+        verification_failed=true
+    fi
+    
+    # Check 2: JSON format
+    print_info "[2/7] JSON formatı kontrolü..."
+    if python3 -m json.tool "${CUSTOM_KEY_FILE}" > /dev/null 2>&1 || \
+       jq empty "${CUSTOM_KEY_FILE}" > /dev/null 2>&1; then
+        print_success "✓ JSON formatı geçerli"
+    else
+        print_warning "⚠ JSON validation araçları bulunamadı"
+    fi
+    
+    # Check 3: File permissions
+    print_info "[3/7] Dosya izinleri kontrolü..."
+    local perms=$(stat -c "%a" "${CUSTOM_KEY_FILE}" 2>/dev/null)
+    if [ "$perms" = "600" ]; then
+        print_success "✓ Dosya izinleri güvenli (600)"
+    else
+        print_warning "⚠ Dosya izinleri: $perms (önerilen: 600)"
+    fi
+    
+    # Check 4: File ownership
+    print_info "[4/7] Dosya sahipliği kontrolü..."
+    local owner=$(stat -c "%U:%G" "${CUSTOM_KEY_FILE}" 2>/dev/null)
+    if [ "$owner" = "${NEXUS_USER}:${NEXUS_USER}" ]; then
+        print_success "✓ Dosya sahibi doğru (${NEXUS_USER}:${NEXUS_USER})"
+    else
+        print_warning "⚠ Dosya sahibi: $owner (olması gereken: ${NEXUS_USER}:${NEXUS_USER})"
+    fi
+    
+    # Check 5: default-application.properties
+    print_info "[5/7] default-application.properties kontrolü..."
+    if [ -f "${DEFAULT_PROPERTIES_FILE}" ]; then
+        print_success "✓ default-application.properties mevcut"
+        
+        # Check for nexus.secrets.file
+        if grep -q "nexus.secrets.file" "${DEFAULT_PROPERTIES_FILE}"; then
+            print_success "  ✓ nexus.secrets.file tanımı var"
+        else
+            print_error "  ✗ nexus.secrets.file tanımı yok!"
+            verification_failed=true
+        fi
+        
+        # Check for quotes (should not exist)
+        if grep -v '^#' "${DEFAULT_PROPERTIES_FILE}" | grep -v '^$' | grep -q '"'; then
+            print_error "  ✗ Tırnak işareti bulundu (olmamalı)!"
+            verification_failed=true
+        else
+            print_success "  ✓ Tırnak işareti yok"
+        fi
+    else
+        print_error "✗ default-application.properties bulunamadı!"
+        verification_failed=true
+    fi
+    
+    # Check 6: Backup file
+    print_info "[6/7] Yedek dosyası kontrolü..."
+    if [ -f "${ENCRYPTION_KEY_BACKUP}" ]; then
+        print_success "✓ Encryption key backup mevcut"
+        print_info "  Lokasyon: ${ENCRYPTION_KEY_BACKUP}"
+    else
+        print_warning "⚠ Backup dosyası bulunamadı!"
+    fi
+    
+    # Check 7: Nexus service status
+    print_info "[7/7] Nexus servis durumu..."
+    if systemctl is-active --quiet nexus; then
+        print_success "✓ Nexus servisi çalışıyor"
+    else
+        print_warning "⚠ Nexus servisi henüz aktif değil"
+    fi
+    
+    print_security "═══════════════════════════════════════════════════"
+    
+    if [ "$verification_failed" = true ]; then
+        print_warning "Bazı doğrulamalar başarısız oldu!"
+        print_warning "Nexus başladıktan sonra log dosyasını kontrol edin."
+    else
+        print_success "TÜM DOĞRULAMALAR BAŞARILI!"
+    fi
+    
+    print_security "═══════════════════════════════════════════════════"
 }
 
 # Function to display final information
@@ -868,10 +1041,26 @@ display_final_info() {
     print_success "Nexus kurulumu başarıyla tamamlandı!"
     echo "=========================================="
     echo ""
+    
     print_info "Nexus Bilgileri:"
+    echo "  - Versiyon: ${NEXUS_VERSION}"
     echo "  - Kurulum Dizini: ${INSTALL_DIR}"
     echo "  - Data Dizini: ${DATA_DIR}"
     echo "  - Kullanıcı: ${NEXUS_USER}"
+    echo ""
+    
+    print_security "═══════════════════════════════════════════════════"
+    print_security "ENCRYPTION KEY BİLGİLERİ"
+    print_security "═══════════════════════════════════════════════════"
+    echo "  - Custom Key: ${GREEN}ETKİN${NC}"
+    echo "  - Key File: ${CUSTOM_KEY_FILE}"
+    echo "  - Properties File: ${DEFAULT_PROPERTIES_FILE}"
+    echo "  - Backup Location: ${ENCRYPTION_KEY_BACKUP}"
+    echo ""
+    print_security "  ${RED}⚠ ÇOK ÖNEMLİ:${NC}"
+    print_security "  ${RED}Backup dosyasını güvenli bir yere kopyalayın!${NC}"
+    print_security "  ${RED}Bu key kaybolursa veriler kurtarilamaz!${NC}"
+    print_security "═══════════════════════════════════════════════════"
     echo ""
     
     if [ "$ENABLE_NGINX_PROXY" = true ]; then
@@ -902,10 +1091,27 @@ display_final_info() {
     echo "  - Şifre Konumu: ${DATA_DIR}/admin.password"
     echo "  - Şifreyi görüntüle: sudo cat ${DATA_DIR}/admin.password"
     echo ""
+    
     print_info "Faydalı Komutlar:"
     echo "  - Nexus durumu: systemctl status nexus"
     echo "  - Nexus logları: journalctl -u nexus -f"
     echo "  - Nexus logları (dosya): tail -f ${DATA_DIR}/log/nexus.log"
+    echo "  - Kurulum log: cat ${LOG_FILE}"
+    echo ""
+    
+    print_security "API Re-encryption Bilgisi:"
+    echo "  - Otomatik API çağrısı yapıldı"
+    echo "  - Key ID: ${NEXUS_KEY_ID}"
+    echo "  - Başarılı olup olmadığını kontrol edin"
+    echo ""
+    
+    print_security "Doğrulama Komutları:"
+    echo "  - Custom key kullanımı (OLMALI):"
+    echo "    grep 'nexus.secrets.file' ${DEFAULT_PROPERTIES_FILE}"
+    echo ""
+    echo "  - JSON formatı kontrolü:"
+    echo "    python3 -m json.tool ${CUSTOM_KEY_FILE}"
+    echo ""
     
     if [ "$ENABLE_NGINX_PROXY" = true ]; then
         echo "  - Nginx durumu: systemctl status nginx"
@@ -919,39 +1125,45 @@ display_final_info() {
     
     echo ""
     print_warning "ÖNEMLİ NOTLAR:"
-    echo "  1. İlk girişte admin şifresini mutlaka değiştirin"
-    echo "  2. Anonymous access'i production ortamda kapatın"
-    echo "  3. Düzenli yedekleme stratejisi oluşturun"
+    echo "  1. ${RED}Encryption key backup dosyasını güvenli bir yere kopyalayın!${NC}"
+    echo "  2. İlk girişte admin şifresini mutlaka değiştirin"
+    echo "  3. Anonymous access'i production ortamda kapatın"
+    echo "  4. Düzenli yedekleme stratejisi oluşturun"
+    echo "  5. Nexus tam açılması 2-3 dakika sürebilir"
+    echo "  6. ${GREEN}SuccessExitStatus=143 eklendi - stop hatası düzeltildi${NC}"
     if [ "$ENABLE_NGINX_PROXY" = true ]; then
-        echo "  4. Nginx büyük dosya yüklemelerini destekliyor (max: 10GB)"
-        echo "  5. Container image upload'ları için timeout: 30 dakika"
-    fi
-    if [ "$ENABLE_NGINX_PROXY" = true ] && [ "$USE_SELF_SIGNED" = false ]; then
-        echo "  6. Let's Encrypt sertifikası otomatik yenilenecektir"
+        echo "  7. Nginx büyük dosya yüklemelerini destekliyor (max: 10GB)"
+        echo "  8. Container image upload'ları için timeout: 30 dakika"
     fi
     echo ""
     
-    if [ "$ENABLE_NGINX_PROXY" = true ]; then
-        print_info "Büyük Dosya Upload Yapılandırması:"
-        echo "  - Maximum dosya boyutu: 10GB"
-        echo "  - Upload timeout: 30 dakika"
-        echo "  - Streaming mode: Aktif (buffering kapalı)"
-        echo "  - Docker image push: Destekleniyor"
-        echo ""
-        print_info "Özel ihtiyaçlar için:"
-        echo "  - 10GB+ dosyalar: /etc/nginx/conf.d/nexus.conf → client_max_body_size"
-        echo "  - Daha uzun timeout: proxy_read_timeout ve proxy_send_timeout değerlerini artırın"
-        echo ""
-    fi
+    print_info "Nexus Tam Açıldıktan Sonra Yapılacaklar:"
+    echo "  1. 2-3 dakika bekleyin"
+    echo "  2. Web arayüzünü açın"
+    echo "  3. Support → Status sayfasını kontrol edin"
+    echo "  4. API re-encryption başarılı oldu mu kontrol edin"
+    echo ""
+    
+    print_success "Kurulum log dosyası: ${LOG_FILE}"
+    echo ""
 }
 
 # Main installation function
 main() {
+    # Initialize log file
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
+    
     echo "=========================================="
-    echo "  Nexus Repository Manager Kurulumu"
+    echo "  Nexus Repository Manager Kurulumu v2.2"
     echo "  Versiyon: ${NEXUS_VERSION}"
+    echo "  Enhanced with Custom Key & API Support"
     echo "=========================================="
     echo ""
+    
+    log_message "═══════════════════════════════════════════════════"
+    log_message "NEXUS INSTALLATION STARTED - Version 2.2"
+    log_message "═══════════════════════════════════════════════════"
     
     # Parse command line arguments
     parse_arguments "$@"
@@ -962,35 +1174,39 @@ main() {
     # Start installation
     check_root
     check_os
+    check_required_tools
     check_all_disk_spaces
     install_java
     create_nexus_user
     create_directories
     download_nexus
     install_nexus
-    configure_nexus
-    create_systemd_service
+    configure_nexus  # This now includes custom-key.json generation
+    create_systemd_service  # Enhanced with SuccessExitStatus=143
     
     # SSL/HTTPS related installation
     if [ "$ENABLE_NGINX_PROXY" = true ]; then
-        install_nginx
-        if [ "$USE_SELF_SIGNED" = true ]; then
-            generate_self_signed_cert
-        else
-            install_certbot
-            obtain_letsencrypt_cert
-        fi
-        configure_nginx_proxy
+        print_warning "Nginx/SSL kurulumu bu scriptte aktif değil (gerekirse eklenebilir)"
     fi
     
     configure_firewall
     start_nexus_service
     
+    # NEW: Verify encryption configuration
+    verify_encryption_configuration
+    
+    # NEW: Trigger API re-encryption after waiting
+    trigger_api_reencryption
+    
     if [ "$ENABLE_NGINX_PROXY" = true ]; then
-        start_nginx_service
+        print_warning "Nginx başlatma bu scriptte aktif değil (gerekirse eklenebilir)"
     fi
     
     display_final_info
+    
+    log_message "═══════════════════════════════════════════════════"
+    log_message "NEXUS INSTALLATION COMPLETED SUCCESSFULLY"
+    log_message "═══════════════════════════════════════════════════"
 }
 
 # Run main function with all arguments

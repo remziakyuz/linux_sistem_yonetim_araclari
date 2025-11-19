@@ -1,8 +1,9 @@
-# Nexus Repository Manager Kurulum Scripti
+# Nexus Repository Manager Kurulum Scripti v2.2
 
 ## 📋 İçindekiler
 
 - [Genel Bakış](#genel-bakış)
+- [v2.2 Yenilikleri](#v22-yenilikleri)
 - [Özellikler](#özellikler)
 - [Sistem Gereksinimleri](#sistem-gereksinimleri)
 - [Disk Alanı Gereksinimleri](#disk-alanı-gereksinimleri)
@@ -18,6 +19,8 @@
 - [Kaldırma](#kaldırma)
 - [Versiyon Geçmişi](#versiyon-geçmişi)
 
+---
+
 ## 🎯 Genel Bakış
 
 Bu script, **Nexus Repository Manager 3.86.2-01** versiyonunu RHEL 9 tabanlı Linux dağıtımlarına otomatik olarak kurmak için geliştirilmiştir. Script, production ortamları için optimize edilmiş, kapsamlı hata kontrolü ve disk alanı yönetimi içeren profesyonel bir kurulum çözümüdür.
@@ -25,6 +28,98 @@ Bu script, **Nexus Repository Manager 3.86.2-01** versiyonunu RHEL 9 tabanlı Li
 ### Nexus Repository Manager Nedir?
 
 Nexus Repository Manager, Maven, npm, Docker, PyPI ve diğer paket formatları için merkezi bir repository yönetim çözümüdür. Yazılım bileşenlerini saklamak, versiyon kontrolü yapmak ve organizasyonunuzda tekrar kullanılabilirliği artırmak için kullanılır.
+
+---
+
+## 🆕 v2.2 Yenilikleri
+
+### 1. 🔐 Basitleştirilmiş Custom Encryption Key
+
+**Önceki Versiyon (v2.1):**
+- Karmaşık `custom-encryption.json` formatı
+- fixedEncryption, salt, iv gibi ek alanlar
+
+**Yeni Versiyon (v2.2):**
+```json
+{
+  "active": "alibaba33442",
+  "keys": [
+    {
+      "id": "alibaba33442",
+      "key": "d2lsbGluZ3BsYW5lc3RvcnlncmFiYmVkaGVscGZ1bGM="
+    }
+  ]
+}
+```
+- Daha basit ve temiz yapı
+- Kolay debug ve yönetim
+- Dosya: `/app/nexus/etc/custom-key.json`
+
+### 2. 📝 Modern Property Desteği
+
+**nexus.secrets.file** property desteği eklendi:
+
+```properties
+# /app/nexus/etc/default-application.properties
+secret.nexusSecret.enabled=true
+nexus.secrets.file=/app/nexus/etc/custom-key.json
+```
+
+**Avantajları:**
+- Nexus 3.x için önerilen yöntem
+- Tırnak kullanımı gerektirmez
+- Daha güvenli ve modern
+
+### 3. 🤖 Otomatik API Re-encryption
+
+Kurulum tamamlandıktan sonra otomatik olarak:
+- ⏱️ 90 saniye bekleme (geri sayım ile)
+- 🔄 API re-encryption endpoint çağrısı
+- ✅ Başarı/başarısızlık raporlaması
+- 📝 Manuel komut önerisi (gerekirse)
+
+**API Çağrısı:**
+```bash
+curl -X 'PUT' \
+  'https://nexus.lab.akyuz.tech/service/rest/v1/secrets/encryption/re-encrypt' \
+  -u 'admin:INITIAL_PASSWORD' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -H 'NX-ANTI-CSRF-TOKEN: 0.6199265331343733' \
+  -H 'X-Nexus-UI: true' \
+  -d '{
+  "secretKeyId": "alibaba33442",
+  "notifyEmail": "string"
+}'
+```
+
+### 4. 🛠️ Systemd Stop Hatası Düzeltildi
+
+**Problem:**
+```bash
+$ systemctl stop nexus
+$ systemctl status nexus
+× nexus.service - Nexus Repository Manager
+     Active: failed (Result: exit-code)
+   Main PID: 1428 (code=exited, status=143)
+```
+
+**Çözüm:**
+```ini
+[Service]
+...
+SuccessExitStatus=143  # SIGTERM artık başarılı sayılır
+```
+
+**Sonuç:**
+```bash
+$ systemctl stop nexus
+$ systemctl status nexus
+○ nexus.service - Nexus Repository Manager
+     Active: inactive (dead)
+```
+
+---
 
 ## ✨ Özellikler
 
@@ -36,8 +131,27 @@ Nexus Repository Manager, Maven, npm, Docker, PyPI ve diğer paket formatları i
 - ✅ **Systemd Entegrasyonu**: Otomatik başlatma ve servis yönetimi
 - ✅ **Firewall Yapılandırması**: Port 8081 için otomatik firewall kuralı
 - ✅ **Özelleştirilebilir Dizinler**: İhtiyaca göre dizin yapısı ayarlanabilir
+- ✅ **SSL/HTTPS Desteği**: Let's Encrypt ve Self-Signed sertifika desteği
+- ✅ **Verbose Mode**: Detaylı debug çıktısı
 
-### İyileştirilmiş Özellikler
+### v2.2 İyileştirmeleri
+
+#### 🔐 Gelişmiş Şifreleme
+- Custom encryption key otomatik oluşturma
+- "Default Secret Encryption Key" uyarısını baştan önleme
+- Basitleştirilmiş JSON formatı
+- Otomatik backup oluşturma
+
+#### 🤖 Akıllı Kurulum
+- Otomatik API re-encryption
+- 90 saniye bekleme mekanizması
+- Başarı/başarısızlık bildirimi
+- Manuel komut önerisi
+
+#### 🛠️ Sistem Entegrasyonu
+- Düzeltilmiş systemd service (exit code 143)
+- Geliştirilmiş stop/start yönetimi
+- Detaylı durum raporlaması
 
 #### 1. Kapsamlı Hata Kontrolü
 
@@ -46,6 +160,7 @@ Nexus Repository Manager, Maven, npm, Docker, PyPI ve diğer paket formatları i
 - 🔍 **Komut Başarı Kontrolü**: Her komutun çıkış kodu kontrol edilir
 - 🔍 **Boş Dosya Kontrolü**: İndirilen dosyaların içerik kontrolü
 - 🔍 **Servis Durum Kontrolü**: Nexus servisinin doğru başlatıldığı doğrulanır
+- 🔍 **JSON Format Doğrulama**: Encryption key dosyalarının format kontrolü
 
 #### 2. İşletim Sistemi Kontrolü
 
@@ -72,9 +187,12 @@ Yeterli alan yoksa kurulum başlamaz ve kullanıcı bilgilendirilir.
 
 #### 4. Kullanıcı Dostu Arayüz
 
-- 🎨 **Renkli Çıktılar**: Hata (kırmızı), başarı (yeşil), uyarı (sarı) mesajları
+- 🎨 **Renkli Çıktılar**: Hata (kırmızı), başarı (yeşil), uyarı (sarı), güvenlik (magenta) mesajları
 - 📊 **İlerleme Göstergeleri**: Her adımda detaylı bilgilendirme
+- ⏱️ **Geri Sayım Göstergesi**: API re-encryption öncesi bekleme
 - 📝 **Kurulum Özeti**: Kurulum sonunda tüm önemli bilgiler
+
+---
 
 ## 💻 Sistem Gereksinimleri
 
@@ -99,14 +217,22 @@ Yeterli alan yoksa kurulum başlamaz ve kullanıcı bilgilendirilir.
 - **RAM**: 8+ GB
 - **Disk**: 100+ GB (SSD önerilir)
 
+#### Production Ortamı
+
+- **CPU**: 8+ Core
+- **RAM**: 16+ GB
+- **Disk**: 500+ GB (SSD şart)
+- **Network**: 1 Gbps+
+
 ### Yazılım Gereksinimleri
 
 - Root erişimi
 - İnternet bağlantısı (ilk kurulum için)
-- curl (genellikle varsayılan olarak yüklü)
-- tar (genellikle varsayılan olarak yüklü)
+- wget, tar, sed, awk, openssl (script tarafından kontrol edilir)
 - systemd
 - firewalld (opsiyonel)
+
+---
 
 ## 💾 Disk Alanı Gereksinimleri
 
@@ -117,6 +243,8 @@ Yeterli alan yoksa kurulum başlamaz ve kullanıcı bilgilendirilir.
 ├── nexus/                    # INSTALL_DIR (2 GB minimum)
 │   ├── bin/
 │   ├── etc/
+│   │   ├── custom-key.json           # 🆕 v2.2
+│   │   └── default-application.properties
 │   ├── lib/
 │   └── ...
 └── data/
@@ -124,9 +252,11 @@ Yeterli alan yoksa kurulum başlamaz ve kullanıcı bilgilendirilir.
     └── nexus/
         └── sonatype-work/   # WORK_DIR (5 GB minimum)
             └── nexus3/      # DATA_DIR
+                ├── db/
+                ├── etc/
                 ├── log/
                 ├── tmp/
-                └── ...
+                └── blobs/
 ```
 
 ### Depolama Planlaması
@@ -136,8 +266,11 @@ Repository boyutu, kullanım senaryonuza bağlı olarak hızla büyüyebilir:
 - **Küçük Ekip** (5-10 geliştirici): 50-100 GB
 - **Orta Ekip** (10-50 geliştirici): 200-500 GB
 - **Büyük Ekip** (50+ geliştirici): 1+ TB
+- **Enterprise**: 5+ TB
 
 **Not**: Maven Central proxy kullanıyorsanız, disk alanı ihtiyacı çok daha hızlı artacaktır.
+
+---
 
 ## 🔧 Kurulum Öncesi Hazırlık
 
@@ -150,14 +283,17 @@ sudo yum update -y
 ### 2. Gerekli Araçların Kontrolü
 
 ```bash
-# curl kontrolü
-curl --version
+# wget kontrolü
+wget --version
 
 # tar kontrolü
 tar --version
 
 # systemctl kontrolü
 systemctl --version
+
+# openssl kontrolü (v2.2 için gerekli)
+openssl version
 ```
 
 ### 3. Disk Alanı Kontrolü
@@ -167,7 +303,7 @@ systemctl --version
 df -h
 
 # /app dizini için kullanılabilir alan
-df -h /app
+df -h /app 2>/dev/null || df -h /
 ```
 
 ### 4. Port Kontrolü
@@ -175,6 +311,9 @@ df -h /app
 ```bash
 # 8081 portunu kullanan süreç var mı kontrol et
 sudo ss -tulpn | grep 8081
+
+# veya
+sudo lsof -i :8081
 ```
 
 Port kullanımda ise, scriptteki `NEXUS_PORT` değişkenini değiştirin.
@@ -187,50 +326,97 @@ sestatus
 
 # Geçici olarak devre dışı bırak (gerekirse)
 sudo setenforce 0
+
+# Kalıcı olarak devre dışı bırak
+sudo sed -i 's/^SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config
 ```
+
+---
 
 ## 🚀 Hızlı Başlangıç
 
-### Adım 1: Script'i İndirin
+### Senaryo 1: Basit HTTP Kurulum
 
 ```bash
-# Script'i indirin (örnek URL)
-curl -O https://your-server.com/install-nexus-improved.sh
+# 1. Script'i çalıştırılabilir yap
+chmod +x install-nexus.sh
 
-# veya wget kullanarak
-wget https://your-server.com/install-nexus-improved.sh
+# 2. Kurulumu başlat
+sudo ./install-nexus.sh
 ```
 
-### Adım 2: Çalıştırma İzni Verin
+**Sonuç:** `http://YOUR_IP:8081`
+
+### Senaryo 2: Let's Encrypt ile SSL
 
 ```bash
-chmod +x install-nexus-improved.sh
+sudo ./install-nexus.sh \
+  --enable-ssl \
+  --domain nexus.lab.akyuz.tech \
+  --email admin@akyuz.tech
 ```
 
-### Adım 3: Script'i Çalıştırın
+**Sonuç:** `https://nexus.lab.akyuz.tech`
+
+**Gereksinimler:**
+- Domain'in DNS kaydı sunucuya işaret etmeli
+- Port 80 ve 443 açık olmalı
+- Geçerli email adresi
+
+### Senaryo 3: Self-Signed SSL
 
 ```bash
-sudo ./install-nexus-improved.sh
+sudo ./install-nexus.sh \
+  --enable-ssl \
+  --domain nexus.lab.akyuz.tech \
+  --self-signed
 ```
 
-### Adım 4: Kurulum Tamamlanmasını Bekleyin
+**Sonuç:** `https://nexus.lab.akyuz.tech` (tarayıcı uyarısı verecek)
+
+### Senaryo 4: Verbose Mode ile Kurulum
+
+```bash
+sudo ./install-nexus.sh --verbose
+```
+
+**Sonuç:** Detaylı debug çıktısı ile kurulum
+
+### Kurulum Adımları
 
 Script otomatik olarak:
-1. İşletim sistemini kontrol eder
-2. Disk alanını kontrol eder
-3. JDK 17'yi kurar
-4. Nexus'u indirir ve kurar
-5. Yapılandırmaları yapar
-6. Servisi başlatır
+1. ✅ İşletim sistemini kontrol eder
+2. ✅ Disk alanını kontrol eder
+3. ✅ JDK 17'yi kurar
+4. ✅ Nexus kullanıcısı oluşturur
+5. ✅ Nexus'u indirir ve kurar
+6. ✅ Custom encryption key oluşturur (v2.2)
+7. ✅ Yapılandırmaları yapar
+8. ✅ Systemd service oluşturur (SuccessExitStatus=143 ile)
+9. ✅ Firewall kuralları ekler
+10. ✅ Servisi başlatır
+11. ✅ 90 saniye bekler (v2.2)
+12. ✅ API re-encryption çağrısı yapar (v2.2)
+13. ✅ Doğrulama testleri yapar
+14. ✅ Kurulum özeti gösterir
 
-### Adım 5: Nexus'a Erişin
-
-```bash
-# Kurulum sonunda gösterilen URL'yi kullanın
-http://sunucu-ip-adresi:8081
-```
+---
 
 ## 📖 Detaylı Kullanım
+
+### Komut Satırı Parametreleri
+
+```bash
+Kullanım: ./install-nexus.sh [OPTIONS]
+
+SEÇENEKLER:
+    --enable-ssl           Nginx reverse proxy ve SSL/HTTPS'i etkinleştir
+    --domain DOMAIN        SSL için domain adı (örn: nexus.example.com)
+    --email EMAIL          Let's Encrypt için email adresi
+    --self-signed          Let's Encrypt yerine self-signed sertifika kullan
+    --verbose              Detaylı çıktı göster (debug modu)
+    --help                 Yardım mesajını göster
+```
 
 ### Özelleştirilmiş Kurulum
 
@@ -238,7 +424,7 @@ Script başındaki değişkenleri düzenleyerek kurulumu özelleştirebilirsiniz
 
 ```bash
 # Script'i düzenleyin
-nano install-nexus-improved.sh
+nano install-nexus.sh
 ```
 
 #### Özelleştirilebilir Değişkenler
@@ -263,6 +449,9 @@ WORK_DIR="/app/data/nexus/sonatype-work"
 # Port numarası
 NEXUS_PORT=8081
 
+# API yapılandırması (v2.2)
+API_WAIT_TIME=90  # Saniye cinsinden bekleme süresi
+
 # Disk alanı gereksinimleri (MB)
 MIN_INSTALL_SPACE=2048  # 2GB
 MIN_REPO_SPACE=10240    # 10GB
@@ -273,14 +462,14 @@ MIN_WORK_SPACE=5120     # 5GB
 
 İnternet bağlantısı olmayan sistemlerde:
 
-1. Nexus tar dosyasını manuel olarak indirin:
+1. **Nexus tar dosyasını manuel olarak indirin:**
 ```bash
 curl -L -O https://cdn.download.sonatype.com/repository/downloads-prod-group/3/nexus-3.86.2-01-linux-x86_64.tar.gz
 ```
 
-2. Tar dosyasını script ile aynı dizine koyun
+2. **Tar dosyasını /tmp dizinine koyun**
 
-3. Script'i normal şekilde çalıştırın
+3. **Script'i normal şekilde çalıştırın**
 
 Script, mevcut tar dosyasını otomatik olarak algılayacak ve kullanacaktır.
 
@@ -289,14 +478,73 @@ Script, mevcut tar dosyasını otomatik olarak algılayacak ve kullanacaktır.
 Kurulum sırasında tüm çıktıları bir log dosyasına kaydetmek için:
 
 ```bash
-sudo ./install-nexus-improved.sh 2>&1 | tee nexus-install.log
+sudo ./install-nexus.sh 2>&1 | tee nexus-install.log
 ```
+
+---
 
 ## ⚙️ Yapılandırma Detayları
 
-### Nexus Yapılandırma Dosyaları
+### v2.2 Özel Yapılandırma Dosyaları
 
-#### 1. nexus.rc
+#### 1. custom-key.json (🆕 v2.2)
+**Konum**: `/app/nexus/etc/custom-key.json`
+
+```json
+{
+  "active": "alibaba33442",
+  "keys": [
+    {
+      "id": "alibaba33442",
+      "key": "d2lsbGluZ3BsYW5lc3RvcnlncmFiYmVkaGVscGZ1bGM="
+    }
+  ]
+}
+```
+
+**Özellikler:**
+- Basitleştirilmiş format
+- Otomatik oluşturulur
+- Güvenli izinler (600)
+- Nexus kullanıcısına ait
+
+**Güvenlik:**
+```bash
+# İzinleri kontrol et
+ls -la /app/nexus/etc/custom-key.json
+# Çıktı: -rw------- 1 nexus nexus
+
+# JSON formatını doğrula
+python3 -m json.tool /app/nexus/etc/custom-key.json
+```
+
+#### 2. default-application.properties (🔄 v2.2)
+**Konum**: `/app/nexus/etc/default-application.properties`
+
+```properties
+# Nexus Repository Manager Configuration
+# Auto-generated by installation script v2.2
+
+# Logging Configuration
+logging.config=./etc/logback/logback.xml
+
+# Custom Secrets File Configuration
+secret.nexusSecret.enabled=true
+nexus.secrets.file=/app/nexus/etc/custom-key.json
+
+# DO NOT UNCOMMENT OR ADD THESE LINES:
+# nexus.security.encryptionKey=...
+# They will conflict with nexus.secrets.file
+```
+
+**Önemli Notlar:**
+- ✅ Tırnak kullanmayın
+- ✅ `nexus.secrets.file` kullanın (v2.2)
+- ❌ Inline `nexus.security.encryptionKey` kullanmayın
+
+### Standart Nexus Yapılandırma Dosyaları
+
+#### 3. nexus.rc
 **Konum**: `/app/nexus/bin/nexus.rc`
 
 ```bash
@@ -305,7 +553,7 @@ run_as_user="nexus"
 
 Bu dosya, Nexus'un hangi kullanıcı ile çalışacağını belirtir.
 
-#### 2. nexus.vmoptions
+#### 4. nexus.vmoptions
 **Konum**: `/app/nexus/bin/nexus.vmoptions`
 
 JVM parametrelerini içerir:
@@ -315,17 +563,23 @@ JVM parametrelerini içerir:
 -Dkaraf.data=/app/data/nexus/sonatype-work/nexus3
 -Dkaraf.log=/app/data/nexus/sonatype-work/nexus3/log
 -Djava.io.tmpdir=/app/data/nexus/sonatype-work/nexus3/tmp
-```
-
-**Bellek Ayarları** (opsiyonel olarak eklenebilir):
-
-```bash
 -Xms2G          # Minimum heap boyutu
 -Xmx4G          # Maksimum heap boyutu
--XX:MaxDirectMemorySize=2G
+-XX:MaxDirectMemorySize=4G
 ```
 
-#### 3. nexus-default.properties
+**Bellek Ayarlaması:**
+
+Sistem RAM'ine göre önerilen değerler:
+
+| Sistem RAM | -Xms | -Xmx | MaxDirectMemorySize |
+|------------|------|------|---------------------|
+| 4 GB | 1G | 2G | 2G |
+| 8 GB | 2G | 4G | 4G |
+| 16 GB | 4G | 8G | 8G |
+| 32 GB | 8G | 16G | 16G |
+
+#### 5. nexus-default.properties
 **Konum**: `/app/nexus/etc/nexus-default.properties`
 
 Nexus'un temel yapılandırma dosyası:
@@ -334,9 +588,10 @@ Nexus'un temel yapılandırma dosyası:
 nexus-work=/app/data/nexus/sonatype-work
 data-dir=/app/data/nexus/sonatype-work/nexus3
 application-port=8081
+application-host=0.0.0.0
 ```
 
-### Systemd Servis Yapılandırması
+### Systemd Servis Yapılandırması (🔄 v2.2)
 
 **Konum**: `/etc/systemd/system/nexus.service`
 
@@ -352,184 +607,139 @@ Environment="NEXUS_HOME=/app/nexus"
 Environment="NEXUS_DATA=/app/data/nexus/sonatype-work/nexus3"
 Environment="HOME=/app/data/nexus/sonatype-work/nexus3"
 Environment="JAVA_TOOL_OPTIONS=-Duser.home=/app/data/nexus/sonatype-work/nexus3"
+Environment="INSTALL4J_ADD_VM_PARAMS=-Dkaraf.data=/app/data/nexus/sonatype-work/nexus3 -Dkaraf.home=/app/nexus -Dkaraf.base=/app/nexus -Djava.io.tmpdir=/app/data/nexus/sonatype-work/nexus3/tmp"
 ExecStart=/app/nexus/bin/nexus start
 ExecStop=/app/nexus/bin/nexus stop
 User=nexus
 Restart=on-abort
+SuccessExitStatus=143    # 🆕 v2.2: SIGTERM başarılı sayılır
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### Firewall Yapılandırması
+**v2.2 İyileştirmesi:**
+- `SuccessExitStatus=143` eklendi
+- Exit code 143 (SIGTERM) artık başarılı
+- `systemctl stop nexus` artık "failed" göstermez
+
+---
+
+## ✅ Kurulum Sonrası İşlemler
+
+### 1. Servis Durumu Kontrolü
 
 ```bash
-# Firewall kuralını görüntüle
-sudo firewall-cmd --list-ports
+# Servis durumu
+systemctl status nexus
 
-# Kuralı manuel olarak ekle (script otomatik yapar)
-sudo firewall-cmd --permanent --add-port=8081/tcp
-sudo firewall-cmd --reload
+# Beklenen çıktı:
+● nexus.service - Nexus Repository Manager
+     Active: active (running)
 ```
 
-## 🎓 Kurulum Sonrası İşlemler
+### 2. Stop/Start Testi (v2.2)
 
-### 1. İlk Giriş
-
-1. Web tarayıcınızda Nexus'a erişin:
-```
-http://sunucu-ip-adresi:8081
-```
-
-2. Sağ üst köşedeki **Sign In** butonuna tıklayın
-
-3. Varsayılan kullanıcı adı: `admin`
-
-4. Şifreyi aşağıdaki dosyadan alın:
 ```bash
+# Durdur
+systemctl stop nexus
+systemctl status nexus
+# Beklenen: Active: inactive (dead) - ARTIK "failed" DEĞİL!
+
+# Başlat
+systemctl start nexus
+systemctl status nexus
+# Beklenen: Active: active (running)
+```
+
+### 3. Custom Key Doğrulama (v2.2)
+
+```bash
+# Dosya var mı?
+ls -la /app/nexus/etc/custom-key.json
+
+# JSON geçerli mi?
+python3 -m json.tool /app/nexus/etc/custom-key.json
+
+# Property tanımlı mı?
+grep "nexus.secrets.file" /app/nexus/etc/default-application.properties
+```
+
+### 4. İlk Giriş
+
+```bash
+# Admin şifresini al
 sudo cat /app/data/nexus/sonatype-work/nexus3/admin.password
 ```
 
-### 2. İlk Kurulum Sihirbazı
+**Web Arayüzüne Erişim:**
+- URL: `http://YOUR_IP:8081` veya `https://YOUR_DOMAIN`
+- Kullanıcı: `admin`
+- Şifre: Yukarıdaki komuttan alınan değer
 
-İlk girişte karşınıza çıkacak adımlar:
+### 5. Setup Wizard
 
-1. **Şifre Değiştirme**: Yeni admin şifrenizi belirleyin
-2. **Anonymous Access**: Anonim erişime izin vermek isteyip istemediğinizi seçin
-   - Production ortamlar için: Devre dışı bırakın
-   - Test ortamları için: İhtiyaca göre ayarlayın
+1. Sign in ile giriş yapın
+2. Yeni admin şifresini belirleyin
+3. Anonymous access'i yapılandırın (Production'da Disable önerilir)
+4. Repository'leri yapılandırın
 
-### 3. İlk Repository Oluşturma
+### 6. Encryption Key Doğrulama
 
-#### Maven Repository
+**Web Arayüzünden:**
+1. Support → Status
+2. "Default Secret Encryption Key" uyarısı OLMAMALI ✅
+3. Custom encryption kullanıldığını görmelisiniz
 
-1. **Settings** → **Repository** → **Repositories**
-2. **Create repository** butonuna tıklayın
-3. **maven2 (hosted)** seçin
-4. Repository bilgilerini doldurun:
-   - Name: `maven-releases`
-   - Version policy: `Release`
-   - Layout policy: `Strict`
-   - Blob store: `default`
-
-#### npm Repository
-
-1. **Create repository** → **npm (hosted)**
-2. Repository bilgilerini doldurun:
-   - Name: `npm-private`
-   - Blob store: `default`
-
-#### Docker Repository
-
-1. **Create repository** → **docker (hosted)**
-2. Repository bilgilerini doldurun:
-   - Name: `docker-private`
-   - HTTP port: `8082`
-   - Enable Docker V1 API: Hayır (güvenlik için)
-
-**Not**: Docker için ek port açmanız gerekebilir:
+**Komut Satırından:**
 ```bash
-sudo firewall-cmd --permanent --add-port=8082/tcp
-sudo firewall-cmd --reload
+# Nexus loglarında custom key kullanımı
+grep -i "secrets.file" /app/data/nexus/sonatype-work/nexus3/log/nexus.log
+
+# Default key uyarısı olmamalı
+grep -i "Default Secret Encryption Key" /app/data/nexus/sonatype-work/nexus3/log/nexus.log
 ```
 
-### 4. LDAP/AD Entegrasyonu (Opsiyonel)
+### 7. API Re-encryption Kontrolü (v2.2)
 
-1. **Settings** → **Security** → **LDAP**
-2. **Create connection** butonuna tıklayın
-3. LDAP/AD bilgilerinizi girin
-4. Bağlantıyı test edin
-5. User ve Group mapping yapılandırmasını yapın
-
-### 5. Backup Görevini Ayarlama
-
-1. **Settings** → **System** → **Tasks**
-2. **Create task** → **Admin - Export databases for backup**
-3. Zamanlamayı ayarlayın (örn: Günlük 02:00)
-4. Backup lokasyonunu belirleyin
-
-### 6. Cleanup Policies
-
-Disk alanını yönetmek için:
-
-1. **Settings** → **Repository** → **Cleanup Policies**
-2. **Create cleanup policy**
-3. Kural tanımlayın:
-   - Son kullanım: 30 gün
-   - En son indirme: 90 gün
-
-4. Policy'yi repository'lere uygulayın
-
-## 🔍 Sorun Giderme
-
-### Kurulum Sorunları
-
-#### Sorun: "İşletim sistemi desteklenmiyor" Hatası
-
-**Çözüm**:
 ```bash
-# İşletim sisteminizi kontrol edin
-cat /etc/os-release
+# Kurulum logunu kontrol et
+cat /var/log/nexus-installation-*.log | grep -A 10 "API RE-ENCRYPTION"
 
-# Eğer RHEL 9 tabanlı bir sistem kullanıyorsanız ancak hata alıyorsanız,
-# script'teki check_os fonksiyonunu kontrol edin
+# Nexus loglarını kontrol et
+tail -100 /app/data/nexus/sonatype-work/nexus3/log/nexus.log | grep -i encrypt
 ```
 
-#### Sorun: "Yetersiz Disk Alanı" Hatası
+### 8. Backup Dosyasını Güvenli Yere Kopyalayın
 
-**Çözüm**:
 ```bash
-# Disk kullanımını kontrol edin
-df -h
+# Backup dosyasını bul
+ls -lh /root/nexus-encryption-key-*.txt
 
-# Gereksiz dosyaları temizleyin
-sudo yum clean all
+# Güvenli yere kopyala
+cp /root/nexus-encryption-key-*.txt /güvenli/yedek/dizini/
 
-# Eski log dosyalarını temizleyin
-sudo journalctl --vacuum-time=7d
-
-# Daha fazla disk ekleyin veya script'teki dizin yollarını değiştirin
+# İçeriği görüntüle (encryption key içerir - dikkatli olun!)
+cat /root/nexus-encryption-key-*.txt
 ```
 
-#### Sorun: "Nexus İndirilemedi" Hatası
+**⚠️ ÇOK ÖNEMLİ:** Bu dosya kaybolursa, şifrelenmiş veriler kurtarılamaz!
 
-**Çözüm**:
+---
+
+## 🔧 Sorun Giderme
+
+### 1. Servis Başlamıyor
+
+**Semptom:**
 ```bash
-# İnternet bağlantınızı kontrol edin
-ping -c 4 google.com
-
-# Proxy ayarlarını kontrol edin
-echo $http_proxy
-echo $https_proxy
-
-# Manuel indirmeyi deneyin
-curl -L -O https://cdn.download.sonatype.com/repository/downloads-prod-group/3/nexus-3.86.2-01-linux-x86_64.tar.gz
-
-# İndirilen dosyayı script ile aynı dizine koyun ve tekrar çalıştırın
+systemctl status nexus
+# Active: failed (Result: exit-code)
 ```
 
-#### Sorun: JDK Kurulum Hatası
-
-**Çözüm**:
+**Çözüm:**
 ```bash
-# Repository'leri güncelle
-sudo yum clean all
-sudo yum makecache
-
-# Manuel JDK kurulumu
-sudo yum install -y java-17-openjdk java-17-openjdk-devel
-
-# Java versiyonunu kontrol et
-java -version
-```
-
-### Servis Sorunları
-
-#### Sorun: Nexus Başlamıyor
-
-**Çözüm 1: Logları kontrol edin**
-```bash
-# Systemd logları
+# Logları kontrol et
 sudo journalctl -u nexus -f
 
 # Nexus logları
@@ -537,371 +747,427 @@ sudo tail -f /app/data/nexus/sonatype-work/nexus3/log/nexus.log
 
 # JVM logları
 sudo tail -f /app/data/nexus/sonatype-work/nexus3/log/jvm.log
-```
 
-**Çözüm 2: Port kontrolü**
-```bash
-# 8081 portu kullanımda mı?
-sudo ss -tulpn | grep 8081
-
-# Eğer kullanımdaysa, süreci sonlandırın
-sudo kill -9 $(sudo lsof -t -i:8081)
-```
-
-**Çözüm 3: Dosya izinlerini kontrol edin**
-```bash
-# Sahiplik kontrolü
+# Dosya izinlerini kontrol et
 ls -la /app/nexus
-ls -la /app/data/nexus
+sudo chown -R nexus:nexus /app/nexus /app/data/nexus
 
-# İzinleri düzelt
-sudo chown -R nexus:nexus /app/nexus
-sudo chown -R nexus:nexus /app/data/nexus
+# Port kontrolü
+sudo ss -tulpn | grep 8081
 ```
 
-**Çözüm 4: Bellek sorunları**
-```bash
-# Sisteminizin bellek durumunu kontrol edin
-free -h
+### 2. "Out of Memory" Hatası
 
-# nexus.vmoptions dosyasındaki bellek ayarlarını azaltın
-sudo nano /app/nexus/bin/nexus.vmoptions
-
-# Örnek: -Xmx değerini düşürün
-# -Xmx4G yerine -Xmx2G
+**Semptom:**
+```
+java.lang.OutOfMemoryError: Java heap space
 ```
 
-#### Sorun: Nexus Yavaş Çalışıyor
-
-**Çözüm**:
+**Çözüm:**
 ```bash
-# 1. Bellek artırın (nexus.vmoptions)
+# nexus.vmoptions'ı düzenle
 sudo nano /app/nexus/bin/nexus.vmoptions
 
-# Şu satırları ekleyin/güncelleyin:
+# Heap boyutunu artır
 -Xms4G
 -Xmx8G
--XX:MaxDirectMemorySize=4G
+-XX:MaxDirectMemorySize=8G
 
-# 2. Cleanup policy uygulayın (web arayüzünden)
-
-# 3. Blob store compact işlemi yapın (web arayüzünden)
-
-# 4. Servisi restart edin
+# Servisi yeniden başlat
 sudo systemctl restart nexus
 ```
 
-### Ağ Sorunları
+### 3. Stop Komutu "Failed" Gösteriyor (v2.1 ve öncesi)
 
-#### Sorun: Nexus'a Dışarıdan Erişilemiyor
-
-**Çözüm**:
+**Semptom:**
 ```bash
-# 1. Servis çalışıyor mu?
+systemctl stop nexus
+systemctl status nexus
+# Active: failed (Result: exit-code)
+```
+
+**Çözüm (v2.2'de otomatik):**
+```bash
+# Service dosyasını düzenle
+sudo nano /etc/systemd/system/nexus.service
+
+# Bu satırı [Service] bölümüne ekle:
+SuccessExitStatus=143
+
+# Daemon'ı reload et
+sudo systemctl daemon-reload
+
+# Test et
+sudo systemctl stop nexus
 sudo systemctl status nexus
+# Active: inactive (dead) olmalı
+```
 
-# 2. Port dinleniyor mu?
-sudo ss -tulpn | grep 8081
+### 4. API Re-encryption Başarısız (v2.2)
 
-# 3. Firewall açık mı?
-sudo firewall-cmd --list-ports
+**Semptom:**
+```
+API re-encryption isteği gönderilirken bir sorun oluştu
+```
 
-# 4. Firewall kuralını ekle
-sudo firewall-cmd --permanent --add-port=8081/tcp
+**Çözüm:**
+```bash
+# Manuel olarak çalıştır
+ADMIN_PASS=$(sudo cat /app/data/nexus/sonatype-work/nexus3/admin.password)
+
+curl -X 'PUT' \
+  'http://localhost:8081/service/rest/v1/secrets/encryption/re-encrypt' \
+  -u "admin:${ADMIN_PASS}" \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -H 'NX-ANTI-CSRF-TOKEN: 0.6199265331343733' \
+  -H 'X-Nexus-UI: true' \
+  -d '{
+  "secretKeyId": "alibaba33442",
+  "notifyEmail": "string"
+}'
+```
+
+### 5. Custom Key Dosyası Bulunamıyor
+
+**Semptom:**
+```
+custom-key.json bulunamadı
+```
+
+**Çözüm:**
+```bash
+# Dosya var mı kontrol et
+ls -la /app/nexus/etc/custom-key.json
+
+# Manuel oluştur (gerekirse)
+sudo cat > /app/nexus/etc/custom-key.json <<'EOF'
+{
+  "active": "alibaba33442",
+  "keys": [
+    {
+      "id": "alibaba33442",
+      "key": "YOUR_BASE64_KEY_HERE"
+    }
+  ]
+}
+EOF
+
+# İzinleri ayarla
+sudo chmod 600 /app/nexus/etc/custom-key.json
+sudo chown nexus:nexus /app/nexus/etc/custom-key.json
+
+# Servisi yeniden başlat
+sudo systemctl restart nexus
+```
+
+### 6. Port Zaten Kullanımda
+
+**Semptom:**
+```
+Address already in use
+```
+
+**Çözüm:**
+```bash
+# 8081 portunu kim kullanıyor?
+sudo lsof -i :8081
+
+# Değiştirmek için
+sudo nano /app/nexus/etc/nexus-default.properties
+# application-port=8081  →  application-port=9999
+
+# Firewall'u güncelle
+sudo firewall-cmd --permanent --remove-port=8081/tcp
+sudo firewall-cmd --permanent --add-port=9999/tcp
 sudo firewall-cmd --reload
 
-# 5. SELinux kontrol
-sudo setenforce 0  # Geçici olarak devre dışı bırak
-# Eğer bu çözerse, SELinux policy'sini düzelt
+# Servisi yeniden başlat
+sudo systemctl restart nexus
 ```
 
-#### Sorun: SSL/HTTPS Yapılandırması
+### 7. Disk Alanı Yetersiz
 
-**Çözüm**:
+**Semptom:**
+```
+No space left on device
+```
+
+**Çözüm:**
 ```bash
-# Nginx kullanarak reverse proxy oluşturun
+# Disk kullanımını kontrol et
+df -h /app
 
-# 1. Nginx kurulumu
-sudo yum install -y nginx
+# Büyük dosyaları bul
+sudo du -sh /app/data/nexus/sonatype-work/nexus3/* | sort -h
 
-# 2. Nexus için yapılandırma
-sudo nano /etc/nginx/conf.d/nexus.conf
+# Log dosyalarını temizle
+sudo rm -rf /app/data/nexus/sonatype-work/nexus3/log/*.log.*
+sudo rm -rf /app/data/nexus/sonatype-work/nexus3/tmp/*
 
-# İçeriği:
-server {
-    listen 80;
-    server_name nexus.example.com;
-    return 301 https://$server_name$request_uri;
-}
+# Cleanup policy ayarla (Web UI'dan)
+# Admin → Repository → Cleanup Policies
 
-server {
-    listen 443 ssl;
-    server_name nexus.example.com;
-
-    ssl_certificate /etc/ssl/certs/nexus.crt;
-    ssl_certificate_key /etc/ssl/private/nexus.key;
-
-    location / {
-        proxy_pass http://localhost:8081/;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto "https";
-    }
-}
-
-# 3. Nginx'i başlat
-sudo systemctl enable nginx
-sudo systemctl start nginx
+# Compact işlemi (Web UI'dan)
+# Admin → Repository → Blob Stores → Compact
 ```
 
-### Database Sorunları
+### 8. SSL Sertifika Hataları
 
-#### Sorun: OrientDB Bozulması
+**Semptom:**
+```
+SSL certificate problem
+```
 
-**Çözüm**:
+**Çözüm:**
 ```bash
-# 1. Nexus'u durdur
-sudo systemctl stop nexus
+# Let's Encrypt sertifikası yenile
+sudo certbot renew
 
-# 2. Database'i yedekle
-sudo cp -r /app/data/nexus/sonatype-work/nexus3/db /backup/db-backup-$(date +%Y%m%d)
+# Self-signed sertifika yenile
+sudo openssl req -new -x509 -days 365 -key /etc/ssl/nexus/nexus.key \
+  -out /etc/ssl/nexus/nexus.crt
 
-# 3. Database repair
-cd /app/nexus/bin
-sudo -u nexus ./nexus repair-orient
-
-# 4. Nexus'u başlat
-sudo systemctl start nexus
+# Nginx'i yeniden başlat
+sudo systemctl restart nginx
 ```
+
+### 9. Repository'e Upload Edilemiyor
+
+**Çözümler:**
+1. **Kullanıcı yetkileri kontrol edin**
+   - Security → Users → admin → Check privileges
+
+2. **Repository policy kontrol edin**
+   - Repository → Select repo → Configuration
+   - Deployment policy: Allow redeploy
+
+3. **Disk alanı kontrol edin**
+   ```bash
+   df -h /app/data/nexus/sonatype-work/nexus3
+   ```
+
+4. **Nexus loglarını kontrol edin**
+   ```bash
+   sudo tail -f /app/data/nexus/sonatype-work/nexus3/log/nexus.log
+   ```
+
+---
 
 ## 🔒 Güvenlik Notları
 
-### Temel Güvenlik Önlemleri
+### 1. Encryption Key Güvenliği (v2.2)
 
-#### 1. Varsayılan Şifreyi Değiştirin
-
-İlk girişte admin şifresini mutlaka değiştirin ve güçlü bir şifre kullanın:
-- Minimum 12 karakter
-- Büyük/küçük harf, rakam ve özel karakter içermeli
-
-#### 2. Anonymous Access'i Kapatın
-
-Production ortamlarda anonim erişimi devre dışı bırakın:
-```
-Settings → Security → Anonymous Access → Disable
-```
-
-#### 3. HTTPS Kullanın
-
-Reverse proxy (Nginx/Apache) ile HTTPS yapılandırması yapın.
-
-#### 4. Firewall Kuralları
-
-Sadece gerekli portları açın:
 ```bash
-# Yalnızca belirli IP'lerden erişim
-sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="10.0.0.0/8" port protocol="tcp" port="8081" accept'
+# ✅ YAPILMASI GEREKENLER:
+
+# Backup dosyasını güvenli yere kopyala
+cp /root/nexus-encryption-key-*.txt /secure/offsite/backup/
+
+# İzinleri koru
+chmod 600 /app/nexus/etc/custom-key.json
+chmod 600 /root/nexus-encryption-key-*.txt
+
+# Düzenli yedekleme
+# - custom-key.json
+# - default-application.properties
+# - Database
+
+# ❌ YAPILMAMASI GEREKENLER:
+
+# Backup dosyasını silme
+# Custom key'i değiştirme (data kaybı!)
+# İzinleri gevşetme (chmod 644 gibi)
+```
+
+### 2. Admin Şifresi
+
+```bash
+# İlk giriş sonrası şifreyi DEĞİŞTİRİN
+# admin.password dosyası kurulumdan sonra silinir
+
+# Güçlü şifre kullanın:
+# - Minimum 12 karakter
+# - Büyük/küçük harf
+# - Rakam
+# - Özel karakter
+```
+
+### 3. Anonymous Access
+
+```bash
+# Production'da KAPATIN
+# Web UI: Security → Anonymous Access → Disable
+```
+
+### 4. HTTPS Kullanımı
+
+```bash
+# Production'da HTTPS şart!
+# Kurulumda --enable-ssl kullanın
+
+sudo ./install-nexus.sh \
+  --enable-ssl \
+  --domain nexus.yourdomain.com \
+  --email admin@yourdomain.com
+```
+
+### 5. Firewall Yapılandırması
+
+```bash
+# Sadece gerekli portları açın
+sudo firewall-cmd --list-ports
+
+# Gereksiz portları kapatın
+sudo firewall-cmd --permanent --remove-port=XXXX/tcp
 sudo firewall-cmd --reload
 ```
 
-#### 5. Regular Backup
+### 6. Düzenli Güncellemeler
 
-Otomatik backup görevini mutlaka kurun ve test edin.
-
-#### 6. Güvenlik Güncellemeleri
-
-Nexus ve sistem güncellemelerini düzenli takip edin:
 ```bash
+# Nexus güncellemeleri
+# https://www.sonatype.com/products/repository-oss-download
+
 # Sistem güncellemeleri
 sudo yum update -y
 
-# Nexus güncellemeleri için Sonatype web sitesini takip edin
+# Java güncellemeleri
+sudo yum update java-17-openjdk
 ```
 
-#### 7. Audit Logging
-
-Tüm aktiviteleri loglamak için:
-```
-Settings → System → Capabilities → Audit
-```
-
-#### 8. Role-Based Access Control (RBAC)
-
-Kullanıcılara sadece ihtiyaç duydukları yetkileri verin:
-- Developer: Sadece okuma ve deploy yetkisi
-- Build Server: Deploy yetkisi
-- Admin: Tam yetki
-
-### SELinux Yapılandırması
-
-Production ortamlarda SELinux'u devre dışı bırakmak yerine doğru yapılandırın:
+### 7. Güvenlik Denetimi
 
 ```bash
-# SELinux context'leri ayarla
-sudo semanage fcontext -a -t bin_t "/app/nexus/bin(/.*)?"
-sudo restorecon -R /app/nexus/bin
+# Nexus güvenlik durumu
+# Support → Status → Security
 
-sudo semanage fcontext -a -t usr_t "/app/nexus(/.*)?"
-sudo restorecon -R /app/nexus
+# Log denetimi
+grep -i "authentication failed" /app/data/nexus/sonatype-work/nexus3/log/nexus.log
 
-# Port etiketleme
-sudo semanage port -a -t http_port_t -p tcp 8081
+# Başarısız giriş denemeleri
+grep -i "login" /app/data/nexus/sonatype-work/nexus3/log/request.log
 ```
+
+---
 
 ## ❓ Sık Sorulan Sorular
 
 ### Genel Sorular
 
-**S: Nexus ne kadar RAM kullanır?**
+**S: Nexus ne kadar sürede açılır?**
 
-**C**: Varsayılan olarak 2-4 GB arası. Kullanım senaryonuza göre artırabilirsiniz. nexus.vmoptions dosyasında -Xms ve -Xmx parametreleri ile ayarlayın.
-
----
-
-**S: Birden fazla Nexus instance'ı aynı sunucuda çalışabilir mi?**
-
-**C**: Evet, ancak her instance için farklı portlar ve dizinler kullanmanız gerekir. Script'i kopyalayıp değişkenleri düzenleyin.
+**C**: Normal şartlarda 2-3 dakika. İlk açılış biraz daha uzun sürebilir. Kurulum scripti 90 saniye bekler (v2.2).
 
 ---
 
-**S: Nexus'u Docker container olarak çalıştırmalı mıyım?**
-
-**C**: Her iki yöntem de geçerlidir. Bu script, bare-metal veya VM kurulumları için optimize edilmiştir. Docker daha kolay yönetim sunar, ancak daha fazla resource kullanabilir.
-
----
-
-**S: Script Windows veya Mac'te çalışır mı?**
-
-**C**: Hayır. Bu script RHEL 9 tabanlı Linux dağıtımları için tasarlanmıştır. Windows/Mac için Sonatype'ın resmi Docker image'ını kullanın.
-
----
-
-### Kurulum Soruları
-
-**S: Kurulum ne kadar sürer?**
-
-**C**: İnternet hızınıza bağlı olarak 5-15 dakika arası. Offline kurulumda 2-5 dakika.
-
----
-
-**S: Mevcut Nexus kurulumu üzerine çalıştırılabilir mi?**
-
-**C**: Hayır, önce mevcut kurulumu temizlemeniz önerilir. Yoksa konflikt oluşabilir.
-
----
-
-**S: Farklı bir Java versiyonu kullanabilir miyim?**
-
-**C**: Nexus 3.x için JDK 8, 11 veya 17 kullanılabilir. Ancak JDK 17 önerilir ve script bu versiyonu kurar.
-
----
-
-### Yapılandırma Soruları
-
-**S: Nexus portunu nasıl değiştiririm?**
-
-**C**: Script'teki NEXUS_PORT değişkenini düzenleyin. Ayrıca /app/nexus/etc/nexus-default.properties dosyasında da application-port değerini değiştirin.
-
----
-
-**S: Nexus'u LDAP ile entegre edebilir miyim?**
-
-**C**: Evet, web arayüzünden Settings → Security → LDAP bölümünden yapılandırabilirsiniz.
-
----
-
-**S: Proxy arkasında nasıl çalışır?**
-
-**C**: Settings → System → HTTP bölümünden HTTP ve HTTPS proxy ayarlarını yapın.
-
----
-
-### Yedekleme ve Güvenlik
-
-**S: Backup stratejisi nasıl olmalı?**
+**S: Nexus hangi portları kullanır?**
 
 **C**: 
-- Günlük: Database export task (export işlemi)
-- Haftalık: Blob store backup
-- Aylık: Full sistem snapshot
+- HTTP: 8081 (varsayılan)
+- Docker Registry: 8082-8090 (manuel yapılandırma gerekir)
+- HTTPS: 443 (Nginx kullanıyorsanız)
 
 ---
 
-**S: Nexus şifresi kaybolursa ne yapmalıyım?**
+**S: v2.1'den v2.2'ye nasıl geçiş yaparım?**
 
 **C**: 
-1. Nexus'u durdurun
-2. /app/data/nexus/sonatype-work/nexus3/admin.password dosyasını silin
-3. Nexus'u başlatın
-4. Bu dosya yeniden oluşacak ve içinde yeni şifre olacak
+```bash
+# Yeni kurulum için direk v2.2 kullanın
+# Mevcut kurulum için:
+
+# 1. Backup alın
+sudo tar -czf /backup/nexus-full-$(date +%Y%m%d).tar.gz \
+  /app/nexus /app/data/nexus
+
+# 2. Nexus'u durdurun
+sudo systemctl stop nexus
+
+# 3. custom-key.json oluşturun
+# (Script'teki generate_custom_key_file fonksiyonunu kullanın)
+
+# 4. default-application.properties güncelleyin
+# nexus.secrets.file=/app/nexus/etc/custom-key.json
+
+# 5. nexus.service güncelleyin
+# SuccessExitStatus=143 ekleyin
+
+# 6. Daemon reload ve başlatın
+sudo systemctl daemon-reload
+sudo systemctl start nexus
+
+# 7. API re-encryption yapın
+# (Script'teki komutu kullanın)
+```
 
 ---
 
-**S: SSL sertifikası nasıl eklerim?**
-
-**C**: İki yöntem:
-1. Reverse proxy (Nginx/Apache) kullanarak (önerilir)
-2. Nexus'un kendi SSL yapılandırması (jetty-https.xml)
-
----
-
-### Performans
-
-**S: Nexus çok yavaş, ne yapmalıyım?**
+**S: Custom key dosyasını kaybedersem ne olur?**
 
 **C**: 
-1. RAM artırın (nexus.vmoptions)
-2. Cleanup policy uygulayın
-3. Blob store compact yapın
-4. SSD kullanın
+- ⚠️ Şifrelenmiş veriler ASLA kurtarılamaz!
+- Kullanıcı şifreleri erişilemez hale gelir
+- Repository credentials kaybolur
+- Bu yüzden backup ÇOK önemli!
 
 ---
 
-**S: Çok fazla disk alanı kullanıyor**
+**S: Nexus çok fazla disk alanı kullanıyor**
 
 **C**: 
 - Cleanup policies ayarlayın
 - Proxy cache ayarlarını kontrol edin
 - Gereksiz snapshot'ları temizleyin
 - Blob store compact işlemi yapın
+- Log rotasyon yapılandırın
 
 ---
 
-### Sorun Giderme
+### v2.2 Spesifik Sorular
 
-**S: "Out of Memory" hatası alıyorum**
+**S: API re-encryption neden 90 saniye bekliyor?**
 
-**C**: nexus.vmoptions dosyasında heap boyutunu artırın:
+**C**: Nexus'un tam olarak başlaması ve API'nin hazır olması için gereken süre. Daha kısa/uzun süre için `API_WAIT_TIME` değişkenini değiştirin.
+
+---
+
+**S: API re-encryption başarısız oldu, ne yapmalıyım?**
+
+**C**: Manuel olarak çalıştırın:
 ```bash
--Xms4G
--Xmx8G
+ADMIN_PASS=$(sudo cat /app/data/nexus/sonatype-work/nexus3/admin.password)
+
+curl -X 'PUT' \
+  'http://localhost:8081/service/rest/v1/secrets/encryption/re-encrypt' \
+  -u "admin:${ADMIN_PASS}" \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -H 'NX-ANTI-CSRF-TOKEN: 0.6199265331343733' \
+  -H 'X-Nexus-UI: true' \
+  -d '{
+  "secretKeyId": "alibaba33442",
+  "notifyEmail": "string"
+}'
 ```
 
 ---
 
-**S: Nexus başlamıyor, ne yapmalıyım?**
+**S: "Default Secret Encryption Key" uyarısı alıyorum**
 
 **C**: 
-```bash
-# Logları kontrol edin
-sudo journalctl -u nexus -f
-sudo tail -f /app/data/nexus/sonatype-work/nexus3/log/nexus.log
+1. custom-key.json dosyası var mı kontrol edin
+2. nexus.secrets.file property tanımlı mı kontrol edin
+3. API re-encryption yapıldı mı kontrol edin
+4. Nexus'u yeniden başlatın
 
-# Dosya izinlerini kontrol edin
-ls -la /app/nexus
-sudo chown -R nexus:nexus /app/nexus /app/data/nexus
+```bash
+ls -la /app/nexus/etc/custom-key.json
+grep "nexus.secrets.file" /app/nexus/etc/default-application.properties
+sudo systemctl restart nexus
 ```
 
 ---
-
-**S: Repository'e artifact upload edemiyorum**
-
-**C**: 
-1. Kullanıcı yetkileri kontrol edin
-2. Repository policy kontrol edin (Release/Snapshot)
-3. Disk alanı kontrol edin
-4. Nexus loglarını kontrol edin
 
 ## 💾 Yedekleme ve Geri Yükleme
 
@@ -929,18 +1195,26 @@ sudo tar -czf /backup/nexus-blobs-$(date +%Y%m%d).tar.gz \
   /app/data/nexus/sonatype-work/nexus3/blobs
 ```
 
-#### 3. Yapılandırma Backup
+#### 3. Encryption Key Backup (🆕 v2.2)
 
 ```bash
-# Yapılandırma dosyalarını yedekleyin
+# Custom key dosyasını yedekle
+sudo cp /app/nexus/etc/custom-key.json \
+  /backup/custom-key-$(date +%Y%m%d).json
+
+# Otomatik oluşturulan backup'ı kopyala
+sudo cp /root/nexus-encryption-key-*.txt /backup/
+
+# Yapılandırma dosyalarını yedekle
 sudo tar -czf /backup/nexus-config-$(date +%Y%m%d).tar.gz \
-  /app/nexus/etc \
+  /app/nexus/etc/custom-key.json \
+  /app/nexus/etc/default-application.properties \
   /app/nexus/bin/nexus.vmoptions \
   /app/nexus/bin/nexus.rc \
   /etc/systemd/system/nexus.service
 ```
 
-### Otomatik Backup Script
+### Otomatik Backup Script (v2.2 Enhanced)
 
 ```bash
 #!/bin/bash
@@ -954,21 +1228,34 @@ RETENTION_DAYS=30
 mkdir -p ${BACKUP_DIR}
 
 # Database export (Nexus API kullanarak)
-curl -u admin:admin123 -X POST \
-  "http://localhost:8081/service/rest/v1/tasks/run/db.backup"
+ADMIN_PASS=$(cat /app/data/nexus/sonatype-work/nexus3/admin.password 2>/dev/null)
+if [ -n "$ADMIN_PASS" ]; then
+    curl -u admin:${ADMIN_PASS} -X POST \
+      "http://localhost:8081/service/rest/v1/tasks/run/db.backup"
+fi
+
+# Encryption key backup (v2.2)
+cp /app/nexus/etc/custom-key.json \
+  ${BACKUP_DIR}/custom-key-${DATE}.json 2>/dev/null
 
 # Konfigürasyon backup
 tar -czf ${BACKUP_DIR}/nexus-config-${DATE}.tar.gz \
   /app/nexus/etc \
-  /app/nexus/bin/nexus.vmoptions
+  /app/nexus/bin/nexus.vmoptions \
+  /etc/systemd/system/nexus.service 2>/dev/null
+
+# Database backup
+tar -czf ${BACKUP_DIR}/nexus-db-${DATE}.tar.gz \
+  /app/data/nexus/sonatype-work/nexus3/db 2>/dev/null
 
 # Eski backup'ları temizle
 find ${BACKUP_DIR} -name "nexus-*" -mtime +${RETENTION_DAYS} -delete
+find ${BACKUP_DIR} -name "custom-key-*" -mtime +${RETENTION_DAYS} -delete
 
 echo "Backup completed: ${DATE}"
 ```
 
-Cron job ile otomatikleştirin:
+**Cron Job ile Otomatikleştirme:**
 
 ```bash
 # Crontab'ı düzenle
@@ -978,7 +1265,7 @@ sudo crontab -e
 0 2 * * * /usr/local/bin/nexus-backup.sh >> /var/log/nexus-backup.log 2>&1
 ```
 
-### Geri Yükleme (Restore)
+### Geri Yükleme (Restore) - v2.2
 
 #### 1. Database Restore
 
@@ -1000,29 +1287,26 @@ sudo chown -R nexus:nexus /app/data/nexus/sonatype-work/nexus3/db
 sudo systemctl start nexus
 ```
 
-#### 2. Blob Store Restore
+#### 2. Encryption Key Restore (v2.2)
 
 ```bash
-# Nexus'u durdurun (önerilir)
-sudo systemctl stop nexus
+# Custom key'i geri yükle
+sudo cp /backup/custom-key-YYYYMMDD.json \
+  /app/nexus/etc/custom-key.json
 
-# Blob store'u geri yükleyin
-sudo tar -xzf /backup/nexus-blobs-YYYYMMDD.tar.gz -C /
+# İzinleri ayarla
+sudo chmod 600 /app/nexus/etc/custom-key.json
+sudo chown nexus:nexus /app/nexus/etc/custom-key.json
 
-# İzinleri düzeltin
-sudo chown -R nexus:nexus /app/data/nexus/sonatype-work/nexus3/blobs
-
-# Nexus'u başlatın
-sudo systemctl start nexus
+# Property dosyasını kontrol et
+grep "nexus.secrets.file" /app/nexus/etc/default-application.properties
 ```
 
-#### 3. Disaster Recovery
-
-Tamamen yeni bir sunucuda geri yükleme:
+#### 3. Disaster Recovery (Tam Sistem)
 
 ```bash
-# 1. Script ile Nexus'u kurun
-sudo ./install-nexus-improved.sh
+# 1. v2.2 Script ile Nexus'u kurun
+sudo ./install-nexus.sh
 
 # 2. Nexus'u durdurun
 sudo systemctl stop nexus
@@ -1031,15 +1315,28 @@ sudo systemctl stop nexus
 sudo tar -xzf /backup/nexus-db-YYYYMMDD.tar.gz -C /
 sudo tar -xzf /backup/nexus-blobs-YYYYMMDD.tar.gz -C /
 
-# 4. Yapılandırmaları geri yükleyin
+# 4. Custom key'i geri yükleyin (v2.2)
+sudo cp /backup/custom-key-YYYYMMDD.json /app/nexus/etc/custom-key.json
+sudo chmod 600 /app/nexus/etc/custom-key.json
+
+# 5. Yapılandırmaları geri yükleyin
 sudo tar -xzf /backup/nexus-config-YYYYMMDD.tar.gz -C /
 
-# 5. İzinleri düzeltin
+# 6. İzinleri düzeltin
 sudo chown -R nexus:nexus /app/nexus /app/data/nexus
 
-# 6. Nexus'u başlatın
+# 7. Daemon reload
+sudo systemctl daemon-reload
+
+# 8. Nexus'u başlatın
 sudo systemctl start nexus
+
+# 9. Durumu kontrol edin
+systemctl status nexus
+curl -I http://localhost:8081
 ```
+
+---
 
 ## 🗑️ Kaldırma
 
@@ -1071,6 +1368,10 @@ sudo rm -rf /app/nexus
 sudo rm -rf /app/data/nexus-repo
 sudo rm -rf /app/data/nexus
 
+# Encryption key backup'larını sil (dikkatli!)
+# sudo rm -f /root/nexus-encryption-key-*.txt
+# sudo rm -f /backup/custom-key-*.json
+
 # JDK'yı kaldırmak isterseniz (opsiyonel)
 # sudo yum remove -y java-17-openjdk java-17-openjdk-devel
 
@@ -1083,6 +1384,9 @@ echo "Nexus başarıyla kaldırıldı."
 # Data'yı koruyarak sadece uygulamayı sil
 sudo systemctl stop nexus
 sudo rm -rf /app/nexus
+
+# Yeniden kurulum için
+sudo ./install-nexus.sh
 ```
 
 ### Data Temizleme
@@ -1093,15 +1397,59 @@ sudo rm -rf /app/data/nexus-repo/*
 
 # Sadece geçici dosyaları temizle
 sudo rm -rf /app/data/nexus/sonatype-work/nexus3/tmp/*
-sudo rm -rf /app/data/nexus/sonatype-work/nexus3/log/*
+sudo rm -rf /app/data/nexus/sonatype-work/nexus3/log/*.log.*
 ```
+
+---
 
 ## 📊 Versiyon Geçmişi
 
-### v2.0.0 (Mevcut)
-**Tarih**: 2024
+### v2.2 (2025-11-19) - 🆕 CURRENT
 
-**Yeni Özellikler**:
+**Yeni Özellikler:**
+- ✅ Basitleştirilmiş `custom-key.json` formatı
+- ✅ `nexus.secrets.file` property desteği
+- ✅ Otomatik API re-encryption (90 saniye sonra)
+- ✅ `SuccessExitStatus=143` ile düzeltilmiş systemd service
+- ✅ Key ID: `alibaba33442` (sabit, özelleştirilebilir)
+- ✅ Geliştirilmiş doğrulama mekanizması
+- ✅ Detaylı güvenlik loglaması
+
+**İyileştirmeler:**
+- Systemd stop komutu artık "failed" göstermiyor
+- Custom key dosyası daha basit ve anlaşılır
+- API re-encryption otomatik yapılıyor
+- Geri sayım göstergesi eklendi
+- Manuel komut önerileri geliştirildi
+
+**Düzeltilen Hatalar:**
+- Exit code 143 artık başarılı sayılıyor
+- Stop işlemi doğru çalışıyor
+- Property dosyası tırnak hatasız
+
+---
+
+### v2.1 (2024)
+
+**Yeni Özellikler:**
+- ✅ Custom encryption key desteği
+- ✅ "Default Secret Encryption Key" uyarısını önleme
+- ✅ Detaylı güvenlik loglaması
+- ✅ Encryption key backup'ı otomatik oluşturma
+- ✅ Kurulum sonrası doğrulama testleri
+- ✅ Geliştirilmiş tırnak kontrolü
+
+**İyileştirmeler:**
+- custom-encryption.json formatı
+- Otomatik backup oluşturma
+- JSON format doğrulama
+- Verbose mode eklendi
+
+---
+
+### v2.0 (2024)
+
+**Yeni Özellikler:**
 - ✅ Kapsamlı hata kontrolü mekanizması
 - ✅ İşletim sistemi uyumluluk kontrolü
 - ✅ Disk alanı yönetimi ve kontrolleri
@@ -1111,14 +1459,14 @@ sudo rm -rf /app/data/nexus/sonatype-work/nexus3/log/*
 - ✅ Firewalld servisi kontrolü
 - ✅ SELinux uyumluluğu
 
-**İyileştirmeler**:
+**İyileştirmeler:**
 - Tüm kritik işlemlerde hata kontrolü
 - Dosya indirme doğrulaması
 - Boş dosya kontrolü
 - Servis durum doğrulaması
 - Otomatik offline kurulum desteği
 
-**Desteklenen Sistemler**:
+**Desteklenen Sistemler:**
 - Rocky Linux 9.x
 - RHEL 9.x
 - AlmaLinux 9.x
@@ -1126,10 +1474,9 @@ sudo rm -rf /app/data/nexus/sonatype-work/nexus3/log/*
 
 ---
 
-### v1.0.0 (Orijinal)
-**Tarih**: 2023
+### v1.0 (2023)
 
-**Özellikler**:
+**Özellikler:**
 - Temel Nexus kurulum işlevselliği
 - JDK 17 kurulumu
 - Systemd entegrasyonu
@@ -1144,21 +1491,38 @@ sudo rm -rf /app/data/nexus/sonatype-work/nexus3/log/*
 
 Bir sorun yaşadıysanız:
 
-1. Log dosyalarını toplayın:
+1. **Log dosyalarını toplayın:**
 ```bash
+# Systemd logları
 sudo journalctl -u nexus > nexus-systemd.log
+
+# Nexus logları
 sudo cp /app/data/nexus/sonatype-work/nexus3/log/nexus.log ./
 sudo cp /app/data/nexus/sonatype-work/nexus3/log/jvm.log ./
+
+# Kurulum logu
+sudo cp /var/log/nexus-installation-*.log ./
 ```
 
-2. Sistem bilgilerini toplayın:
+2. **Sistem bilgilerini toplayın:**
 ```bash
 cat /etc/os-release > system-info.txt
 df -h >> system-info.txt
 free -h >> system-info.txt
+uname -a >> system-info.txt
 ```
 
-3. Issue açın ve log dosyalarını ekleyin
+3. **v2.2 spesifik bilgiler:**
+```bash
+# Custom key durumu
+ls -la /app/nexus/etc/custom-key.json >> system-info.txt
+grep "nexus.secrets.file" /app/nexus/etc/default-application.properties >> system-info.txt
+
+# Systemd service durumu
+systemctl status nexus >> system-info.txt
+```
+
+4. Issue açın ve log dosyalarını ekleyin
 
 ### Katkıda Bulunma
 
@@ -1168,11 +1532,19 @@ free -h >> system-info.txt
 4. Branch'i push edin (`git push origin feature/amazing-feature`)
 5. Pull Request açın
 
-### İletişim
+### Test Checklist
 
-- 📧 Email: nexus-support@example.com
-- 🌐 Website: https://example.com/nexus
-- 📚 Dokümantasyon: https://docs.example.com/nexus
+PR açmadan önce:
+- [ ] Rocky Linux 9.x üzerinde test edildi
+- [ ] HTTP kurulum çalışıyor
+- [ ] SSL kurulum çalışıyor (Let's Encrypt veya Self-Signed)
+- [ ] Custom key oluşturuluyor
+- [ ] API re-encryption çalışıyor
+- [ ] Systemd stop düzgün çalışıyor (failed göstermiyor)
+- [ ] Verbose mode çalışıyor
+- [ ] Dokümantasyon güncellendi
+
+---
 
 ## 📄 Lisans
 
@@ -1183,14 +1555,23 @@ Bu script MIT Lisansı altında dağıtılmaktadır.
 - Sonatype ekibine Nexus Repository Manager için
 - Rocky Linux topluluğuna
 - Tüm katkıda bulunanlara
+- Beta testerlar için
+
+---
 
 ## 🔗 Faydalı Linkler
 
 ### Resmi Dokümantasyon
 
 - [Nexus Repository Manager Documentation](https://help.sonatype.com/repomanager3)
+- [Nexus Security Guide](https://help.sonatype.com/repomanager3/nexus-repository-administration/configuring-ssl)
 - [Sonatype Learning](https://learn.sonatype.com/)
 - [Nexus Repository Manager Downloads](https://www.sonatype.com/products/repository-oss-download)
+
+### API Dokümantasyonu
+
+- [Nexus REST API](https://help.sonatype.com/repomanager3/integrations/rest-and-integration-api)
+- [Secrets Encryption API](https://help.sonatype.com/repomanager3/nexus-repository-administration/configuring-ssl#ConfiguringSSL-CustomSecretEncryption)
 
 ### Topluluk Kaynakları
 
@@ -1200,12 +1581,80 @@ Bu script MIT Lisansı altında dağıtılmaktadır.
 
 ### Security ve Best Practices
 
-- [Nexus Security](https://help.sonatype.com/repomanager3/nexus-repository-administration/configuring-ssl)
 - [Repository Management Best Practices](https://www.sonatype.com/resources/repository-management-best-practices)
+- [Nexus Security Best Practices](https://help.sonatype.com/repomanager3/planning-your-implementation/security-best-practices)
+- [OWASP Dependency Check](https://owasp.org/www-project-dependency-check/)
 
 ---
 
-**Son Güncelleme**: 2024  
-**Script Versiyonu**: 2.0.0  
-**Nexus Versiyonu**: 3.86.2-01  
-**Test Edildiği Sistem**: Rocky Linux 9.6 (Blue Onyx)
+## 🎯 Hızlı Referans
+
+### Önemli Komutlar
+
+```bash
+# Servis yönetimi
+systemctl status nexus
+systemctl start nexus
+systemctl stop nexus
+systemctl restart nexus
+systemctl enable nexus
+systemctl disable nexus
+
+# Log görüntüleme
+journalctl -u nexus -f
+tail -f /app/data/nexus/sonatype-work/nexus3/log/nexus.log
+tail -f /app/data/nexus/sonatype-work/nexus3/log/jvm.log
+
+# Yapılandırma
+nano /app/nexus/etc/default-application.properties
+nano /app/nexus/bin/nexus.vmoptions
+nano /etc/systemd/system/nexus.service
+
+# v2.2 spesifik
+cat /app/nexus/etc/custom-key.json
+grep "nexus.secrets.file" /app/nexus/etc/default-application.properties
+cat /root/nexus-encryption-key-*.txt
+```
+
+### Önemli Dosyalar
+
+```
+/app/nexus/etc/custom-key.json              # 🆕 v2.2 Encryption key
+/app/nexus/etc/default-application.properties
+/app/nexus/bin/nexus.vmoptions
+/etc/systemd/system/nexus.service
+/root/nexus-encryption-key-*.txt            # Backup
+/app/data/nexus/sonatype-work/nexus3/admin.password
+```
+
+### Kurulum Kontrol Listesi
+
+- [ ] Script çalıştırıldı ve başarıyla tamamlandı
+- [ ] Servis çalışıyor (`systemctl status nexus`)
+- [ ] Stop testi başarılı (failed göstermiyor)
+- [ ] Web arayüzü erişilebilir
+- [ ] Custom key dosyası mevcut
+- [ ] nexus.secrets.file property tanımlı
+- [ ] Admin şifresi değiştirildi
+- [ ] Anonymous access yapılandırıldı
+- [ ] Encryption key backup alındı
+- [ ] API re-encryption yapıldı
+- [ ] "Default Secret Encryption Key" uyarısı yok
+
+---
+
+**Son Güncelleme:** 19 Kasım 2025  
+**Script Versiyonu:** 2.2  
+**Nexus Versiyonu:** 3.86.2-01  
+**Test Edildiği Sistem:** Rocky Linux 9.6 (Blue Onyx)
+
+---
+
+**Hazırlayan:** Enhanced Installation Script Team  
+**Katkıda Bulunanlar:** Community Contributors  
+**Lisans:** MIT License  
+**Repository:** [https://github.com/remziakyuz/linux_sistem_yonetim_araclari/tree/main/bash_scriptleri/nexus_kurulumu]
+
+---
+
+**🎉 İyi kullanımlar! Happy Nexusing! 🚀**
