@@ -1,2 +1,4 @@
 Türkiye ip networ listeleri;
+https://www.ipdeny.com/ipblocks/data/countries/tr.zone
+Tüm liste;
 https://www.ipdeny.com/ipblocks/
