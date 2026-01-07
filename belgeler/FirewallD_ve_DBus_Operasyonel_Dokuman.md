@@ -1,3 +1,13 @@
+# FirewallD ve DBus Operasyonel Doküman (Güncel Dağıtımlar)
+
+Bu belge; güncel Linux dağıtımları (RHEL/Rocky/Alma 8-10, Fedora, Ubuntu 20.04+, Debian 11+, SLES/openSUSE 15+) için **ek notlar** ve **uyumluluk düzeltmeleri** ile zenginleştirilmiştir.
+
+- Varsayılan backend: **nftables** (modern dağıtımlar)
+- Servis/log yönetimi: **systemd + journalctl**
+- Paket yöneticileri: **dnf / apt / zypper** (yum örnekleri korunur)
+
+---
+
 # FİREWALLD ve DBUS
 # OPERASYONEL DÖKÜMAN
 
@@ -1820,10 +1830,136 @@ Bu döküman, firewalld ve dbus konularında kapsamlı bir referans kaynağı su
 
 ---
 
-**Döküman Versiyonu**: 1.0  
-**Son Güncelleme**: Kasım 2024  
+**Döküman Versiyonu**: 1.1  
+**Son Güncelleme**: Kasım 2026  
 **Yazar**: Linux Sistem Destek Ekibi
 
 ---
 
 *Bu döküman, production ortamlarda güvenli ve performanslı firewall yapılandırması için hazırlanmıştır.*
+
+---
+
+# EK A: Dağıtım Bazlı Hızlı Özet (RHEL / Fedora / Ubuntu / Debian / SUSE)
+
+Aşağıdaki tablo, bu dokümandaki komutların dağıtımlara göre pratik karşılıklarını tek yerde toplar.
+
+## A.1 Paket Kurulumu
+
+| Amaç | RHEL / Fedora | Ubuntu / Debian | SUSE |
+|---|---|---|---|
+| firewalld | `dnf install -y firewalld` | `apt update && apt install -y firewalld` | `zypper refresh && zypper install -y firewalld` |
+| ipset | `dnf install -y ipset` | `apt update && apt install -y ipset` | `zypper refresh && zypper install -y ipset` |
+| conntrack (opsiyonel) | `dnf install -y conntrack-tools` | `apt update && apt install -y conntrack` | `zypper refresh && zypper install -y conntrack-tools` |
+| geoipupdate | `dnf install -y geoipupdate` | `apt update && apt install -y geoipupdate` | `zypper refresh && zypper install -y geoipupdate` |
+| xtables-addons (opsiyonel) | `dnf install -y xtables-addons` | `apt update && apt install -y xtables-addons-common` | `zypper refresh && zypper install -y xtables-addons` |
+
+## A.2 Servis Yönetimi
+
+| İşlem | Komut |
+|---|---|
+| Etkinleştir + başlat | `systemctl enable --now firewalld` |
+| Durum | `systemctl status firewalld` |
+| Yeniden başlat | `systemctl restart firewalld` |
+| Firewalld reload | `firewall-cmd --reload` |
+
+## A.3 Log İzleme (Güncel)
+
+Modern dağıtımlarda birincil kaynak **systemd-journald**’dır:
+
+```bash
+journalctl -u firewalld --no-pager -n 200
+journalctl -u firewalld -f
+journalctl -k --no-pager -n 200
+```
+
+Dağıtım notları:
+- RHEL/Fedora: klasik `/var/log/messages` bulunabilir.
+- Ubuntu/Debian: `/var/log/syslog` daha yaygındır.
+- Yine de en sağlıklısı: `journalctl`.
+
+## A.4 Backend ve Kuralların Görülmesi
+
+| Amaç | Komut |
+|---|---|
+| Firewalld backend | `firewall-cmd --get-backend` |
+| nftables ruleset | `nft list ruleset` |
+| iptables (legacy) | `iptables -L -n -v` |
+
+---
+
+# EK B: Security Baseline (Minimum Güvenli Başlangıç)
+
+Bu ek; production sunucular için “minimum güvenli” başlangıç çizgisidir. Amaç:
+- Varsayılanı kapalı tutmak (deny-by-default)
+- Sadece gerekli servisleri açmak (allowlist)
+- SSH ve yönetim yüzeyini sıkılaştırmak
+- İzleme ve yedekleme disiplinini standardize etmek
+
+## B.1 Baseline Varsayımları
+
+- Varsayılan zone: `public` (değilse kendi zone’unuza uyarlayın).
+- Yönetim (SSH) mümkünse ayrı bir yönetim IP bloğundan gelecek.
+
+## B.2 Hızlı Baseline Uygulaması
+
+### 1) Varsayılan yaklaşım: deny-by-default
+
+```bash
+firewall-cmd --permanent --zone=public --set-target=DROP
+firewall-cmd --reload
+```
+
+### 2) Sadece gerekli servisleri aç
+
+Örnek (web sunucusu + yönetim):
+
+```bash
+firewall-cmd --permanent --zone=public --add-service=http
+firewall-cmd --permanent --zone=public --add-service=https
+firewall-cmd --reload
+```
+
+### 3) SSH’ı sadece yönetim ağından aç
+
+Örnek yönetim ağı: `10.0.0.0/24`
+
+```bash
+firewall-cmd --permanent --zone=public --remove-service=ssh
+firewall-cmd --permanent --zone=public --add-rich-rule='rule family="ipv4" source address="10.0.0.0/24" service name="ssh" accept'
+firewall-cmd --reload
+```
+
+### 4) SSH brute-force için rate limit (opsiyonel)
+
+```bash
+firewall-cmd --permanent --zone=public --add-rich-rule='rule service name="ssh" limit value="5/m" accept'
+firewall-cmd --reload
+```
+
+### 5) Log/izleme
+
+```bash
+firewall-cmd --set-log-denied=all
+journalctl -u firewalld -f
+journalctl -k -f
+```
+
+Not: Yüksek trafikte log gürültüsü yaratabilir; gerekirse `off` yapın.
+
+## B.3 Yedekleme
+
+```bash
+tar -czf /var/backups/firewalld_$(date +%F_%H%M%S).tar.gz /etc/firewalld
+firewall-cmd --list-all-zones > /var/backups/firewalld_runtime_$(date +%F_%H%M%S).txt
+ipset save > /var/backups/ipsets_$(date +%F_%H%M%S).txt
+```
+
+## B.4 Doğrulama Checklist
+
+- [ ] Varsayılan zone doğru mu?
+- [ ] Sadece gerekli servis/port açık mı?
+- [ ] SSH sadece yönetim ağından mı?
+- [ ] Reload sonrası kurallar korunuyor mu?
+- [ ] Log/izleme çalışıyor mu?
+- [ ] Yedek alındı mı?
