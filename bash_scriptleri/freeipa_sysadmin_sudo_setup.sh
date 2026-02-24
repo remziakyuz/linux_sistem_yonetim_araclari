@@ -1001,13 +1001,62 @@ section "KURULUM DOĞRULAMA VE ÖZET"
 
 echo ""
 info "Oluşturulan sudo komut grupları:"
-ipa sudocmdgroup-find 2>/dev/null | grep "Group name" | grep "sysadmin" | \
-    awk '{print "  OK " $3}'
+ALL_GROUPS=(
+    "sysadmin_service_mgmt"
+    "sysadmin_disk_mgmt"
+    "sysadmin_filesystem_mgmt"
+    "sysadmin_network_mgmt"
+    "sysadmin_cpu_process_mgmt"
+    "sysadmin_log_analysis"
+    "sysadmin_app_analysis"
+    "sysadmin_system_config"
+    "sysadmin_disk_encryption"
+    "sysadmin_hardware_mgmt"
+    "sysadmin_user_mgmt"
+    "sysadmin_security_analysis"
+    "sysadmin_backup_recovery"
+    "sysadmin_virt_container"
+    "sysadmin_deny_root_shells"
+)
+
+GRP_OK=0; GRP_FAIL=0
+for g in "${ALL_GROUPS[@]}"; do
+    if ipa sudocmdgroup-show "$g" &>/dev/null; then
+        # Üye sayısını al
+        MEMBERS=$(ipa sudocmdgroup-show "$g" 2>/dev/null | awk -F: '/Member Sudo/{gsub(/,/,"",$0); n=NF-1; print n}' || echo "?")
+        echo -e "  ${GREEN}[OK]${NC} $g"
+        GRP_OK=$((GRP_OK+1))
+    else
+        echo -e "  ${RED}[HATA]${NC} $g - BULUNAMADI!"
+        GRP_FAIL=$((GRP_FAIL+1))
+    fi
+done
+echo ""
+info "Grup özeti: ${GRP_OK} başarılı, ${GRP_FAIL} başarısız"
 
 echo ""
 info "Oluşturulan sudo kuralları:"
-ipa sudorule-find 2>/dev/null | grep "Rule name" | grep -E "sysadmin" | \
-    awk '{print "  OK " $3}'
+for rule in "rule_linux_sysadmin" "rule_linux_sysadmin_deny_root"; do
+    if ipa sudorule-show "$rule" &>/dev/null; then
+        echo -e "  ${GREEN}[OK]${NC} $rule"
+    else
+        echo -e "  ${RED}[HATA]${NC} $rule - BULUNAMADI!"
+    fi
+done
+
+echo ""
+info "IPA linux-sysadmin grubu:"
+if ipa group-show linux-sysadmin &>/dev/null; then
+    MEMBERS=$(ipa group-show linux-sysadmin 2>/dev/null | awk -F: '/Member users:/{print $2}')
+    echo -e "  ${GREEN}[OK]${NC} linux-sysadmin | Üyeler:${MEMBERS:-" (henüz üye yok)"}"
+else
+    echo -e "  ${RED}[HATA]${NC} linux-sysadmin - BULUNAMADI!"
+fi
+
+echo ""
+info "Allow kuralı komut grup bağlantıları:"
+ipa sudorule-show "rule_linux_sysadmin" 2>/dev/null | grep -E "Sudo Allow|Command Groups" | sed 's/^/  /'
+
 
 echo ""
 echo -e "${GREEN}${BOLD}"
