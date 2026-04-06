@@ -39,7 +39,7 @@ sudo tail -f /var/log/allowcntry.log
 | Sadece TR | `sudo python3 geoip_firewall_setup.py --allow TR` |
 | TR + DE | `sudo python3 geoip_firewall_setup.py --allow TR,DE` |
 | Veritabanı güncellemesini atla | `--skip-update` |
-| Ekstra yerel ağ ekle | `--local-networks 10.10.0.0/16,172.20.0.0/14` |
+| Ekstra yerel ağ ekle | `--local-networks 10.253.10.0/24,192.168.5.0/24` |
 | Yerel ağ kurallarını devre dışı bırak | `--no-local` *(önerilmez)* |
 | Tüm parametreler | `python3 geoip_firewall_setup.py --help` |
 
@@ -62,8 +62,8 @@ Script 8 adımda çalışır:
 
 | Dosya | İçerik | Öncelik |
 |-------|--------|---------|
-| `ipset4-local.xml` | RFC 1918 + loopback IPv4 | -32768 (en yüksek) |
-| `ipset6-local.xml` | RFC 4193 + loopback IPv6 | -32768 (en yüksek) |
+| `ipset4-local.xml` | Loopback + link-local + özel subnet'ler (IPv4) | -32768 (en yüksek) |
+| `ipset6-local.xml` | Loopback + link-local + özel subnet'ler (IPv6) | -32768 (en yüksek) |
 | `geoip4-notblock.xml` | Tüm izinli ülkeler — IPv4 | -32767 |
 | `geoip6-notblock.xml` | Tüm izinli ülkeler — IPv6 | -32767 |
 | `geoip4-tr.xml` | TR IPv4 (ayrı referans) | — |
@@ -84,24 +84,55 @@ Script 8 adımda çalışır:
 ## 🔒 Yerel Ağ IPSet'i (`ipset4-local` / `ipset6-local`)
 
 **v3.0'da eklendi.** Yerel ağ trafiği `-32768` önceliğiyle **her zaman kabul edilir**
-ve GeoIP drop kurallarından etkilenmez. Bu sayede:
+ve GeoIP drop kurallarından etkilenmez.
 
-- LAN erişimi (SSH, yönetim vb.) kesinlikle bloklanmaz
-- Loopback adresleri (`127.0.0.1`, `::1`) korunur
-- VPN / management subnet'leri `--local-networks` ile eklenebilir
+Varsayılan (minimal): `127.0.0.0/8` (loopback), `169.254.0.0/16` (link-local)
 
-Varsayılan IPv4 ağları: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16`
-
-Varsayılan IPv6 ağları: `::1/128`, `fc00::/7`, `fe80::/10`, `::ffff:0:0/96`
+> **Not:** `10.0.0.0/8` gibi geniş RFC 1918 blokları varsayılanda yoktur — alt subnet'lerle
+> çakışır. LAN subnet'lerinizi açıkça belirtin:
 
 ```bash
-# Örnek: VPN subnet'ini ekle
-sudo python3 geoip_firewall_setup.py --allow TR --local-networks 10.8.0.0/24
+sudo python3 geoip_firewall_setup.py --allow TR \
+  --local-networks 10.253.10.0/24,10.255.255.0/24
 ```
 
 ---
 
-## ⚠️ Kritik Uyarılar
+## 🔍 IPSet Durum Kontrolleri
+
+```bash
+# Yüklü ipset'leri listele
+sudo firewall-cmd --get-ipsets
+
+# ipset detayı (firewalld tanımı)
+sudo firewall-cmd --info-ipset=ipset4-local
+sudo firewall-cmd --info-ipset=geoip4-notblock
+
+# Ham ipset içeriği (kernel)
+sudo ipset list ipset4-local
+sudo ipset list geoip4-notblock | head -30
+
+# Entry sayısı
+sudo ipset list geoip4-notblock | grep -c "^[0-9]"
+
+# Belirli bir IP izinli mi?
+sudo ipset test geoip4-notblock 1.2.3.4 && echo "İZİNLİ" || echo "BLOKLU"
+
+# Belirli subnet XML'de var mı?
+grep "10.253.10.0" /etc/firewalld/ipsets/ipset4-local.xml
+
+# Tüm ipset'lerin özet tablosu
+for s in $(sudo firewall-cmd --get-ipsets); do
+  count=$(sudo ipset list "$s" 2>/dev/null | grep -c "^[0-9a-f]" || echo "?")
+  printf "%-25s : %s entry\n" "$s" "$count"
+done
+
+# Aktif kurallar
+sudo firewall-cmd --list-rich-rules
+
+# Log dosyası
+sudo tail -f /var/log/allowcntry.log
+```
 
 > **1. Kendi ülkenizi ekleyin!** SSH bağlantınızın kesilmemesi için `--allow` listesine
 > bağlandığınız ülkeyi mutlaka ekleyin.

@@ -95,34 +95,49 @@ cmd "sudo python3 geoip_firewall_setup.py --allow TR,DE,FR,IT,ES,GB,NL,BE,AT,CH,
 echo ""
 
 # ──────────────────────────────────────────────────────────────────────────────
-section "6. Durum Kontrol Komutları"
-
-cmd "sudo firewall-cmd --list-rich-rules"
-echo "     Tüm aktif rich rule'ları göster."
-echo ""
+section "6. IPSet Durum Kontrolleri"
 
 cmd "sudo firewall-cmd --get-ipsets"
-echo "     Yüklü IPSet'leri listele."
+echo "     Yüklü tüm ipset'leri listele."
+echo ""
+
+cmd "sudo firewall-cmd --info-ipset=ipset4-local"
+cmd "sudo firewall-cmd --info-ipset=geoip4-notblock"
+echo "     firewalld XML tanımını göster (family, type, description)."
 echo ""
 
 cmd "sudo ipset list ipset4-local"
-echo "     Yerel IPv4 ağlarını göster."
+cmd "sudo ipset list geoip4-notblock | head -30"
+echo "     Kernel'deki ham ipset içeriğini göster."
 echo ""
 
-cmd "sudo ipset list ipset6-local"
-echo "     Yerel IPv6 ağlarını göster."
+cmd "sudo ipset list geoip4-notblock | grep -c '^[0-9]'"
+cmd "grep -c '<entry>' /etc/firewalld/ipsets/ipset4-local.xml"
+echo "     ipset'teki entry sayısını öğren."
 echo ""
 
-cmd "sudo ipset list geoip4-notblock | head -20"
-echo "     İzinli ülkeler IPv4 ipset'ini önizle."
+cmd "sudo ipset test geoip4-notblock 1.2.3.4 && echo 'İZİNLİ' || echo 'BLOKLU'"
+echo "     Belirli bir IP'nin ipset'te olup olmadığını test et."
 echo ""
 
-cmd "sudo firewall-cmd --list-all"
-echo "     Tüm firewalld yapılandırmasını göster."
+cmd "grep '<entry>' /etc/firewalld/ipsets/ipset4-local.xml"
+echo "     XML dosyasındaki tüm entry'leri listele."
 echo ""
 
-cmd "sudo systemctl status firewalld"
-echo "     Firewalld servis durumunu kontrol et."
+cmd "grep '10.253.10.0' /etc/firewalld/ipsets/ipset4-local.xml"
+echo "     Belirli bir subnet XML'de var mı kontrol et."
+echo ""
+
+cmd "# Tüm ipset'lerin özet tablosu"
+cmd "for s in \$(sudo firewall-cmd --get-ipsets); do"
+cmd "  count=\$(sudo ipset list \"\$s\" 2>/dev/null | grep -c '^[0-9a-f]' || echo '?')"
+cmd "  printf '%-25s : %s entry\n' \"\$s\" \"\$count\""
+cmd "done"
+echo ""
+echo "  Örnek çıktı:"
+echo "    geoip4-notblock           : 14823 entry"
+echo "    geoip4-tr                 : 12105 entry"
+echo "    ipset4-local              : 4 entry"
 echo ""
 
 # ──────────────────────────────────────────────────────────────────────────────

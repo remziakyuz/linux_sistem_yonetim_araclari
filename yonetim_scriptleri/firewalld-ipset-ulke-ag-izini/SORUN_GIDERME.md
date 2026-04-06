@@ -324,12 +324,37 @@ df -h && free -h
 sudo firewall-cmd --state
 sudo firewall-cmd --list-all
 sudo firewall-cmd --list-rich-rules
+
+# --- IPSet listesi ---
 sudo firewall-cmd --get-ipsets
 
-# --- IPSet içerikleri ---
+# --- IPSet detayı (firewalld tanımı) ---
+sudo firewall-cmd --info-ipset=ipset4-local
+sudo firewall-cmd --info-ipset=geoip4-notblock
+
+# --- Ham ipset içeriği (kernel) ---
 sudo ipset list ipset4-local
 sudo ipset list ipset6-local
 sudo ipset list geoip4-notblock | head -20
+
+# --- Entry sayısı ---
+sudo ipset list geoip4-notblock | grep -c "^[0-9]"
+sudo ipset list ipset4-local    | grep -c "^[0-9]"
+
+# --- Belirli bir IP izinli mi? ---
+sudo ipset test geoip4-notblock 1.2.3.4 && echo "İZİNLİ" || echo "BLOKLU"
+sudo ipset test ipset4-local 10.253.10.5 && echo "YEREL" || echo "Yerel değil"
+
+# --- XML dosyaları ---
+grep "<entry>" /etc/firewalld/ipsets/ipset4-local.xml
+grep -c "<entry>" /etc/firewalld/ipsets/geoip4-notblock.xml
+grep "10.253.10.0" /etc/firewalld/ipsets/ipset4-local.xml  # subnet var mı?
+
+# --- Tüm ipset'lerin özet tablosu ---
+for s in $(sudo firewall-cmd --get-ipsets); do
+  count=$(sudo ipset list "$s" 2>/dev/null | grep -c "^[0-9a-f]" || echo "?")
+  printf "%-25s : %s entry\n" "$s" "$count"
+done
 
 # --- Log ---
 sudo tail -100 /var/log/allowcntry.log

@@ -112,17 +112,14 @@ geoip6-notblock.xml    # Tüm izinli ülkeler — IPv6 (kural tarafından kullan
 **Yerel ağ ipset'leri** (v3.0 — yeni):
 
 ```
-ipset4-local.xml       # RFC 1918 + loopback + link-local (IPv4)
-ipset6-local.xml       # RFC 4193 + loopback + link-local (IPv6)
+ipset4-local.xml       # Loopback + link-local + kullanıcı tanımlı subnet'ler (IPv4)
+ipset6-local.xml       # Loopback + link-local + kullanıcı tanımlı subnet'ler (IPv6)
 ```
 
-Varsayılan IPv4 içeriği:
+Varsayılan IPv4 içeriği (minimal — yalnızca evrensel adresler):
 
 | CIDR | Açıklama |
 |------|----------|
-| `10.0.0.0/8` | RFC 1918 Class-A özel |
-| `172.16.0.0/12` | RFC 1918 Class-B özel |
-| `192.168.0.0/16` | RFC 1918 Class-C özel |
 | `127.0.0.0/8` | Loopback |
 | `169.254.0.0/16` | Link-local (APIPA) |
 
@@ -131,15 +128,15 @@ Varsayılan IPv6 içeriği:
 | CIDR | Açıklama |
 |------|----------|
 | `::1/128` | Loopback |
-| `fc00::/7` | Unique local (RFC 4193) |
 | `fe80::/10` | Link-local |
-| `::ffff:0:0/96` | IPv4-mapped |
 
-Özel bir VPN veya yönetim ağı eklemek için:
+> **Not:** `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` gibi geniş RFC 1918 blokları
+> artık varsayılanda **yoktur**. Bu bloklar eklenirse alt subnet'ler çakışma hatası verir
+> (nftables overlapping intervals). LAN subnet'lerinizi `--local-networks` ile açıkça belirtin:
 
 ```bash
 sudo python3 geoip_firewall_setup.py --allow TR \
-  --local-networks 10.8.0.0/24,2001:db8::/32
+  --local-networks 10.253.10.0/24,10.255.255.0/24,192.168.5.0/24
 ```
 
 ### Adım 7 — Firewalld Kuralları
@@ -184,22 +181,129 @@ sudo grep ERROR /var/log/allowcntry.log
 
 ---
 
-## 🔍 Durum Kontrolü
+## 🔍 Durum Kontrolü ve IPSet İnceleme
+
+### Yüklü ipset'leri listele
 
 ```bash
-# Aktif kurallar
-sudo firewall-cmd --list-rich-rules
-
-# IPSet listesi
 sudo firewall-cmd --get-ipsets
+```
 
-# Belirli bir ipset'in içeriği
-sudo ipset list geoip4-notblock | head -50
+Örnek çıktı:
+```
+geoip4-notblock geoip4-tr geoip6-notblock geoip6-tr ipset4-local ipset6-local
+```
+
+---
+
+### Belirli bir ipset'in detaylarını gör
+
+```bash
+# firewalld'nin XML tanımı (family, type, entry sayısı)
+sudo firewall-cmd --info-ipset=ipset4-local
+sudo firewall-cmd --info-ipset=geoip4-notblock
+
+# Kernel'deki ham ipset içeriği (tüm entry'ler)
 sudo ipset list ipset4-local
+sudo ipset list ipset6-local
+sudo ipset list geoip4-notblock | head -30
+```
 
-# Firewalld genel durum
+---
+
+### Entry sayısını öğren
+
+```bash
+# Kernel üzerinden (en güvenilir)
+sudo ipset list geoip4-notblock | grep -c "^[0-9]"
+sudo ipset list ipset4-local    | grep -c "^[0-9]"
+
+# XML dosyası üzerinden
+grep -c "<entry>" /etc/firewalld/ipsets/geoip4-notblock.xml
+grep -c "<entry>" /etc/firewalld/ipsets/ipset4-local.xml
+```
+
+---
+
+### Belirli bir IP'nin ipset'te olup olmadığını test et
+
+```bash
+# IP izinli ülkeler listesinde mi?
+sudo ipset test geoip4-notblock 1.2.3.4 && echo "İZİNLİ" || echo "BLOKLU"
+
+# IP yerel ağ listesinde mi?
+sudo ipset test ipset4-local 10.253.10.5 && echo "YEREL" || echo "Yerel değil"
+```
+
+---
+
+### XML dosyalarını doğrudan incele
+
+```bash
+# Tüm entry'leri listele
+grep "<entry>" /etc/firewalld/ipsets/ipset4-local.xml
+
+# Entry'ler olmadan sadece başlığı gör (family, type, description)
+grep -v "<entry>" /etc/firewalld/ipsets/ipset4-local.xml
+
+# Belirli bir subnet var mı?
+grep "10.253.10.0" /etc/firewalld/ipsets/ipset4-local.xml
+```
+
+---
+
+### Aktif rich rule'ları gör
+
+```bash
+sudo firewall-cmd --list-rich-rules
+```
+
+Beklenen çıktı:
+```
+rule priority="-32768" family="ipv4" source ipset="ipset4-local" accept
+rule priority="-32768" family="ipv6" source ipset="ipset6-local" accept
+rule priority="-32767" family="ipv4" source ipset="geoip4-notblock" accept
+rule priority="-32767" family="ipv4" drop
+rule priority="-32767" family="ipv6" source ipset="geoip6-notblock" accept
+rule priority="-32767" family="ipv6" drop
+```
+
+---
+
+### Tüm firewalld durumunu bir arada gör
+
+```bash
 sudo firewall-cmd --list-all
+```
+
+---
+
+### Tüm ipset'lerin özet tablosu
+
+```bash
+for s in $(sudo firewall-cmd --get-ipsets); do
+  count=$(sudo ipset list "$s" 2>/dev/null | grep -c "^[0-9a-f]" || echo "?")
+  printf "%-25s : %s entry\n" "$s" "$count"
+done
+```
+
+Örnek çıktı:
+```
+geoip4-notblock           : 14823 entry
+geoip4-tr                 : 12105 entry
+geoip6-notblock           : 3201 entry
+geoip6-tr                 : 2984 entry
+ipset4-local              : 4 entry
+ipset6-local              : 2 entry
+```
+
+---
+
+### Firewalld ve sistem durumu
+
+```bash
 sudo systemctl status firewalld
+sudo firewall-cmd --state
 ```
 
 ---
