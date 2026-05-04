@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 #  iSCSI Target Sunucu Yönetim Scripti
-#  Sürüm  : 0.85
+#  Sürüm  : 0.94
 #  Destek : Oracle Linux 8/9 · RHEL 8/9 · Rocky · AlmaLinux · Fedora · CentOS
 #  Kullanım: sudo bash iscsi-manager.sh [--dry-run]
 # =============================================================================
@@ -10,7 +10,7 @@ set -uo pipefail
 [[ "${BASH_VERSINFO[0]}" -lt 4 ]] && { echo "Bash 4+ gerekli."; exit 1; }
 
 # ─── Sabitler ─────────────────────────────────────────────────────────────────
-readonly VERSION="0.85"
+readonly VERSION="0.94"
 readonly CONFIG_DIR="/etc/iscsi-manager"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.sh"
 readonly BACKUP_DIR="${CONFIG_DIR}/backups"
@@ -39,6 +39,11 @@ log_warn()    { echo -e "${YELLOW}[UYARI]${NC} $*"; echo "$(_ts) [UYARI] $*" >> 
 log_error()   { echo -e "${RED}[HATA ]${NC} $*" >&2; echo "$(_ts) [HATA ] $*" >> "$LOG_FILE" 2>/dev/null || true; }
 log_section() { echo -e "\n${CYAN}${BOLD}══ $* ══${NC}"; }
 die()         { log_error "$@"; exit 1; }
+# Pipe ( { ... } | _run_targetcli ) bloğu içinde kullanılacak log fonksiyonları.
+# stdout targetcli'ye gider, bu yüzden log çıktısı stderr'e yönlendirilir.
+_p_info()  { echo -e "${BLUE}[INFO ]${NC} $*" >&2; echo "$(_ts) [INFO ] $*" >> "$LOG_FILE" 2>/dev/null || true; }
+_p_ok()    { echo -e "${GREEN}[ OK  ]${NC} $*" >&2; echo "$(_ts) [ OK  ] $*" >> "$LOG_FILE" 2>/dev/null || true; }
+_p_warn()  { echo -e "${YELLOW}[UYARI]${NC} $*" >&2; echo "$(_ts) [UYARI] $*" >> "$LOG_FILE" 2>/dev/null || true; }
 
 # ─── Menü ─────────────────────────────────────────────────────────────────────
 # Kurallar:
@@ -318,52 +323,136 @@ _run_targetcli() {
         log_warn "[DRY-RUN] targetcli komutları:"
         cat "$tmpf"
     else
-        targetcli < "$tmpf" 2>&1 | tee -a "$LOG_FILE"
+        # Zararsız "already exists" uyarılarını filtrele, gerçek hataları göster
+        targetcli < "$tmpf" 2>&1 | \
+            grep -v -E "already exists in configFS|already mapped to this NodeACL|This MappedLUN already|This NodeACL already|This NetworkPortal already|This Target already|Storage object .* exists$|lun for storage object .* already exists" | \
+            tee -a "$LOG_FILE"
     fi
     rm -f "$tmpf"
+}
+
+# ─── Backstore İsim Çözümleme ─────────────────────────────────────────────────
+_resolve_backstore_name() {
+    # Bir block device için mevcut backstore adını bul; yoksa varsayılan üret.
+    # $1 = /dev/vg/lv   $2 = lv adı   $3 = lun numarası   $4 = targetcli ls çıktısı
+    local dev="$1" default_lv="$2" default_lno="$3" tcli_state="$4"
+    local default_bs="${default_lv}_lun${default_lno}"
+
+    if [[ -n "$tcli_state" ]]; then
+        # targetcli ls çıktısında dev yolunu içeren backstore satırını bul
+        # Örnek: "o- lv_ha_shared02_lun3 ... [/dev/vg_data01/lv_ha_shared03 (50.0GiB) ...]"
+        local existing_bs
+        existing_bs=$(echo "$tcli_state" \
+            | grep -F "$dev" \
+            | grep -E "write-thru|write-back|activated|deactivated" \
+            | sed -n 's/.*o- \([a-zA-Z0-9_-]*\)\s.*/\1/p' \
+            | head -1)
+        if [[ -n "$existing_bs" ]]; then
+            printf '%s' "$existing_bs"
+            return
+        fi
+    fi
+    printf '%s' "$default_bs"
 }
 
 # ─── Cluster: Backstore Attribute'ları ───────────────────────────────────────
 _cluster_backstore_attrs() {
     # $1 = backstore adı
-    # Çıktı: targetcli komut satırları
+    # Çıktı (stdout): yalnızca DEĞİŞMESİ gereken targetcli komutları
+    # Durum (stderr): ✓ güncel / ↻ güncelleniyor mesajları
     local bs="$1"
-    cat <<ATTRS
-cd /backstores/block/${bs}
-set attribute emulate_pr=1
-set attribute emulate_caw=1
-set attribute emulate_3pc=1
-set attribute emulate_tpu=1
-set attribute emulate_tpws=1
-set attribute enforce_pr_isids=1
-set attribute emulate_rest_reord=0
-set attribute emulate_write_cache=0
-set attribute emulate_fua_write=1
-set attribute emulate_fua_read=1
-set attribute emulate_ua_intlck_ctrl=0
-ATTRS
+    local -a attr_pairs=(
+        "emulate_pr:1"  "emulate_caw:1"  "emulate_3pc:1"
+        "emulate_tpu:1" "emulate_tpws:1" "enforce_pr_isids:1"
+        "emulate_rest_reord:0" "emulate_write_cache:0"
+        "emulate_fua_write:1" "emulate_fua_read:1"
+    )
+
+    # configfs dizinini bul
+    local cfg_base=""
+    local d
+    for d in /sys/kernel/config/target/core/iblock_*/"${bs}"; do
+        [[ -d "$d" ]] && cfg_base="$d" && break
+    done
+
+    local changed=0 need_cd=true
+    local pair attr val current
+    for pair in "${attr_pairs[@]}"; do
+        attr="${pair%%:*}"; val="${pair##*:}"
+        current=""
+        [[ -n "$cfg_base" && -f "${cfg_base}/attrib/${attr}" ]] && \
+            current=$(cat "${cfg_base}/attrib/${attr}" 2>/dev/null)
+        if [[ "$current" != "$val" ]]; then
+            $need_cd && { echo "cd /backstores/block/${bs}"; need_cd=false; }
+            echo "set attribute ${attr}=${val}"
+            (( changed++ ))
+        fi
+    done
+
+    if (( changed == 0 )); then
+        _p_info "  ✓ Backstore '${bs}' attribute'ları güncel."
+    else
+        _p_info "  ↻ Backstore '${bs}': ${changed} attribute güncelleniyor."
+    fi
 }
 
 # ─── Cluster: TPG Parametreleri ──────────────────────────────────────────────
 _cluster_tpg_params() {
-    cat <<TPGP
-cd /iscsi/${ISCSI_TARGET_IQN}/tpg1
-set parameter MaxBurstLength=${ISCSI_MAX_BURST}
-set parameter FirstBurstLength=${ISCSI_FIRST_BURST}
-set parameter InitialR2T=No
-set parameter ImmediateData=Yes
-set parameter MaxOutstandingR2T=${ISCSI_MAX_R2T}
-set parameter MaxConnections=1
-set parameter HeaderDigest=${CLUSTER_DIGEST}
-set parameter DataDigest=${CLUSTER_DIGEST}
-set attribute login_timeout=${ISCSI_LOGIN_TIMEOUT}
-set attribute nopin_timeout=${ISCSI_NOPIN_TIMEOUT}
-set attribute nopin_response_timeout=${ISCSI_NOPIN_RESP_TIMEOUT}
-set attribute default_erl=0
-set attribute demo_mode_write_protect=0
-set attribute generate_node_acls=0
-set attribute cache_dynamic_acls=0
-TPGP
+    # Çıktı (stdout): yalnızca DEĞİŞMESİ gereken targetcli komutları
+    local tpg_base="/sys/kernel/config/target/iscsi/${ISCSI_TARGET_IQN}/tpgt_1"
+
+    local -a params=(
+        "MaxBurstLength:${ISCSI_MAX_BURST}"
+        "FirstBurstLength:${ISCSI_FIRST_BURST}"
+        "InitialR2T:No"
+        "ImmediateData:Yes"
+        "MaxOutstandingR2T:${ISCSI_MAX_R2T}"
+        "MaxConnections:1"
+        "HeaderDigest:${CLUSTER_DIGEST}"
+        "DataDigest:${CLUSTER_DIGEST}"
+    )
+    local -a attrs=(
+        "login_timeout:${ISCSI_LOGIN_TIMEOUT}"
+        "default_erl:0"
+        "demo_mode_write_protect:0"
+        "generate_node_acls:0"
+        "cache_dynamic_acls:0"
+    )
+
+    local need_cd=true changed=0
+    local pair pname pval current
+
+    # Parametreler (param/ dizininde)
+    for pair in "${params[@]}"; do
+        pname="${pair%%:*}"; pval="${pair##*:}"
+        current=""
+        [[ -f "${tpg_base}/param/${pname}" ]] && \
+            current=$(cat "${tpg_base}/param/${pname}" 2>/dev/null)
+        if [[ "$current" != "$pval" ]]; then
+            $need_cd && { echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1"; need_cd=false; }
+            echo "set parameter ${pname}=${pval}"
+            (( changed++ ))
+        fi
+    done
+
+    # Attribute'lar (attrib/ dizininde)
+    for pair in "${attrs[@]}"; do
+        pname="${pair%%:*}"; pval="${pair##*:}"
+        current=""
+        [[ -f "${tpg_base}/attrib/${pname}" ]] && \
+            current=$(cat "${tpg_base}/attrib/${pname}" 2>/dev/null)
+        if [[ "$current" != "$pval" ]]; then
+            $need_cd && { echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1"; need_cd=false; }
+            echo "set attribute ${pname}=${pval}"
+            (( changed++ ))
+        fi
+    done
+
+    if (( changed == 0 )); then
+        _p_info "  ✓ TPG parametreleri güncel."
+    else
+        _p_info "  ↻ TPG: ${changed} parametre güncelleniyor."
+    fi
 }
 
 # ─── LVM ─────────────────────────────────────────────────────────────────────
@@ -443,30 +532,58 @@ create_single_lun() {
 
 _add_lun_to_target() {
     local vg="$1" lv="$2" lun_no="$3"
-    local bs="${lv}_lun${lun_no}"
     local dev="/dev/${vg}/${lv}"
     [[ -b "$dev" ]] || { log_error "Block device yok: $dev"; return 1; }
     backup_targetcli
 
+    local tcli_state=""
+    tcli_state=$(targetcli ls 2>/dev/null) || true
+    local bs
+    bs=$(_resolve_backstore_name "$dev" "$lv" "$lun_no" "$tcli_state")
+
+    local cmds=""
+    cmds=$(
     {
-        echo "cd /backstores/block"
-        echo "create dev=${dev} name=${bs}"
+        # Backstore yoksa oluştur
+        if ! echo "$tcli_state" | grep -qF "block/${bs}" 2>/dev/null; then
+            echo "cd /backstores/block"
+            echo "create dev=${dev} name=${bs}"
+        fi
+        # Attribute'lar — configfs-aware
         if $CLUSTER_MODE; then
             _cluster_backstore_attrs "$bs"
         else
-            echo "cd /backstores/block/${bs}"
-            echo "set attribute emulate_write_cache=0"
+            local cur_wc="" d2
+            for d2 in /sys/kernel/config/target/core/iblock_*/"${bs}"/attrib/emulate_write_cache; do
+                [[ -f "$d2" ]] && cur_wc=$(cat "$d2" 2>/dev/null) && break
+            done
+            [[ "$cur_wc" != "0" ]] && echo "cd /backstores/block/${bs}" && echo "set attribute emulate_write_cache=0"
         fi
-        echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/luns"
-        echo "create /backstores/block/${bs} lun=${lun_no}"
+        # LUN yoksa oluştur
+        if ! echo "$tcli_state" | grep -qE "o- lun${lun_no}[^0-9]" 2>/dev/null; then
+            echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/luns"
+            echo "create /backstores/block/${bs} lun=${lun_no}"
+        fi
+        # Mapped LUN'lar — configfs ile kontrol
+        local cfgfs_tgt="/sys/kernel/config/target/iscsi/${ISCSI_TARGET_IQN}/tpgt_1"
         local ai
         for ai in "${ALLOWED_INITIATORS[@]:-}"; do
             [[ -z "$ai" ]] && continue
-            echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/acls/${ai}"
-            echo "create mapped_lun=${lun_no} tpg_lun_or_backstore=${lun_no}"
+            if [[ ! -d "${cfgfs_tgt}/acls/${ai}/lun_${lun_no}" ]]; then
+                echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/acls/${ai}"
+                echo "create mapped_lun=${lun_no} tpg_lun_or_backstore=${lun_no}"
+            fi
         done
-        echo "cd /"; echo "saveconfig"; echo "exit"
-    } | _run_targetcli && log_ok "LUN${lun_no} target'a eklendi."
+    } )
+
+    if [[ -z "$cmds" ]]; then
+        log_ok "LUN${lun_no} zaten güncel – değişiklik gerekmedi."
+    else
+        {
+            echo "$cmds"
+            echo "cd /"; echo "saveconfig"; echo "exit"
+        } | _run_targetcli && log_ok "LUN${lun_no} target'a eklendi."
+    fi
 }
 
 list_luns() {
@@ -537,7 +654,7 @@ remove_lun() {
         [[ -z "$x2" || "$x2" == "$to_del" ]] && continue
         nl+=("$x2")
     done
-    LUN_DEFINITIONS=("${nl[@]:-}")
+    LUN_DEFINITIONS=(); [[ ${#nl[@]} -gt 0 ]] && LUN_DEFINITIONS=("${nl[@]}")
     save_config
     log_ok "LUN${del_lno} kaldırıldı."
     press_enter
@@ -572,7 +689,7 @@ add_initiator() {
     save_config
     if [[ -n "$ISCSI_TARGET_IQN" ]] && \
        targetcli ls /iscsi 2>/dev/null | grep -q "$ISCSI_TARGET_IQN"; then
-        confirm "ACL şimdi uygulanşın mı?" && _apply_acl "$iqn"
+        confirm "ACL şimdi uygulansın mı?" && _apply_acl "$iqn"
     fi
     log_ok "Eklendi: ${iqn}"
     press_enter
@@ -625,7 +742,7 @@ remove_initiator() {
         [[ -z "$ai2" || "$ai2" == "$to_del" ]] && continue
         nl+=("$ai2")
     done
-    ALLOWED_INITIATORS=("${nl[@]:-}")
+    ALLOWED_INITIATORS=(); [[ ${#nl[@]} -gt 0 ]] && ALLOWED_INITIATORS=("${nl[@]}")
     save_config
     log_ok "Silindi: ${to_del}"
     press_enter
@@ -706,7 +823,7 @@ manage_portals() {
             for ip2 in "${ISCSI_PORTAL_IPS[@]:-}"; do
                 [[ -z "$ip2" || "$ip2" == "$td" ]] && continue; nl+=("$ip2")
             done
-            ISCSI_PORTAL_IPS=("${nl[@]:-}"); save_config; log_ok "Silindi."
+            ISCSI_PORTAL_IPS=(); [[ ${#nl[@]} -gt 0 ]] && ISCSI_PORTAL_IPS=("${nl[@]}"); save_config; log_ok "Silindi."
             ;;
         3)
             ISCSI_PORTAL_PORT=$(input_text "Yeni port numarası" "$ISCSI_PORTAL_PORT" validate_port)
@@ -738,98 +855,177 @@ manage_chap() {
 
 # ─── iSCSI Target Yapılandırması ──────────────────────────────────────────────
 configure_iscsi_target() {
-    log_section "iSCSI TARGET UYGULANIIYOR"
+    log_section "iSCSI TARGET UYGULANIYOR"
     if [[ -z "$ISCSI_TARGET_IQN" ]]; then log_error "Target IQN tanımlanmamış!"; return 1; fi
     if [[ ${#ISCSI_PORTAL_IPS[@]} -eq 0 ]]; then log_error "Portal IP tanımlanmamış!"; return 1; fi
     backup_targetcli
 
-    local applied=0
+    # ── Mevcut durum analizi ──
+    local tcli_state=""
+    local cfgfs_tgt="/sys/kernel/config/target/iscsi/${ISCSI_TARGET_IQN}/tpgt_1"
+    if ! $DRY_RUN; then
+        tcli_state=$(targetcli ls 2>/dev/null) || true
+    fi
+
+    local new_count=0 exist_count=0 cmd_count=0
+    local cmds=""
+    cmds=$(
     {
-        # Backstoreler
-        local x vg_lv lno vg lv bs
+        # ── 1. Backstoreler ──
+        local x vg_lv lno vg lv bs dev
         for x in "${LUN_DEFINITIONS[@]:-}"; do
             [[ -z "$x" ]] && continue
             IFS=':' read -r vg_lv lno _ <<< "$x"
             IFS='/' read -r vg lv <<< "$vg_lv"
-            [[ -b "/dev/${vg}/${lv}" ]] || { log_warn "  /dev/${vg_lv} yok – atlandı."; continue; }
-            bs="${lv}_lun${lno}"
-            echo "cd /backstores/block"
-            echo "create dev=/dev/${vg}/${lv} name=${bs}"
+            dev="/dev/${vg}/${lv}"
+            [[ -b "$dev" ]] || { _p_warn "  $dev yok – atlandı."; continue; }
+
+            bs=$(_resolve_backstore_name "$dev" "$lv" "$lno" "$tcli_state")
+
+            if echo "$tcli_state" | grep -qF "block/${bs}" 2>/dev/null; then
+                _p_info "  ✓ Backstore '${bs}' zaten var."
+            else
+                echo "cd /backstores/block"
+                echo "create dev=${dev} name=${bs}"
+            fi
+
+            # Attribute'lar — configfs'den oku, farklı olanları gönder
             if $CLUSTER_MODE; then
                 _cluster_backstore_attrs "$bs"
             else
-                echo "cd /backstores/block/${bs}"
-                echo "set attribute emulate_write_cache=0"
+                local cur_wc=""
+                local d2
+                for d2 in /sys/kernel/config/target/core/iblock_*/"${bs}"/attrib/emulate_write_cache; do
+                    [[ -f "$d2" ]] && cur_wc=$(cat "$d2" 2>/dev/null) && break
+                done
+                if [[ "$cur_wc" != "0" ]]; then
+                    echo "cd /backstores/block/${bs}"
+                    echo "set attribute emulate_write_cache=0"
+                fi
             fi
-            (( applied++ ))
         done
 
-        # Target oluştur
-        echo "cd /iscsi"
-        echo "create ${ISCSI_TARGET_IQN}"
+        # ── 2. Target ──
+        if echo "$tcli_state" | grep -qF "$ISCSI_TARGET_IQN" 2>/dev/null; then
+            _p_info "  ✓ Target '${ISCSI_TARGET_IQN}' zaten var."
+        else
+            echo "cd /iscsi"
+            echo "create ${ISCSI_TARGET_IQN}"
+        fi
 
-        # Portaller
-        echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/portals"
-        echo "delete 0.0.0.0 3260"
+        # ── 3. Portaller ──
+        if echo "$tcli_state" | grep -qF "0.0.0.0:3260" 2>/dev/null; then
+            echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/portals"
+            echo "delete 0.0.0.0 3260"
+        fi
         local ip
         for ip in "${ISCSI_PORTAL_IPS[@]:-}"; do
             [[ -z "$ip" ]] && continue
-            echo "create ${ip} ${ISCSI_PORTAL_PORT}"
+            if echo "$tcli_state" | grep -qF "${ip}:${ISCSI_PORTAL_PORT}" 2>/dev/null; then
+                _p_info "  ✓ Portal ${ip}:${ISCSI_PORTAL_PORT} zaten var."
+            else
+                echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/portals"
+                echo "create ${ip} ${ISCSI_PORTAL_PORT}"
+            fi
         done
 
-        # LUN'lar
-        echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/luns"
+        # ── 4. LUN eşlemeleri ──
         for x in "${LUN_DEFINITIONS[@]:-}"; do
             [[ -z "$x" ]] && continue
             IFS=':' read -r vg_lv lno _ <<< "$x"
             IFS='/' read -r vg lv <<< "$vg_lv"
-            [[ -b "/dev/${vg}/${lv}" ]] || continue
-            bs="${lv}_lun${lno}"
-            echo "create /backstores/block/${bs} lun=${lno}"
+            dev="/dev/${vg}/${lv}"
+            [[ -b "$dev" ]] || continue
+            bs=$(_resolve_backstore_name "$dev" "$lv" "$lno" "$tcli_state")
+            if echo "$tcli_state" | grep -qE "o- lun${lno}[^0-9]" 2>/dev/null; then
+                _p_info "  ✓ LUN${lno} zaten var."
+            else
+                echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/luns"
+                echo "create /backstores/block/${bs} lun=${lno}"
+            fi
         done
 
-        # TPG ayarları
+        # ── 5. TPG parametreleri — configfs'den oku, farklı olanları gönder ──
         if $CLUSTER_MODE; then
             _cluster_tpg_params
         else
-            echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1"
-            echo "set attribute demo_mode_write_protect=0"
-            echo "set attribute generate_node_acls=0"
-            echo "set attribute cache_dynamic_acls=0"
-            echo "set parameter InitialR2T=No"
-            echo "set parameter ImmediateData=Yes"
+            local -a tpg_checks=(
+                "attrib:demo_mode_write_protect:0"
+                "attrib:generate_node_acls:0"
+                "attrib:cache_dynamic_acls:0"
+                "param:InitialR2T:No"
+                "param:ImmediateData:Yes"
+            )
+            local tpc tc_dir tc_name tc_val tc_cur need_tpg_cd=true
+            for tpc in "${tpg_checks[@]}"; do
+                IFS=':' read -r tc_dir tc_name tc_val <<< "$tpc"
+                tc_cur=""
+                [[ -f "${cfgfs_tgt}/${tc_dir}/${tc_name}" ]] && \
+                    tc_cur=$(cat "${cfgfs_tgt}/${tc_dir}/${tc_name}" 2>/dev/null)
+                if [[ "$tc_cur" != "$tc_val" ]]; then
+                    $need_tpg_cd && { echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1"; need_tpg_cd=false; }
+                    [[ "$tc_dir" == "param" ]] \
+                        && echo "set parameter ${tc_name}=${tc_val}" \
+                        || echo "set attribute ${tc_name}=${tc_val}"
+                fi
+            done
         fi
 
-        # CHAP
-        echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1"
+        # ── 6. CHAP ──
+        local auth_cur=""
+        [[ -f "${cfgfs_tgt}/attrib/authentication" ]] && \
+            auth_cur=$(cat "${cfgfs_tgt}/attrib/authentication" 2>/dev/null)
         if $CHAP_ENABLED; then
-            echo "set auth userid=${CHAP_USERNAME}"
-            echo "set auth password=${CHAP_PASSWORD}"
-            echo "set attribute authentication=1"
+            if [[ "$auth_cur" != "1" ]]; then
+                echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1"
+                echo "set auth userid=${CHAP_USERNAME}"
+                echo "set auth password=${CHAP_PASSWORD}"
+                echo "set attribute authentication=1"
+            fi
         else
-            echo "set attribute authentication=0"
+            if [[ "$auth_cur" != "0" && -n "$auth_cur" ]]; then
+                echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1"
+                echo "set attribute authentication=0"
+            fi
         fi
 
-        # ACL'ler
+        # ── 7. ACL + Mapped LUN'lar ──
         local ai
         for ai in "${ALLOWED_INITIATORS[@]:-}"; do
             [[ -z "$ai" ]] && continue
-            echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/acls"
-            echo "create ${ai}"
+            local acl_cfgfs="${cfgfs_tgt}/acls/${ai}"
+            if [[ -d "$acl_cfgfs" ]]; then
+                _p_info "  ✓ ACL '${ai}' zaten var."
+            else
+                echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/acls"
+                echo "create ${ai}"
+            fi
+            # Mapped LUN'lar
             for x in "${LUN_DEFINITIONS[@]:-}"; do
                 [[ -z "$x" ]] && continue
                 IFS=':' read -r vg_lv lno _ <<< "$x"
                 IFS='/' read -r vg lv <<< "$vg_lv"
                 [[ -b "/dev/${vg}/${lv}" ]] || continue
-                echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/acls/${ai}"
-                echo "create mapped_lun=${lno} tpg_lun_or_backstore=${lno}"
+                if [[ -d "${acl_cfgfs}/lun_${lno}" ]]; then
+                    _p_info "  ✓ MappedLUN${lno} → ${ai} zaten var."
+                else
+                    echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/acls/${ai}"
+                    echo "create mapped_lun=${lno} tpg_lun_or_backstore=${lno}"
+                fi
             done
         done
+    } )
 
-        echo "cd /"; echo "saveconfig"; echo "exit"
-    } | _run_targetcli
-
-    log_ok "Target yapılandırması tamamlandı ($applied LUN)."
+    # ── Komut varsa çalıştır, yoksa "güncel" de ──
+    if [[ -z "$cmds" ]]; then
+        log_ok "Yapılandırma tamamen güncel – değişiklik gerekmedi."
+    else
+        {
+            echo "$cmds"
+            echo "cd /"; echo "saveconfig"; echo "exit"
+        } | _run_targetcli
+        log_ok "Target yapılandırması güncellendi."
+    fi
 }
 
 # ─── Cluster Optimizasyonları ─────────────────────────────────────────────────
@@ -838,29 +1034,40 @@ configure_kernel_params() {
     if $DRY_RUN; then
         log_warn "[DRY-RUN] Yazılacak: $SYSCTL_FILE"; return
     fi
-    {
-        echo "# iSCSI Cluster Kernel Parametreleri – iscsi-manager $VERSION"
-        echo "net.core.rmem_max           = 16777216"
-        echo "net.core.wmem_max           = 16777216"
-        echo "net.core.rmem_default       = 4194304"
-        echo "net.core.wmem_default       = 4194304"
-        echo "net.ipv4.tcp_rmem           = 4096 4194304 16777216"
-        echo "net.ipv4.tcp_wmem           = 4096 4194304 16777216"
-        echo "net.core.netdev_max_backlog = 50000"
-        echo "net.core.somaxconn          = 4096"
-        echo "net.ipv4.tcp_timestamps     = 1"
-        echo "net.ipv4.tcp_sack           = 1"
-        echo "net.ipv4.tcp_window_scaling = 1"
-        echo "net.ipv4.tcp_keepalive_time   = 10"
-        echo "net.ipv4.tcp_keepalive_intvl  = 10"
-        echo "net.ipv4.tcp_keepalive_probes = 6"
-        echo "net.ipv4.tcp_fin_timeout      = 30"
-        echo "net.ipv4.tcp_syncookies       = 1"
-        echo "vm.swappiness               = 10"
-        echo "vm.dirty_ratio              = 5"
-        echo "vm.dirty_background_ratio   = 2"
-    } > "$SYSCTL_FILE"
-    sysctl --system 2>&1 | grep -E "(Applying|Failed)" | tee -a "$LOG_FILE" || true
+    local new_content
+    new_content=$(cat <<SYSCTL
+# iSCSI Cluster Kernel Parametreleri – iscsi-manager $VERSION
+net.core.rmem_max           = 16777216
+net.core.wmem_max           = 16777216
+net.core.rmem_default       = 4194304
+net.core.wmem_default       = 4194304
+net.ipv4.tcp_rmem           = 4096 4194304 16777216
+net.ipv4.tcp_wmem           = 4096 4194304 16777216
+net.core.netdev_max_backlog = 50000
+net.core.somaxconn          = 4096
+net.ipv4.tcp_timestamps     = 1
+net.ipv4.tcp_sack           = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_keepalive_time   = 10
+net.ipv4.tcp_keepalive_intvl  = 10
+net.ipv4.tcp_keepalive_probes = 6
+net.ipv4.tcp_fin_timeout      = 30
+net.ipv4.tcp_syncookies       = 1
+vm.swappiness               = 10
+vm.dirty_ratio              = 5
+vm.dirty_background_ratio   = 2
+SYSCTL
+    )
+    # Aynı içerikse atla
+    if [[ -f "$SYSCTL_FILE" ]]; then
+        local existing; existing=$(cat "$SYSCTL_FILE" 2>/dev/null)
+        if [[ "$existing" == "$new_content" ]]; then
+            log_ok "Kernel parametreleri zaten güncel: $SYSCTL_FILE"
+            return
+        fi
+    fi
+    echo "$new_content" > "$SYSCTL_FILE"
+    sysctl --system 2>&1 | grep -E "(Applying.*99-iscsi|Failed)" | tee -a "$LOG_FILE" || true
     log_ok "Kernel parametreleri uygulandı: $SYSCTL_FILE"
 }
 
@@ -870,6 +1077,8 @@ configure_io_scheduler() {
     if ! $DRY_RUN; then
         echo "# iSCSI Cluster I/O Scheduler – iscsi-manager $VERSION" > "$UDEV_FILE"
     fi
+    # Zaten işlenmiş diskleri takip et (aynı fiziksel disk birden fazla LV altında olabilir)
+    declare -A _seen_slaves
     local x vg_lv vg lv dev dm_dev dm_name
     for x in "${LUN_DEFINITIONS[@]:-}"; do
         [[ -z "$x" ]] && continue
@@ -885,6 +1094,9 @@ configure_io_scheduler() {
         for slave in "/sys/block/${dm_name}/slaves/"/*/; do
             slave=$(basename "$slave")
             [[ -z "$slave" || "$slave" == "*" ]] && continue
+            # Zaten işlendi mi?
+            [[ -n "${_seen_slaves[$slave]:-}" ]] && continue
+            _seen_slaves[$slave]=1
             local rot=1 sched dtype
             [[ -f "/sys/block/${slave}/queue/rotational" ]] && \
                 rot=$(cat "/sys/block/${slave}/queue/rotational")
@@ -936,34 +1148,46 @@ apply_cluster_optimizations() {
 
     # Mevcut backstorelara cluster attribute'larını uygula
     if [[ -n "$ISCSI_TARGET_IQN" ]]; then
-        backup_targetcli
-        local x vg_lv lno vg lv bs found=0
+        local tcli_state=""
+        tcli_state=$(targetcli ls 2>/dev/null) || true
+
+        local x vg_lv lno vg lv bs dev found=0
+        local cmds=""
+        cmds=$(
         {
             for x in "${LUN_DEFINITIONS[@]:-}"; do
                 [[ -z "$x" ]] && continue
                 IFS=':' read -r vg_lv lno _ <<< "$x"
                 IFS='/' read -r vg lv <<< "$vg_lv"
-                bs="${lv}_lun${lno}"
-                targetcli ls "/backstores/block/${bs}" &>/dev/null 2>&1 || continue
+                dev="/dev/${vg}/${lv}"
+                bs=$(_resolve_backstore_name "$dev" "$lv" "$lno" "$tcli_state")
+                # Backstore mevcut mu?
+                local bs_exists=false
+                local d
+                for d in /sys/kernel/config/target/core/iblock_*/"${bs}"; do
+                    [[ -d "$d" ]] && bs_exists=true && break
+                done
+                $bs_exists || continue
                 _cluster_backstore_attrs "$bs"
                 (( found++ ))
             done
             if (( found > 0 )); then
                 _cluster_tpg_params
-                if $CHAP_ENABLED; then
-                    echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1"
-                    echo "set auth userid=${CHAP_USERNAME}"
-                    echo "set auth password=${CHAP_PASSWORD}"
-                    echo "set attribute authentication=1"
-                else
-                    echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1"
-                    echo "set attribute authentication=0"
-                fi
             fi
-            echo "cd /"; echo "saveconfig"; echo "exit"
-        } | _run_targetcli
-        (( found > 0 )) && log_ok "$found backstore cluster attribute uygulandı." \
-                        || log_warn "Aktif backstore bulunamadı – önce LUN'ları oluşturun."
+        } )
+
+        if [[ -n "$cmds" ]]; then
+            backup_targetcli
+            {
+                echo "$cmds"
+                echo "cd /"; echo "saveconfig"; echo "exit"
+            } | _run_targetcli
+            log_ok "$found backstore cluster attribute kontrol edildi."
+        elif (( found > 0 )); then
+            log_ok "$found backstore kontrol edildi – tüm attribute'lar güncel."
+        else
+            log_warn "Aktif backstore bulunamadı – önce LUN'ları oluşturun."
+        fi
     fi
 
     configure_kernel_params
@@ -1446,7 +1670,582 @@ print_client_info() {
     press_enter
 }
 
-# ─── Tam Kurulum Sihirbazı ────────────────────────────────────────────────────
+# ─── Aktif Session Listesi ────────────────────────────────────────────────────
+list_active_sessions() {
+    log_section "AKTİF iSCSI CLIENT BAĞLANTILARI"
+    echo ""
+
+    local total_sessions=0
+
+    # ── 1. targetcli sessions (en güvenilir yöntem) ──
+    if command -v targetcli &>/dev/null; then
+        echo -e "  ${BOLD}iSCSI Aktif Sessionlar:${NC}"
+        local tcli_out
+        # Bazı sürümler stdout, bazıları stderr kullanır — ikisini de yakala
+        tcli_out=$(targetcli sessions 2>&1) || true
+        if [[ -n "$tcli_out" ]]; then
+            local has_session=false
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                # "No open sessions" veya benzeri boş mesaj kontrolü
+                if echo "$line" | grep -qi "no open\|no active\|no session"; then
+                    continue
+                fi
+                # Session satırı içeren satırları göster
+                if echo "$line" | grep -qi "sid:\|session\|LOGGED_IN\|alias:"; then
+                    echo -e "    ${GREEN}●${NC}  ${line}"
+                    has_session=true
+                    (( total_sessions++ ))
+                fi
+            done <<< "$tcli_out"
+            if ! $has_session; then
+                echo -e "    ${YELLOW}(aktif session yok)${NC}"
+            fi
+        else
+            echo -e "    ${YELLOW}(targetcli sessions çıktı vermedi)${NC}"
+        fi
+    else
+        echo -e "  ${YELLOW}targetcli komutu bulunamadı.${NC}"
+    fi
+    echo ""
+
+    # ── 2. Aktif TCP bağlantıları (client IP'leri görünür) ──
+    echo -e "  ${BOLD}TCP Bağlantıları (port ${ISCSI_PORTAL_PORT:-3260}):${NC}"
+    local tcp_out
+    tcp_out=$(ss -tn state established 2>/dev/null \
+        | grep ":${ISCSI_PORTAL_PORT:-3260}" || true)
+    if [[ -n "$tcp_out" ]]; then
+        printf "    %-32s  %-32s\n" "Yerel Adres (Target)" "Uzak Adres (Client)"
+        printf "    %-32s  %-32s\n" "────────────────────────────────" "────────────────────────────────"
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local local_addr remote_addr
+            local_addr=$(echo "$line" | awk '{print $3}')
+            remote_addr=$(echo "$line" | awk '{print $4}')
+            [[ -z "$local_addr" ]] && continue
+            printf "    %-32s  ${GREEN}%-32s${NC}\n" "$local_addr" "$remote_addr"
+        done <<< "$tcp_out"
+    else
+        echo -e "    ${YELLOW}(bağlı TCP oturumu yok)${NC}"
+    fi
+    echo ""
+
+    # ── 3. configfs (ek detay — varsa) ──
+    local configfs="/sys/kernel/config/target/iscsi"
+    if [[ -d "$configfs" ]]; then
+        local cfg_count=0
+        local tgt_dir
+        for tgt_dir in "${configfs}"/*/; do
+            [[ -d "$tgt_dir" ]] || continue
+            local tpgt_dir
+            for tpgt_dir in "${tgt_dir}"tpgt_*/; do
+                [[ -d "${tpgt_dir}sessions" ]] || continue
+                local sess_dir
+                for sess_dir in "${tpgt_dir}sessions"/*/; do
+                    [[ -d "$sess_dir" ]] || continue
+                    (( cfg_count++ ))
+                done
+            done
+        done
+        if (( cfg_count > 0 )); then
+            echo -e "  ${BOLD}configfs Session Sayısı:${NC} ${cfg_count}"
+        fi
+    fi
+    echo ""
+    echo -e "  ${BOLD}Özet:${NC} ${total_sessions} aktif iSCSI session"
+    press_enter
+}
+
+# ─── Mevcut LUN'a Yeni Client Ekle ───────────────────────────────────────────
+add_client_to_lun() {
+    log_section "MEVCUT LUN'A YENİ CLIENT EKLE"
+    [[ -z "$ISCSI_TARGET_IQN" ]] && { log_warn "Target IQN tanımlanmamış."; press_enter; return; }
+    [[ ${#LUN_DEFINITIONS[@]} -eq 0 ]] && { log_warn "Önce LUN tanımlayın."; press_enter; return; }
+
+    echo -e "  ${YELLOW}Client'ta initiator IQN'ini öğrenmek için:${NC}"
+    echo -e "  ${BOLD}cat /etc/iscsi/initiatorname.iscsi${NC}\n"
+
+    local iqn; iqn=$(input_text "Yeni Client Initiator IQN" "" validate_iqn)
+
+    # Aynı IQN kontrolü
+    local ai
+    for ai in "${ALLOWED_INITIATORS[@]:-}"; do
+        [[ "$ai" == "$iqn" ]] && { log_warn "Bu initiator zaten tanımlı: ${iqn}"; press_enter; return; }
+    done
+
+    # Hangi LUN'lara erişim verileceğini seç
+    echo -e "\n${BOLD}Hangi LUN'lara erişim verilsin?${NC}"
+    echo -e "  ${YELLOW}Boş bırakırsanız tüm LUN'lara erişim verilir.${NC}\n"
+    local i=1 x vg_lv lno sz
+    local all_lun_nos=()
+    for x in "${LUN_DEFINITIONS[@]:-}"; do
+        [[ -z "$x" ]] && continue
+        IFS=':' read -r vg_lv lno sz <<< "$x"
+        echo "  ${i}. LUN${lno} → /dev/${vg_lv} (${sz})"
+        all_lun_nos+=("$lno")
+        (( i++ ))
+    done
+    echo ""
+    printf "${CYAN}LUN numaraları (boşlukla ayırın, boş=tümü): ${NC}" >&2
+    local sel_input; read -r sel_input < /dev/tty
+
+    local selected_luns=()
+    if [[ -z "$sel_input" ]]; then
+        selected_luns=("${all_lun_nos[@]}")
+    else
+        local num
+        for num in $sel_input; do
+            local found_lun=false
+            local ln
+            for ln in "${all_lun_nos[@]}"; do
+                [[ "$ln" == "$num" ]] && { found_lun=true; break; }
+            done
+            $found_lun && selected_luns+=("$num") || log_warn "  LUN${num} tanımlı değil – atlandı."
+        done
+    fi
+
+    if [[ ${#selected_luns[@]} -eq 0 ]]; then
+        log_warn "Geçerli LUN seçilmedi."; press_enter; return
+    fi
+
+    echo ""
+    echo -e "  Client    : ${BOLD}${iqn}${NC}"
+    echo -e "  LUN'lar   : ${BOLD}LUN${selected_luns[*]}${NC}"
+    confirm "Ekleme yapılsın mı?" || { press_enter; return; }
+
+    ALLOWED_INITIATORS+=("$iqn")
+    save_config
+    backup_targetcli
+
+    {
+        echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/acls"
+        echo "create ${iqn}"
+        local lno
+        for lno in "${selected_luns[@]}"; do
+            echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/acls/${iqn}"
+            echo "create mapped_lun=${lno} tpg_lun_or_backstore=${lno}"
+        done
+        echo "cd /"; echo "saveconfig"; echo "exit"
+    } | _run_targetcli && log_ok "Client eklendi: ${iqn}"
+
+    press_enter
+}
+
+# ─── Bağlı Client Sil / LUN Erişimini Kaldır ─────────────────────────────────
+remove_client_from_lun() {
+    log_section "BAĞLI CLIENT SİL / LUN ERİŞİMİNİ KALDIR"
+    [[ -z "$ISCSI_TARGET_IQN" ]] && { log_warn "Target IQN tanımlanmamış."; press_enter; return; }
+    [[ ${#ALLOWED_INITIATORS[@]} -eq 0 ]] && { log_warn "Tanımlı client yok."; press_enter; return; }
+
+    echo -e "\n${BOLD}Client seçin:${NC}"
+    local i=1 ai
+    for ai in "${ALLOWED_INITIATORS[@]:-}"; do
+        [[ -z "$ai" ]] && continue
+        echo "  ${i}. ${ai}"; (( i++ ))
+    done
+    local idx; idx=$(read_choice $(( i - 1 )))
+    local sel_client="${ALLOWED_INITIATORS[$((idx-1))]}"
+
+    echo ""
+    show_menu "Silme Kapsamı" \
+        "Yalnızca belirli bir LUN'dan kaldır (ACL kalır)" \
+        "Client'ı tamamen sil (tüm LUN erişimi + ACL)"
+    local scope; scope=$(read_choice 2)
+
+    if [[ "$scope" == "1" ]]; then
+        # Belirli bir LUN'dan kaldır
+        [[ ${#LUN_DEFINITIONS[@]} -eq 0 ]] && { log_warn "LUN tanımlı değil."; press_enter; return; }
+        echo -e "\n${BOLD}Hangi LUN'dan kaldırılsın?${NC}"
+        local j=1 x vg_lv lno sz
+        for x in "${LUN_DEFINITIONS[@]:-}"; do
+            [[ -z "$x" ]] && continue
+            IFS=':' read -r vg_lv lno sz <<< "$x"
+            echo "  ${j}. LUN${lno} → /dev/${vg_lv} (${sz})"
+            (( j++ ))
+        done
+        local lidx; lidx=$(read_choice $(( j - 1 )))
+        IFS=':' read -r _ sel_lno _ <<< "${LUN_DEFINITIONS[$((lidx-1))]}"
+
+        confirm "${RED}LUN${sel_lno}${NC} → ${sel_client} erişimi kesilsin mi?" "h" || { press_enter; return; }
+        backup_targetcli
+        {
+            echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/acls/${sel_client}"
+            echo "delete mapped_lun=${sel_lno}"
+            echo "cd /"; echo "saveconfig"; echo "exit"
+        } | _run_targetcli && log_ok "LUN${sel_lno} → ${sel_client} erişimi kaldırıldı."
+    else
+        # Client'ı tamamen sil
+        confirm "${RED}${sel_client}${NC} tamamen silinsin mi (tüm LUN erişimi kaldırılır)?" "h" \
+            || { press_enter; return; }
+        backup_targetcli
+        {
+            echo "cd /iscsi/${ISCSI_TARGET_IQN}/tpg1/acls"
+            echo "delete ${sel_client}"
+            echo "cd /"; echo "saveconfig"; echo "exit"
+        } | _run_targetcli
+
+        local nl=() ai2
+        for ai2 in "${ALLOWED_INITIATORS[@]:-}"; do
+            [[ -z "$ai2" || "$ai2" == "$sel_client" ]] && continue
+            nl+=("$ai2")
+        done
+        ALLOWED_INITIATORS=(); [[ ${#nl[@]} -gt 0 ]] && ALLOWED_INITIATORS=("${nl[@]}")
+        save_config
+        log_ok "Client silindi: ${sel_client}"
+    fi
+    press_enter
+}
+
+# ─── Yapılandırma Güncelleme Menüsü ──────────────────────────────────────────
+# ─── Yapılandırmayı Sıfırla (Güvenli Sıfırlama) ──────────────────────────────
+reset_configuration() {
+    log_section "YAPILANDIRMAYI SIFIRLA"
+    echo -e "${RED}${BOLD}  ⚠  DİKKAT — BU İŞLEM GERİ ALINAMAZ!${NC}\n"
+
+    if ! is_system_configured && [[ ! -f "$CONFIG_FILE" ]]; then
+        log_warn "Sıfırlanacak bir yapılandırma bulunamadı."
+        press_enter; return
+    fi
+
+    echo -e "${BOLD}  Aşağıdaki işlemler yapılacak:${NC}"
+    echo "    1. targetcli yapılandırmasının yedeği alınacak"
+    echo "    2. Tüm aktif iSCSI session'ları kesilecek"
+    echo "    3. targetcli yapılandırması temizlenecek (target/LUN/ACL/portal silinir)"
+    echo "    4. config.sh dosyası yedeklenip silinecek"
+    echo "    5. Bellek değişkenleri sıfırlanacak"
+    echo ""
+    echo -e "${YELLOW}  Korunacak öğeler:${NC}"
+    echo "    ✓ LVM logical volume'ları (lv_*) – veriler korunur"
+    echo "    ✓ Volume Group'lar"
+    echo "    ✓ Önceki yedekler /etc/iscsi-manager/backups/ altında"
+    echo "    ✓ Kernel/sysctl/udev kuralları (cluster optimizasyonları)"
+    echo ""
+
+    if is_system_configured; then
+        _show_current_config_summary
+        echo ""
+    fi
+
+    # ── İlk onay ──
+    if ! confirm "Yapılandırmayı SIFIRLAMAK istiyor musunuz?" "h"; then
+        log_info "İptal edildi."
+        press_enter; return
+    fi
+
+    # ── Aktif session uyarısı ──
+    local active_sessions=0
+    if command -v targetcli &>/dev/null; then
+        local sess_out; sess_out=$(targetcli sessions 2>&1 || true)
+        if echo "$sess_out" | grep -qi "LOGGED_IN\|sid:"; then
+            active_sessions=$(echo "$sess_out" | grep -ci "LOGGED_IN\|sid:")
+            echo ""
+            echo -e "${RED}${BOLD}  ⚠  ${active_sessions} aktif client bağlantısı var!${NC}"
+            echo "  Sıfırlama bu bağlantıları zorla kesecek ve client'larda I/O hatası oluşturabilir."
+            echo ""
+            if ! confirm "Aktif bağlantılara rağmen devam edilsin mi?" "h"; then
+                log_info "İptal edildi."
+                press_enter; return
+            fi
+        fi
+    fi
+
+    # ── İkinci onay (yazılı) ──
+    echo ""
+    echo -e "${RED}${BOLD}  Son onay:${NC} Devam etmek için ${BOLD}SIFIRLA${NC} yazıp Enter'a basın."
+    printf "${CYAN}> ${NC}" >&2
+    local confirmation; read -r confirmation < /dev/tty
+    if [[ "$confirmation" != "SIFIRLA" ]]; then
+        log_info "Onay alınamadı – işlem iptal edildi."
+        press_enter; return
+    fi
+
+    # ── 1. Yedek al ──
+    log_info "1/5 – targetcli yapılandırması yedekleniyor..."
+    backup_targetcli
+
+    # config.sh yedeği
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local cfg_bak="${BACKUP_DIR}/config.sh.$(date +%Y%m%d_%H%M%S).bak"
+        cp "$CONFIG_FILE" "$cfg_bak" 2>/dev/null && \
+            log_ok "config.sh yedeği: $cfg_bak"
+    fi
+
+    # ── 2. targetcli temizle ──
+    log_info "2/5 – targetcli yapılandırması temizleniyor..."
+    if command -v targetcli &>/dev/null && ! $DRY_RUN; then
+        # Tüm block backstore'larını targetcli ls ile listele
+        local bs_list=()
+        local bs_out
+        bs_out=$(targetcli ls /backstores/block 2>/dev/null) || true
+        while IFS= read -r line; do
+            # Sadece "/dev/..." içeren satırlar gerçek block backstore'lardır
+            [[ "$line" =~ /dev/ ]] || continue
+            local bs_name
+            bs_name=$(echo "$line" | sed -n 's/^\s*o- \([a-zA-Z0-9_-]\+\)\s.*/\1/p')
+            [[ -n "$bs_name" ]] && bs_list+=("$bs_name")
+        done <<< "$bs_out"
+
+        local cur_iqn="$ISCSI_TARGET_IQN"
+        {
+            # Önce target'ı sil (LUN'lar, ACL'ler, portaller dahil)
+            if [[ -n "$cur_iqn" ]]; then
+                echo "cd /iscsi"
+                echo "delete ${cur_iqn}"
+            fi
+            # Block backstore'ları sil
+            local bs_name
+            for bs_name in "${bs_list[@]:-}"; do
+                [[ -z "$bs_name" ]] && continue
+                echo "cd /backstores/block"
+                echo "delete ${bs_name}"
+            done
+            echo "cd /"
+            echo "saveconfig"
+            echo "exit"
+        } | _run_targetcli
+        log_ok "targetcli temizlendi (${#bs_list[@]} backstore silindi)."
+    fi
+
+    # ── 3. iSCSI servisini yeniden başlat (kalıntı session'ları temizle) ──
+    log_info "3/5 – iSCSI target servisi yeniden başlatılıyor..."
+    if ! $DRY_RUN; then
+        systemctl restart target 2>&1 | tee -a "$LOG_FILE" || \
+            log_warn "Servis yeniden başlatılamadı (kritik değil)."
+    fi
+
+    # ── 4. config.sh sil ──
+    log_info "4/5 – config.sh dosyası kaldırılıyor..."
+    if ! $DRY_RUN && [[ -f "$CONFIG_FILE" ]]; then
+        rm -f "$CONFIG_FILE" && log_ok "config.sh kaldırıldı."
+    fi
+
+    # ── 5. Bellek değişkenlerini sıfırla ──
+    log_info "5/5 – Bellek değişkenleri sıfırlanıyor..."
+    ISCSI_TARGET_IQN=""
+    ISCSI_PORTAL_PORT="3260"
+    ISCSI_PORTAL_IPS=()
+    LUN_DEFINITIONS=()
+    ALLOWED_INITIATORS=()
+    CHAP_ENABLED=false
+    CHAP_USERNAME=""
+    CHAP_PASSWORD=""
+    CLUSTER_MODE=false
+    CLUSTER_FS_TYPE="gfs2"
+    CLUSTER_DIGEST="None"
+    CLUSTER_ALUA_MODE="symmetric"
+
+    echo ""
+    log_ok "═══ Yapılandırma sıfırlama tamamlandı ═══"
+    echo ""
+    echo -e "${BOLD}  Sonraki adımlar:${NC}"
+    echo "    • Sıfırdan kurulum için: ${BOLD}1. Tam Kurulum Sihirbazı${NC}"
+    echo "    • İptal etmek isterseniz yedeklerden geri yükleme:"
+    echo -e "      ${CYAN}targetcli restoreconfig ${BACKUP_DIR}/<son_yedek>.json${NC}"
+    echo ""
+    press_enter
+}
+
+
+# ─── Tam Yapılandırma Güncelleme Alt Menüsü ──────────────────────────────────
+menu_full_config_update() {
+    while true; do
+        clear
+        echo -e "${CYAN}${BOLD}"
+        echo "  ╔═══════════════════════════════════════════════╗"
+        echo "  ║       Tam Yapılandırma Güncelleme            ║"
+        echo "  ╚═══════════════════════════════════════════════╝"
+        echo -e "${NC}"
+        if is_system_configured; then
+            _show_current_config_summary
+            echo ""
+        else
+            log_warn "Henüz tam yapılandırılmış bir sistem yok."
+            echo ""
+        fi
+
+        show_menu "Hangi alanı güncellemek istiyorsunuz?" \
+            "Target IQN değiştir" \
+            "Portal IP/port güncelle" \
+            "CHAP ayarlarını güncelle" \
+            "Cluster modu / FS / ALUA / Digest güncelle" \
+            "Yapılandırmayı tekrar uygula (idempotent)" \
+            "Geri"
+        local ch; ch=$(read_choice 6)
+        case "$ch" in
+            1) _update_target_iqn ;;
+            2) manage_portals ;;
+            3) manage_chap ;;
+            4) _update_cluster_settings ;;
+            5)
+                if [[ -z "$ISCSI_TARGET_IQN" ]]; then
+                    log_warn "Önce Target IQN tanımlayın."; press_enter
+                else
+                    configure_iscsi_target
+                    $CLUSTER_MODE && apply_cluster_optimizations
+                    press_enter
+                fi
+                ;;
+            6) return ;;
+        esac
+    done
+}
+
+_update_target_iqn() {
+    log_section "TARGET IQN GÜNCELLE"
+    [[ -z "$ISCSI_TARGET_IQN" ]] && { log_warn "Mevcut Target IQN yok."; press_enter; return; }
+    echo -e "  Mevcut IQN  : ${YELLOW}${ISCSI_TARGET_IQN}${NC}"
+    echo -e "  ${RED}DİKKAT:${NC} IQN değişikliği client'larda yeniden bağlantı gerektirir!"
+    echo ""
+    if ! confirm "Devam edilsin mi?" "h"; then press_enter; return; fi
+
+    local new_iqn; new_iqn=$(input_text "Yeni Target IQN" "$ISCSI_TARGET_IQN" validate_iqn)
+    if [[ "$new_iqn" == "$ISCSI_TARGET_IQN" ]]; then
+        log_info "IQN aynı – değişiklik yapılmadı."; press_enter; return
+    fi
+
+    confirm "${RED}IQN '${ISCSI_TARGET_IQN}' → '${new_iqn}'${NC} olarak değiştirilsin mi?" "h" \
+        || { press_enter; return; }
+
+    backup_targetcli
+    # Eski IQN'i sil ve yeniden config'le yeniden oluştur
+    {
+        echo "cd /iscsi"
+        echo "delete ${ISCSI_TARGET_IQN}"
+        echo "cd /"
+        echo "saveconfig"
+        echo "exit"
+    } | _run_targetcli
+
+    ISCSI_TARGET_IQN="$new_iqn"
+    save_config
+    configure_iscsi_target
+    log_ok "Target IQN güncellendi: $new_iqn"
+    press_enter
+}
+
+_update_cluster_settings() {
+    log_section "CLUSTER AYARLARINI GÜNCELLE"
+    show_menu "Cluster Modu" \
+        "Etkinleştir" \
+        "Devre Dışı Bırak" \
+        "Sadece FS / ALUA / Digest güncelle" \
+        "Geri"
+    local ch; ch=$(read_choice 4)
+    case "$ch" in
+        1)
+            if $CLUSTER_MODE; then
+                log_info "Cluster modu zaten aktif."
+            else
+                CLUSTER_MODE=true
+                save_config
+                log_ok "Cluster modu etkinleştirildi."
+            fi
+            ;;
+        2)
+            if ! $CLUSTER_MODE; then
+                log_info "Cluster modu zaten devre dışı."
+            else
+                confirm "${RED}Cluster modu kapatılsın mı?${NC}" "h" || { press_enter; return; }
+                CLUSTER_MODE=false
+                save_config
+                log_ok "Cluster modu devre dışı bırakıldı."
+            fi
+            ;;
+        3) ;;
+        4) return ;;
+    esac
+
+    # Cluster sub-ayarlar
+    show_menu "Dosya Sistemi" "GFS2" "OCFS2" "lvmlockd" "Raw" "Değiştirme"
+    local fs; fs=$(read_choice 5)
+    case "$fs" in
+        1) CLUSTER_FS_TYPE="gfs2";;
+        2) CLUSTER_FS_TYPE="ocfs2";;
+        3) CLUSTER_FS_TYPE="lvmlockd";;
+        4) CLUSTER_FS_TYPE="raw";;
+    esac
+
+    show_menu "ALUA Modu" "Simetrik" "Asimetrik" "Değiştirme"
+    local am; am=$(read_choice 3)
+    case "$am" in
+        1) CLUSTER_ALUA_MODE="symmetric";;
+        2) CLUSTER_ALUA_MODE="asymmetric";;
+    esac
+
+    show_menu "iSCSI Digest" "None" "CRC32C" "Değiştirme"
+    local dm; dm=$(read_choice 3)
+    case "$dm" in
+        1) CLUSTER_DIGEST="None";;
+        2) CLUSTER_DIGEST="CRC32C";;
+    esac
+
+    save_config
+    log_ok "Cluster ayarları güncellendi."
+    confirm "Yapılandırmayı şimdi targetcli'ye uygulansın mı?" "e" \
+        && configure_iscsi_target
+    press_enter
+}
+
+# ─── Yapılandırma Güncelleme Menüsü ──────────────────────────────────────────
+menu_update() {
+    while true; do
+        clear
+        show_menu "Yapılandırmayı Güncelle" \
+            "Aktif Bağlantıları Listele" \
+            "Mevcut LUN'a Yeni Client Ekle" \
+            "Bağlı Client Sil / LUN Erişimini Kaldır" \
+            "Yeni LUN Ekle" \
+            "Tam Yapılandırma Güncelleme (IQN/Portal/CHAP/Cluster)" \
+            "Ana Menüye Dön"
+        local ch; ch=$(read_choice 6)
+        case "$ch" in
+            1) list_active_sessions ;;
+            2) add_client_to_lun ;;
+            3) remove_client_from_lun ;;
+            4) create_single_lun ;;
+            5) menu_full_config_update ;;
+            6) return ;;
+        esac
+    done
+}
+
+
+# ─── Sistem Yapılandırılmış mı? ──────────────────────────────────────────────
+is_system_configured() {
+    # Hem config.sh'da hem de targetcli'de yapılandırma varsa "yapılandırılmış" sayılır
+    [[ -n "$ISCSI_TARGET_IQN" ]] || return 1
+    [[ ${#LUN_DEFINITIONS[@]} -gt 0 ]] || return 1
+    # configfs'de target gerçekten var mı?
+    [[ -d "/sys/kernel/config/target/iscsi/${ISCSI_TARGET_IQN}" ]] || return 1
+    return 0
+}
+
+_show_current_config_summary() {
+    echo -e "${BOLD}  Mevcut Yapılandırma:${NC}"
+    echo -e "    Target IQN  : ${GREEN}${ISCSI_TARGET_IQN}${NC}"
+    local p; for p in "${ISCSI_PORTAL_IPS[@]:-}"; do
+        [[ -z "$p" ]] && continue
+        echo -e "    Portal      : ${GREEN}${p}:${ISCSI_PORTAL_PORT}${NC}"
+    done
+    local x vg_lv lno sz
+    for x in "${LUN_DEFINITIONS[@]:-}"; do
+        [[ -z "$x" ]] && continue
+        IFS=':' read -r vg_lv lno sz <<< "$x"
+        echo -e "    LUN${lno}        : ${GREEN}/dev/${vg_lv} (${sz})${NC}"
+    done
+    local ai
+    for ai in "${ALLOWED_INITIATORS[@]:-}"; do
+        [[ -z "$ai" ]] && continue
+        echo -e "    Initiator   : ${GREEN}${ai}${NC}"
+    done
+    local cm_txt="Hayır"
+    $CLUSTER_MODE && cm_txt="Evet (${CLUSTER_FS_TYPE} / ${CLUSTER_ALUA_MODE})"
+    echo -e "    Cluster     : ${GREEN}${cm_txt}${NC}"
+    local ch_txt="Devre Dışı"
+    $CHAP_ENABLED && ch_txt="Aktif (${CHAP_USERNAME})"
+    echo -e "    CHAP        : ${GREEN}${ch_txt}${NC}"
+}
+
 wizard_full_setup() {
     clear
     echo -e "${CYAN}${BOLD}"
@@ -1454,6 +2253,22 @@ wizard_full_setup() {
     echo "  ║     iSCSI Target – Tam Kurulum Sihirbazı     ║"
     echo "  ╚═══════════════════════════════════════════════╝"
     echo -e "${NC}"
+
+    # ── Sistem zaten yapılandırılmış mı? ──
+    if is_system_configured; then
+        echo -e "${YELLOW}${BOLD}  ⚠  Sistem zaten yapılandırılmıştır.${NC}\n"
+        _show_current_config_summary
+        echo ""
+        echo -e "${BOLD}  Yapılabilecekler:${NC}"
+        echo -e "    • ${BOLD}8. Yapılandırmayı Güncelle${NC}     – Mevcut sistemi günceller (LUN/client ekle/sil)"
+        echo -e "    • ${BOLD}9. Tüm Yapılandırmayı Uygula${NC}   – config.sh'ı targetcli'ye yansıtır (idempotent)"
+        echo -e "    • ${BOLD}10. Yapılandırmayı Sıfırla${NC}     – Sistemi temizler, sıfırdan başlamak için"
+        echo ""
+        log_warn "Sıfırdan kurulum yapmak için önce ana menüden \"10. Yapılandırmayı Sıfırla\" seçeneğini kullanın."
+        press_enter
+        return
+    fi
+
     $DRY_RUN && echo -e "  ${RED}[DRY-RUN MODU]${NC}"
     press_enter
 
@@ -1663,6 +2478,128 @@ menu_cluster() {
     done
 }
 
+# ─── Mevcut targetcli Yapılandırmasını Otomatik Tespit ────────────────────────
+detect_existing_config() {
+    # Zaten config varsa atla
+    [[ -f "$CONFIG_FILE" ]] && return 0
+
+    # targetcli kurulu mu?
+    command -v targetcli &>/dev/null || return 1
+
+    # targetcli'de bir hedef tanımlı mı?
+    local tcli_full
+    tcli_full=$(targetcli ls 2>/dev/null) || return 1
+    echo "$tcli_full" | grep -q "iqn\." || return 1
+
+    log_section "MEVCUT YAPILANDIRMA TESPİT EDİLDİ"
+    log_info "targetcli'de aktif bir yapılandırma bulundu."
+    echo -e "  ${YELLOW}config.sh dosyası yok – mevcut ayarlar içe aktarılabilir.${NC}\n"
+
+    # ── Target IQN ──
+    local detected_iqn
+    detected_iqn=$(echo "$tcli_full" \
+        | grep -E 'o-\s+iqn\.' \
+        | grep -v 'acls' \
+        | head -1 \
+        | sed -n 's/.*o- \(iqn\.[^ ]*\).*/\1/p')
+    if [[ -z "$detected_iqn" ]]; then
+        log_warn "Target IQN tespit edilemedi."
+        return 1
+    fi
+    echo -e "  Target IQN : ${GREEN}${detected_iqn}${NC}"
+
+    # ── Portal IP'leri ──
+    local -a detected_portals=()
+    local detected_port="3260"
+    while IFS= read -r line; do
+        local ip_port
+        ip_port=$(echo "$line" | sed -n 's/.*o- \([0-9.]*:[0-9]*\).*/\1/p')
+        if [[ -n "$ip_port" ]]; then
+            local ip="${ip_port%%:*}"
+            local port="${ip_port##*:}"
+            detected_portals+=("$ip")
+            detected_port="$port"
+            echo -e "  Portal      : ${GREEN}${ip}:${port}${NC}"
+        fi
+    done < <(echo "$tcli_full" | grep -E 'o-\s+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:')
+
+    # ── LUN'lar ──
+    # Önce backstore'lardan boyut bilgisini al: dev_path → size
+    declare -A bs_sizes
+    while IFS= read -r line; do
+        local dev_path size_raw
+        dev_path=$(echo "$line" | sed -n 's|.*\(/dev/[a-zA-Z0-9_-]*/[a-zA-Z0-9_-]*\).*|\1|p')
+        size_raw=$(echo "$line" | sed -n 's|.* (\([0-9.]*[MGTP]iB\)).*|\1|p')
+        if [[ -n "$dev_path" && -n "$size_raw" ]]; then
+            # 100.0GiB → 100G  /  50.0GiB → 50G  /  1.5TiB → 1.5T
+            local sz
+            sz=$(echo "$size_raw" | sed 's/iB//;s/\.0\([MGTP]\)$/\1/')
+            bs_sizes["$dev_path"]="$sz"
+        fi
+    done < <(echo "$tcli_full" | grep -E 'o-\s+\S+.*\[/dev/')
+
+    # LUN eşlemeleri: lun satırından lun numarası ve dev_path al
+    local -a detected_luns=()
+    while IFS= read -r line; do
+        local lun_no dev_path
+        lun_no=$(echo "$line" | sed -n 's/.*o- lun\([0-9]*\).*/\1/p')
+        dev_path=$(echo "$line" | sed -n 's|.*(\(/dev/[a-zA-Z0-9_-]*/[a-zA-Z0-9_-]*\)).*|\1|p')
+        if [[ -n "$lun_no" && -n "$dev_path" ]]; then
+            local vg_lv="${dev_path#/dev/}"
+            local sz="${bs_sizes[$dev_path]:-??}"
+            detected_luns+=("${vg_lv}:${lun_no}:${sz}")
+            echo -e "  LUN${lun_no}       : ${GREEN}/dev/${vg_lv} (${sz})${NC}"
+        fi
+    done < <(echo "$tcli_full" | grep -E 'o- lun[0-9]+')
+
+    # ── Initiator ACL'leri ──
+    local -a detected_initiators=()
+    while IFS= read -r line; do
+        local ini_iqn
+        ini_iqn=$(echo "$line" | sed -n 's/.*o- \(iqn\.[^ ]*\).*/\1/p')
+        if [[ -n "$ini_iqn" && "$ini_iqn" != "$detected_iqn" ]]; then
+            # Duplicate kontrolü
+            local dup=false ex
+            for ex in "${detected_initiators[@]:-}"; do
+                [[ "$ex" == "$ini_iqn" ]] && { dup=true; break; }
+            done
+            if ! $dup; then
+                detected_initiators+=("$ini_iqn")
+                echo -e "  Initiator   : ${GREEN}${ini_iqn}${NC}"
+            fi
+        fi
+    done < <(echo "$tcli_full" | grep -E 'o-\s+iqn\.' | grep -i "Mapped LUNs")
+
+    # ── Cluster modu tespiti (emulate_pr kontrolü — configfs'den) ──
+    local detected_cluster=false
+    local pr_files=(/sys/kernel/config/target/core/iblock_*/*/attrib/emulate_pr)
+    if [[ -f "${pr_files[0]:-}" ]]; then
+        local pr_val; pr_val=$(cat "${pr_files[0]}" 2>/dev/null)
+        [[ "$pr_val" == "1" ]] && detected_cluster=true
+    fi
+    local cl_txt; $detected_cluster && cl_txt="${GREEN}Aktif (PR etkin)${NC}" || cl_txt="Devre Dışı"
+    echo -e "  Cluster     : ${cl_txt}"
+    echo ""
+
+    if ! confirm "Bu yapılandırma içe aktarılsın mı?" "e"; then
+        log_info "İçe aktarma atlandı. Sihirbazı kullanabilirsiniz (seçenek 1)."
+        return 1
+    fi
+
+    # ── İçe aktar ──
+    ISCSI_TARGET_IQN="$detected_iqn"
+    ISCSI_PORTAL_PORT="$detected_port"
+    [[ ${#detected_portals[@]} -gt 0 ]]    && ISCSI_PORTAL_IPS=("${detected_portals[@]}")
+    [[ ${#detected_luns[@]} -gt 0 ]]       && LUN_DEFINITIONS=("${detected_luns[@]}")
+    [[ ${#detected_initiators[@]} -gt 0 ]] && ALLOWED_INITIATORS=("${detected_initiators[@]}")
+    CLUSTER_MODE=$detected_cluster
+
+    save_config
+    log_ok "Yapılandırma içe aktarıldı ve kaydedildi: $CONFIG_FILE"
+    press_enter
+    return 0
+}
+
 # ─── Ana Menü ─────────────────────────────────────────────────────────────────
 menu_main() {
     while true; do
@@ -1686,12 +2623,14 @@ menu_main() {
             "Cluster Yönetimi" \
             "Portal Yönetimi" \
             "CHAP Kimlik Doğrulama" \
-            "Tum Yapilandirmayi Uygula (targetcli)" \
-            "Firewall ve SELinux Guncelle" \
-            "Client Baglanti Bilgisi" \
-            "Cikis"
+            "Yapılandırmayı Güncelle  ★" \
+            "Tüm Yapılandırmayı Uygula (idempotent)" \
+            "Yapılandırmayı Sıfırla  ⚠" \
+            "Firewall ve SELinux Güncelle" \
+            "Client Bağlantı Bilgisi" \
+            "Çıkış"
 
-        local ch; ch=$(read_choice 12)
+        local ch; ch=$(read_choice 13)
         case "$ch" in
             1)  wizard_full_setup ;;
             2)  show_status ;;
@@ -1700,7 +2639,8 @@ menu_main() {
             5)  menu_cluster ;;
             6)  manage_portals ;;
             7)  manage_chap ;;
-            8)
+            8)  menu_update ;;
+            9)
                 if [[ -z "$ISCSI_TARGET_IQN" ]]; then
                     log_warn "Önce Target IQN tanımlayın."; press_enter; continue
                 fi
@@ -1717,10 +2657,10 @@ menu_main() {
                 configure_iscsi_target
                 $CLUSTER_MODE && apply_cluster_optimizations
                 press_enter ;;
-            9)  configure_firewall; configure_selinux; press_enter ;;
-            10) print_client_info ;;
-            11) echo -e "\n${GREEN}  İyi çalışmalar!${NC}\n"; exit 0 ;;
-            12) echo -e "\n${GREEN}  İyi çalışmalar!${NC}\n"; exit 0 ;;
+            10) reset_configuration ;;
+            11) configure_firewall; configure_selinux; press_enter ;;
+            12) print_client_info ;;
+            13) echo -e "\n${GREEN}  İyi çalışmalar!${NC}\n"; exit 0 ;;
         esac
     done
 }
@@ -1731,7 +2671,11 @@ main() {
     init_dirs
     echo "=== iSCSI Manager $VERSION – $(_ts) ===" >> "$LOG_FILE" 2>/dev/null || true
     detect_os
-    load_config || log_info "Yeni kurulum – sihirbazı kullanın (seçenek 1)."
+    if ! load_config; then
+        # config.sh yok — targetcli'de mevcut yapılandırma var mı bak
+        detect_existing_config || \
+            log_info "Yeni kurulum – sihirbazı kullanın (seçenek 1)."
+    fi
     menu_main
 }
 
