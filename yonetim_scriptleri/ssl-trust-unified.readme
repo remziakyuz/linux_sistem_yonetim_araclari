@@ -1,0 +1,70 @@
+sudo ./ssl-trust-unified.sh --all \
+  --target freeipa.example.com:443 \
+  --target satellite.example.com:443 \
+  --target foreman.example.com:443 \
+  --target git.example.com:443 \
+  --target registry.example.com:5000
+
+
+
+
+Hızlı kullanım (tüm senaryolar)
+1) FreeIPA + Satellite/Foreman + Git + Registry örneği
+sudo ./ssl-trust-unified.sh --all \
+  --target freeipa.example.com:443 \
+  --target satellite.example.com:443 \
+  --target foreman.example.com:443 \
+  --target git.example.com:443 \
+  --target registry.example.com:5000
+
+2) Sadece dosya üret (sisteme kurma yok)
+./ssl-trust-unified.sh --no-install \
+  --target git.local.lab \
+  --out ./out
+
+3) Target listesini dosyadan oku
+
+targets.txt içine satır satır host[:port] yaz:
+
+sudo ./ssl-trust-unified.sh --all --from-file targets.txt
+
+4) Makinede var olan (FreeIPA / Katello / Foreman Proxy) CA dosyalarını da otomatik ekle
+sudo ./ssl-trust-unified.sh --all --auto-local-ca
+
+Çıktı dosyaları (tarayıcı import için)
+
+Her target için şuraya yazar:
+
+<out>/<host_port>/
+  chain.pem
+  ca-bundle.pem
+  ca-bundle.crt
+  ca-bundle.der
+
+
+Firefox: ca-bundle.pem veya ca-bundle.crt import edilebilir.
+
+Chrome / Edge (Linux): Genelde OS trust store’u kullanır; bu yüzden --install-system çoğu ortamda yeterli. İstersen --install-nss ile NSS DB’lere de ekler (senin cert-import.sh / örnek yaklaşımını kapsar) 
+
+OS tarafı “tam ve doğru” ekleme mantığı (senin scriptlerin kapsandı)
+
+Senin registry için yazdığın scriptlerdeki mantığı (sertifikayı çek → distro tespit → doğru trust dizinine kopyala → trust güncelle) aynen kapsadım. 
+
+Not: “ssl-chipper” dökümanları ne oldu?
+
+Yüklediğin ssl-chipper-ayarlama.txt ve ssl-chipper-kontrol.txt sertifika import değil, Satellite/Foreman TLS hardening (cipher/protocol kısıtlama + nmap kontrol) dökümanı. Onu bu tek script’e “sertifika ekleme” açısından dahil etmedim; çünkü doğası gereği konfigürasyon yönetimi (custom-hiera + installer) adımı. İstersen ayrı bir “hardening uygulama” fonksiyonu olarak da ekleyebilirim ama şu an bu tek script, istediğin gibi sertifika dağıtımı/kurulumu işini eksiksiz kapsıyor. 
+
+En pratik öneri (zaman kaybı olmasın diye)
+
+Sunucu/istemcilerde genelde şu komut yeterli:
+
+sudo ./ssl-trust-unified.sh --install-system --install-containers \
+  --target registry.example.com:5000
+
+
+Eğer “tarayıcıda kesin görünsün” istiyorsan:
+
+sudo ./ssl-trust-unified.sh --all --target git.example.com
+
+
+İstersen bir sonraki adım olarak, sende geçen servis isimlerini (freeipa/satellite/foreman/gitrepo/registry) otomatik tanıyıp varsayılan portları (443/5000/8443 vb.) kendisi seçen bir “profil modu” da ekleyebilirim; ama mevcut haliyle zaten tek komutla çoklu target çalışıyor.
