@@ -1,0 +1,59 @@
+---
+# vars/custom.yml
+# Version: 4.22
+# Custom Profile Template - Define your own settings
+#
+# Edit values below to match your environment requirements
+#
+# IMPORTANT: Always sync multipath with sanlock!
+#   no_path_retry = (sanlock_io_timeout * 8) / multipath_polling_interval
+#
+# Failover Time Estimation (integer-safe formula):
+#   ~= (sanlock_io_timeout * 3 / 2) + (ha_monitoring_interval * 3) + 25
+
+# ===== VDSM Settings =====
+vdsm_heartbeat_interval: 10           # Range: 5-30s, default: 15
+vdsm_host_monitor_timeout: 30         # Range: 20-90s, default: 60
+vdsm_migration_timeout: 180           # Range: 60-600s, default: 300
+
+# ===== Sanlock Settings =====
+sanlock_io_timeout: 50                # Range: 30-80s, recommended: 50
+sanlock_watchdog_fire_timeout: 35     # Range: 20-60s, default: 60
+
+# ===== Multipath Settings =====
+multipath_polling_interval: 5         # Range: 3-10s, default: 5
+
+# ===== HA Agent Settings =====
+ha_monitoring_interval: 10            # Range: 5-30s, default: 20
+ha_connection_timeout: 12             # Range: 10-30s, default: 30
+ha_score_penalty: 500                 # Default: 500
+ha_state_transition_timeout: 35       # Range: 20-60s, default: 60
+
+# ===== Libvirt Settings =====
+libvirt_keepalive_interval: 5         # Range: 3-15s, default: 5
+libvirt_keepalive_count: 5            # Range: 3-10, default: 5
+
+# ===== Backup Settings =====
+create_backup: true
+
+
+# ===== Multipath device-block scope (Dell EMC ME5) =====
+# multipath_me5_device_block:
+#   false (default) -> HA storage timeouts go in a GLOBAL `overrides {}` block
+#                      (applies to ALL arrays on the host).
+#   true            -> timeouts + Dell ME5 ALUA path attributes are scoped to a
+#                      `devices { device { vendor/product } }` stanza, so other
+#                      arrays keep their own defaults. Use this with a Dell ME5.
+# The ALUA attributes follow the Dell PowerVault ME5 Administrator's Guide.
+# Verify vendor/product on the host:  multipathd show paths format "%d %s"
+# Verify ALUA after applying:          multipath -v3 | grep -i alua
+multipath_me5_device_block: false
+multipath_me5_vendor: "DellEMC"
+multipath_me5_product: "ME5"
+multipath_me5_path_grouping_policy: "group_by_prio"
+multipath_me5_path_checker: "tur"
+multipath_me5_hardware_handler: "1 alua"
+multipath_me5_prio: "alua"
+multipath_me5_failback: "immediate"
+multipath_me5_rr_weight: "uniform"
+multipath_me5_path_selector: "service-time 0"

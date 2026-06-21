@@ -1,0 +1,349 @@
+---
+# olvm-ha-rollback.yml
+# Rollback OLVM HA Tuning changes
+# Version: 4.22
+# 
+# Uses ONLY ansible-core builtin modules (no external collections)
+#
+# Usage:
+#   # Remove drop-in configs (revert to defaults)
+#   ansible-playbook -i inventory.yml olvm-ha-rollback.yml
+#   
+#   # Restore from specific backup
+#   ansible-playbook -i inventory.yml olvm-ha-rollback.yml \
+#     -e "rollback_date=20260510T010146"
+
+- name: "OLVM HA Tuning - Rollback"
+  hosts: ovirt_hosts
+  become: yes
+  gather_facts: yes
+  serial: 1
+  
+  vars:
+    # Empty = remove drop-in configs only
+    # Set to date = restore from specific backup
+    rollback_date: ""
+    backup_base: /root
+    
+    # Files to remove during simple rollback
+    dropin_files:
+      - /etc/vdsm/vdsm.conf.d/99-ha-tuning.conf
+      - /etc/multipath/conf.d/99-ha-tuning.conf
+    
+  tasks:
+    - name: "[ROLLBACK] Display rollback plan"
+      debug:
+        msg:
+          - "===================================================="
+          - "OLVM HA Tuning - Rollback (v4.22)"
+          - "===================================================="
+          - "Host:        {{ ansible_hostname }}"
+          - "Mode:        {{ 'Restore from backup' if rollback_date else 'Remove drop-in configs' }}"
+          - "Backup Date: {{ rollback_date if rollback_date else 'N/A' }}"
+          - "===================================================="
+
+    - name: "[ROLLBACK] Validate rollback_date format (if provided)"
+      assert:
+        that:
+          - rollback_date is match('^[0-9]{8}T[0-9]{6}$')
+        fail_msg: |
+          Invalid rollback_date format: '{{ rollback_date }}'
+          Expected format: YYYYMMDDTHHMMSS (e.g., 20260510T010146)
+          Use empty value to remove drop-in configs without restoring backup.
+        success_msg: "rollback_date format valid: {{ rollback_date }}"
+      when: rollback_date != ""
+
+    # =============================================================
+    # MODE 1: Simple rollback - remove drop-in configs AND the keys that
+    # were injected in-place by lineinfile, so the host truly reverts to
+    # daemon defaults (not just half-reverted as in <= v4.8).
+    # =============================================================
+    - name: "[ROLLBACK] Remove drop-in configuration files"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ dropin_files }}"
+      when: rollback_date == ""
+      notify:
+        - reload multipathd
+        - restart sanlock
+        - restart vdsmd
+        - restart ovirt-ha-agent
+        - restart ovirt-ha-broker
+
+    - name: "[ROLLBACK] Stat in-place edited config files"
+      stat:
+        path: "{{ item }}"
+      register: inplace_stats
+      loop:
+        - /etc/sanlock/sanlock.conf
+        - /etc/ovirt-hosted-engine-ha/agent.conf
+        - /etc/libvirt/libvirtd.conf
+      when: rollback_date == ""
+
+    - name: "[ROLLBACK] Remove injected keys from sanlock.conf"
+      lineinfile:
+        path: /etc/sanlock/sanlock.conf
+        regexp: "{{ item }}"
+        state: absent
+      loop:
+        - '^\s*io_timeout\s*='
+        - '^\s*watchdog_fire_timeout\s*='
+      when:
+        - rollback_date == ""
+        - inplace_stats.results[0].stat.exists | default(false)
+      notify: restart sanlock
+
+    - name: "[ROLLBACK] Remove injected keys from agent.conf"
+      lineinfile:
+        path: /etc/ovirt-hosted-engine-ha/agent.conf
+        regexp: "{{ item }}"
+        state: absent
+      loop:
+        - '^\s*monitoring_interval\s*='
+        - '^\s*connection_timeout\s*='
+        - '^\s*score_penalty\s*='
+        - '^\s*state_transition_timeout\s*='
+      when:
+        - rollback_date == ""
+        - inplace_stats.results[1].stat.exists | default(false)
+      notify: restart ovirt-ha-agent
+
+    - name: "[ROLLBACK] Remove injected keys from libvirtd.conf"
+      lineinfile:
+        path: /etc/libvirt/libvirtd.conf
+        regexp: "{{ item }}"
+        state: absent
+      loop:
+        - '^\s*keepalive_interval\s*='
+        - '^\s*keepalive_count\s*='
+      when:
+        - rollback_date == ""
+        - inplace_stats.results[2].stat.exists | default(false)
+      notify: restart libvirtd
+
+    # =============================================================
+    # MODE 2: Full restore from backup
+    # =============================================================
+    - name: "[ROLLBACK] Find backup directory"
+      stat:
+        path: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}"
+      register: backup_dir_stat
+      when: rollback_date != ""
+
+    - name: "[ROLLBACK] Verify backup exists"
+      assert:
+        that:
+          - backup_dir_stat.stat.exists
+          - backup_dir_stat.stat.isdir
+        fail_msg: "Backup not found: {{ backup_base }}/olvm-ha-backup-{{ rollback_date }}"
+      when: rollback_date != ""
+
+    - name: "[ROLLBACK] Restore VDSM drop-in (if exists in backup)"
+      stat:
+        path: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}/99-ha-tuning.conf.backup"
+      register: vdsm_backup_stat
+      when: rollback_date != ""
+
+    - name: "[ROLLBACK] Apply VDSM drop-in from backup"
+      copy:
+        src: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}/99-ha-tuning.conf.backup"
+        dest: /etc/vdsm/vdsm.conf.d/99-ha-tuning.conf
+        remote_src: yes
+        mode: '0644'
+        owner: root
+        group: root
+      when: rollback_date != "" and vdsm_backup_stat.stat.exists
+      notify:
+        - restart sanlock
+        - restart vdsmd
+
+    - name: "[ROLLBACK] Remove VDSM drop-in (no backup to restore)"
+      file:
+        path: /etc/vdsm/vdsm.conf.d/99-ha-tuning.conf
+        state: absent
+      when: rollback_date != "" and not vdsm_backup_stat.stat.exists
+      notify:
+        - restart sanlock
+        - restart vdsmd
+
+    - name: "[ROLLBACK] Restore sanlock.conf"
+      stat:
+        path: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}/sanlock.conf.backup"
+      register: sanlock_backup_stat
+      when: rollback_date != ""
+
+    - name: "[ROLLBACK] Apply sanlock.conf from backup"
+      copy:
+        src: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}/sanlock.conf.backup"
+        dest: /etc/sanlock/sanlock.conf
+        remote_src: yes
+        mode: '0644'
+        owner: root
+        group: root
+      when: rollback_date != "" and sanlock_backup_stat.stat.exists
+      notify: restart sanlock
+
+    - name: "[ROLLBACK] Restore agent.conf"
+      stat:
+        path: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}/agent.conf.backup"
+      register: agent_backup_stat
+      when: rollback_date != ""
+
+    - name: "[ROLLBACK] Apply agent.conf from backup"
+      copy:
+        src: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}/agent.conf.backup"
+        dest: /etc/ovirt-hosted-engine-ha/agent.conf
+        remote_src: yes
+        mode: '0644'
+        owner: root
+        group: root
+      when: rollback_date != "" and agent_backup_stat.stat.exists
+      notify: restart ovirt-ha-agent
+
+    - name: "[ROLLBACK] Restore broker.conf"
+      stat:
+        path: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}/broker.conf.backup"
+      register: broker_backup_stat
+      when: rollback_date != ""
+
+    - name: "[ROLLBACK] Apply broker.conf from backup"
+      copy:
+        src: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}/broker.conf.backup"
+        dest: /etc/ovirt-hosted-engine-ha/broker.conf
+        remote_src: yes
+        mode: '0644'
+        owner: root
+        group: root
+      when: rollback_date != "" and broker_backup_stat.stat.exists
+      notify: restart ovirt-ha-broker
+
+    - name: "[ROLLBACK] Restore libvirtd.conf"
+      stat:
+        path: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}/libvirtd.conf.backup"
+      register: libvirt_backup_stat
+      when: rollback_date != ""
+
+    - name: "[ROLLBACK] Apply libvirtd.conf from backup"
+      copy:
+        src: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}/libvirtd.conf.backup"
+        dest: /etc/libvirt/libvirtd.conf
+        remote_src: yes
+        mode: '0644'
+        owner: root
+        group: root
+      when: rollback_date != "" and libvirt_backup_stat.stat.exists
+      notify: restart libvirtd
+
+    - name: "[ROLLBACK] Restore multipath drop-in"
+      stat:
+        path: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}/multipath-99-ha-tuning.conf.backup"
+      register: multipath_backup_stat
+      when: rollback_date != ""
+
+    - name: "[ROLLBACK] Apply multipath drop-in from backup"
+      copy:
+        src: "{{ backup_base }}/olvm-ha-backup-{{ rollback_date }}/multipath-99-ha-tuning.conf.backup"
+        dest: /etc/multipath/conf.d/99-ha-tuning.conf
+        remote_src: yes
+        mode: '0644'
+        owner: root
+        group: root
+      when: rollback_date != "" and multipath_backup_stat.stat.exists
+      notify: reload multipathd
+
+    - name: "[ROLLBACK] Remove multipath drop-in (no backup)"
+      file:
+        path: /etc/multipath/conf.d/99-ha-tuning.conf
+        state: absent
+      when: rollback_date != "" and not multipath_backup_stat.stat.exists
+      notify: reload multipathd
+
+    # =============================================================
+    # FORCE HANDLERS TO RUN
+    # =============================================================
+    - name: "[ROLLBACK] Force handlers to flush"
+      meta: flush_handlers
+
+    # =============================================================
+    # VERIFICATION
+    # =============================================================
+    - name: "[ROLLBACK] Wait for services to settle"
+      pause:
+        seconds: 10
+
+    - name: "[ROLLBACK] Verify service status"
+      command: systemctl is-active {{ item }}
+      register: service_status
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      loop:
+        - vdsmd
+        - sanlock
+        - libvirtd
+
+    - name: "[ROLLBACK] Check HA services"
+      command: systemctl is-active {{ item }}
+      register: ha_service_status
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      loop:
+        - ovirt-ha-agent
+        - ovirt-ha-broker
+
+    - name: "[ROLLBACK] Display rollback summary"
+      debug:
+        msg:
+          - "===================================================="
+          - "Rollback Completed: {{ ansible_hostname }}"
+          - "===================================================="
+          - "Mode: {{ 'Restored from backup' if rollback_date else 'Removed drop-in configs' }}"
+          - "----------------------------------------------------"
+          - "Service Status:"
+          - "  vdsmd:           {{ service_status.results[0].stdout | default('unknown') }}"
+          - "  sanlock:         {{ service_status.results[1].stdout | default('unknown') }}"
+          - "  libvirtd:        {{ service_status.results[2].stdout | default('unknown') }}"
+          - "  ovirt-ha-agent:  {{ ha_service_status.results[0].stdout | default('unknown') }}"
+          - "  ovirt-ha-broker: {{ ha_service_status.results[1].stdout | default('unknown') }}"
+          - "===================================================="
+          - "VERIFY MANUALLY: hosted-engine --vm-status"
+          - "===================================================="
+
+  handlers:
+    - name: reload multipathd
+      command: multipathd reconfigure
+      register: multipath_reload
+      changed_when: multipath_reload.rc == 0
+      failed_when: false
+
+    - name: restart sanlock
+      systemd:
+        name: sanlock
+        state: restarted
+        daemon_reload: yes
+
+    - name: restart vdsmd
+      systemd:
+        name: vdsmd
+        state: restarted
+        daemon_reload: yes
+
+    - name: restart libvirtd
+      systemd:
+        name: libvirtd
+        state: restarted
+        daemon_reload: yes
+
+    - name: restart ovirt-ha-agent
+      systemd:
+        name: ovirt-ha-agent
+        state: restarted
+      failed_when: false
+
+    - name: restart ovirt-ha-broker
+      systemd:
+        name: ovirt-ha-broker
+        state: restarted
+      failed_when: false

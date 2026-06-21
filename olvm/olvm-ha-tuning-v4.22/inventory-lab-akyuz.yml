@@ -1,0 +1,44 @@
+---
+# inventory-lab-akyuz.yml
+# Version: 4.22
+# OLVM/oVirt inventory for the lab.akyuz.tech cluster (from discovery 2026-06-20)
+#
+#   Hosts (hosted-engine hypervisors): olvm01, olvm02
+#   Engine (hosted-engine VM)        : olvmm
+#   Storage                          : LIO-ORG iSCSI software target
+#       target iqn.2025-01.com.sirket:storage01 @ 172.16.166.248:3260
+#       multipath devices lv_ha_shared01_ / lv_ha_shared02_ (ALUA)
+#
+# Names resolve under lab.akyuz.tech; set ansible_host to an IP only if DNS
+# is not available from the control node.
+
+all:
+  children:
+    ovirt_hosts:
+      hosts:
+        olvm01.lab.akyuz.tech:
+          ansible_host: olvm01.lab.akyuz.tech
+        olvm02.lab.akyuz.tech:
+          ansible_host: olvm02.lab.akyuz.tech
+      vars:
+        ansible_user: root
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o ConnectTimeout=15'
+        # ansible_ssh_private_key_file: ~/.ssh/id_rsa
+
+    ovirt_engine:
+      hosts:
+        engine:
+          ansible_host: olvmm.lab.akyuz.tech
+      vars:
+        ansible_user: root
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o ConnectTimeout=15'
+
+  vars:
+    project_name: "OLVM HA Tuning"
+    project_version: "4.22"
+    # Storage context (informational)
+    lab_storage_vendor: "LIO-ORG"
+    lab_storage_target: "iqn.2025-01.com.sirket:storage01"
+    lab_storage_portal: "172.16.166.248:3260"

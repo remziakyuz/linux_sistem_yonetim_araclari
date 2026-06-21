@@ -1,0 +1,217 @@
+---
+# test-connection.yml
+# Version: 4.22
+# OLVM Environment Validation Playbook
+# 
+# Tests:
+#   - Ansible connectivity
+#   - OS version compatibility
+#   - Required packages installed
+#   - Python module availability
+#   - Service states
+#   - Existing configurations
+
+- name: "OLVM Environment Validation"
+  hosts: ovirt_hosts
+  gather_facts: yes
+  become: yes
+  any_errors_fatal: false  # Continue even if some hosts fail
+  
+  tasks:
+    # =============================================================
+    # OS INFORMATION
+    # =============================================================
+    - name: "[INFO] Display host information"
+      debug:
+        msg:
+          - "Host: {{ ansible_hostname }} ({{ ansible_default_ipv4.address }})"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel: {{ ansible_kernel }}"
+          - "Python: {{ ansible_python_version }}"
+          - "Architecture: {{ ansible_architecture }}"
+      tags: info
+    
+    # =============================================================
+    # PACKAGE CHECKS
+    # =============================================================
+    - name: "[PKG] Check VDSM"
+      shell: |
+        rpm -q vdsm --queryformat '%{VERSION}-%{RELEASE}' 2>/dev/null || echo "NOT_INSTALLED"
+      register: vdsm_info
+      changed_when: false
+      tags: packages
+    
+    - name: "[PKG] Check ovirt-hosted-engine-ha"
+      shell: |
+        rpm -q ovirt-hosted-engine-ha --queryformat '%{VERSION}-%{RELEASE}' 2>/dev/null || echo "NOT_INSTALLED"
+      register: ha_info
+      changed_when: false
+      tags: packages
+    
+    - name: "[PKG] Check sanlock"
+      shell: |
+        rpm -q sanlock --queryformat '%{VERSION}-%{RELEASE}' 2>/dev/null || echo "NOT_INSTALLED"
+      register: sanlock_info
+      changed_when: false
+      tags: packages
+    
+    - name: "[PKG] Check libvirt"
+      shell: |
+        rpm -q libvirt --queryformat '%{VERSION}-%{RELEASE}' 2>/dev/null || echo "NOT_INSTALLED"
+      register: libvirt_info
+      changed_when: false
+      tags: packages
+    
+    - name: "[PKG] Check device-mapper-multipath"
+      shell: |
+        rpm -q device-mapper-multipath --queryformat '%{VERSION}-%{RELEASE}' 2>/dev/null || echo "NOT_INSTALLED"
+      register: multipath_info
+      changed_when: false
+      tags: packages
+
+    # =============================================================
+    # PYTHON MODULE CHECKS
+    # =============================================================
+    - name: "[PYTHON] Check Python rpm module"
+      command: python3 -c "import rpm"
+      register: python_rpm
+      changed_when: false
+      failed_when: false
+      tags: python
+    
+    - name: "[PYTHON] Check Python dnf module"
+      command: python3 -c "import dnf"
+      register: python_dnf
+      changed_when: false
+      failed_when: false
+      tags: python
+
+    # =============================================================
+    # SERVICE CHECKS
+    # =============================================================
+    - name: "[SVC] Check critical service states"
+      shell: systemctl is-active {{ item }} 2>/dev/null || echo "inactive"
+      register: services_status
+      changed_when: false
+      loop:
+        - vdsmd
+        - sanlock
+        - libvirtd
+        - multipathd
+        - ovirt-ha-agent
+        - ovirt-ha-broker
+      tags: services
+
+    # =============================================================
+    # STORAGE CHECKS
+    # =============================================================
+    - name: "[STORAGE] Check multipath devices"
+      shell: |
+        multipath -l 2>/dev/null | grep -c "^[a-z0-9]" || echo "0"
+      register: multipath_devices
+      changed_when: false
+      failed_when: false
+      tags: storage
+
+    # =============================================================
+    # ANSIBLE MODULE CHECKS
+    # =============================================================
+    - name: "[ANSIBLE] Test required builtin modules"
+      command: ansible-doc -t module {{ item }}
+      delegate_to: localhost
+      run_once: true
+      become: no
+      register: module_check
+      changed_when: false
+      failed_when: false
+      loop:
+        - file
+        - copy
+        - lineinfile
+        - systemd
+        - command
+        - stat
+        - set_fact
+      tags: modules
+
+    - name: "[ANSIBLE] Verify all required modules available"
+      assert:
+        that:
+          - item.rc == 0
+        fail_msg: "Module '{{ item.item }}' not available"
+        success_msg: "Module '{{ item.item }}': OK"
+      loop: "{{ module_check.results }}"
+      run_once: true
+      tags: modules
+
+    # =============================================================
+    # CONFIGURATION CHECKS
+    # =============================================================
+    - name: "[CONFIG] Check existing HA tuning"
+      stat:
+        path: /etc/vdsm/vdsm.conf.d/99-ha-tuning.conf
+      register: vdsm_tuning_conf
+      tags: config
+
+    - name: "[CONFIG] Check existing multipath tuning"
+      stat:
+        path: /etc/multipath/conf.d/99-ha-tuning.conf
+      register: multipath_tuning_conf
+      tags: config
+
+    - name: "[CONFIG] Get current sanlock io_timeout"
+      shell: |
+        if [ -f /etc/vdsm/vdsm.conf.d/99-ha-tuning.conf ]; then
+          grep -A3 '^\[sanlock\]' /etc/vdsm/vdsm.conf.d/99-ha-tuning.conf | grep io_timeout | awk '{print $3}' || echo "default"
+        else
+          echo "default"
+        fi
+      register: current_sanlock
+      changed_when: false
+      tags: config
+
+    # =============================================================
+    # SUMMARY REPORT
+    # =============================================================
+    - name: "[REPORT] Service status summary"
+      debug:
+        msg: "{{ item.item }}: {{ item.stdout }}"
+      loop: "{{ services_status.results }}"
+      tags: report
+
+    - name: "[REPORT] Environment validation summary"
+      debug:
+        msg:
+          - "===================================================="
+          - "Environment Validation: {{ ansible_hostname }}"
+          - "===================================================="
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel: {{ ansible_kernel }}"
+          - "Python: {{ ansible_python_version }}"
+          - "----------------------------------------------------"
+          - "Packages:"
+          - "  VDSM: {{ vdsm_info.stdout }}"
+          - "  Hosted-Engine HA: {{ ha_info.stdout }}"
+          - "  Sanlock: {{ sanlock_info.stdout }}"
+          - "  Libvirt: {{ libvirt_info.stdout }}"
+          - "  Multipath: {{ multipath_info.stdout }}"
+          - "----------------------------------------------------"
+          - "Python Modules:"
+          - "  rpm: {{ 'OK' if python_rpm.rc == 0 else 'MISSING - run fix-ansible-deps.sh' }}"
+          - "  dnf: {{ 'OK' if python_dnf.rc == 0 else 'MISSING - run fix-ansible-deps.sh' }}"
+          - "----------------------------------------------------"
+          - "Storage:"
+          - "  Multipath devices: {{ multipath_devices.stdout }}"
+          - "----------------------------------------------------"
+          - "Configuration:"
+          - "  HA Tuning Applied: {{ 'YES' if vdsm_tuning_conf.stat.exists else 'NO' }}"
+          - "  Multipath Tuning Applied: {{ 'YES' if multipath_tuning_conf.stat.exists else 'NO' }}"
+          - "  Current Sanlock io_timeout: {{ current_sanlock.stdout }}s"
+          - "===================================================="
+      tags: report
+
+    - name: "[REPORT] Determine readiness"
+      debug:
+        msg:
+          - "{{ '✓ READY: All checks passed' if (python_rpm.rc == 0 and 'NOT_INSTALLED' not in vdsm_info.stdout) else '✗ NOT READY: Fix issues above' }}"
+      tags: report

@@ -1,0 +1,116 @@
+# OLVM HA Tuning – Run Report
+
+- **Generated:** {{ report_generated }}
+- **Playbook version:** {{ report_version }}
+- **Profile applied:** `{{ report_profile }}`
+- **Run mode:** {{ 'STAGED (no service restart)' if not report_restart_enabled else 'APPLIED (services restarted)' }}
+- **Backup stamp:** `{{ report_backup_stamp }}`  (rollback: `./setup.sh --rollback {{ report_backup_stamp }}`)
+- **Hosts processed:** {{ report_hosts | length }}
+
+> The "Estimated failover" figure is a **heuristic upper bound**
+> `(sanlock_io × 3/2) + (ha_mon × 3) + 25`, not a measured value.
+> Validate with a real failover test (fence a host) in a maintenance window.
+
+---
+
+## 1. Summary
+
+| Host | Tuning | Failover (heuristic) | Changes this run | Services after |
+|------|--------|----------------------|------------------|----------------|
+{% for h in report_hosts %}
+| `{{ h.hostname }}` | {{ 'APPLIED' if h.changed_any else 'NO-OP (already tuned)' }} | ~{{ h.estimated_failover }}s ({{ h.failover_class }}) | {{ h.change_count }} | {{ h.services_summary }} |
+{% endfor %}
+
+---
+
+## 2. Per-host detail
+{% for h in report_hosts %}
+
+### {{ loop.index }}. `{{ h.hostname }}`
+
+**Profile values applied**
+
+| Setting | Value |
+|---------|-------|
+| VDSM heartbeat_interval | {{ h.settings.vdsm_heartbeat_interval }}s |
+| VDSM host_monitor_timeout | {{ h.settings.vdsm_host_monitor_timeout }}s |
+| VDSM migration_timeout | {{ h.settings.vdsm_migration_timeout }}s |
+| Sanlock io_timeout | {{ h.settings.sanlock_io_timeout }}s |
+| Sanlock watchdog_fire_timeout | {{ h.settings.sanlock_watchdog_fire_timeout }}s |
+| Multipath polling_interval | {{ h.settings.multipath_polling_interval }}s |
+| Multipath no_path_retry (derived) | {{ h.settings.no_path_retry }} |
+| HA monitoring_interval | {{ h.settings.ha_monitoring_interval }}s |
+| HA connection_timeout | {{ h.settings.ha_connection_timeout }}s |
+| HA score_penalty | {{ h.settings.ha_score_penalty }} |
+| HA state_transition_timeout | {{ h.settings.ha_state_transition_timeout }}s |
+| Libvirt keepalive_interval | {{ h.settings.libvirt_keepalive_interval }}s |
+| Libvirt keepalive_count | {{ h.settings.libvirt_keepalive_count }} |
+
+**Operations performed**
+
+| Item | Result |
+|------|--------|
+| Backup directory | `{{ h.backup_dir }}` ({{ 'created' if h.backup_created else 'skipped' }}) |
+| VDSM drop-in (`/etc/vdsm/vdsm.conf.d/99-ha-tuning.conf`) | {{ h.changes.vdsm_dropin }} |
+| Sanlock legacy keys (`/etc/sanlock/sanlock.conf`) | {{ h.changes.sanlock_keys }} |
+| Multipath drop-in (`/etc/multipath/conf.d/99-ha-tuning.conf`) | {{ h.changes.multipath_dropin }} |
+| HA agent keys (`/etc/ovirt-hosted-engine-ha/agent.conf`) | {{ h.changes.ha_agent_keys }} |
+| Libvirt keepalive keys (`/etc/libvirt/libvirtd.conf`) | {{ h.changes.libvirt_keys }} |
+| Service restart | {{ 'performed' if h.restart_enabled else 'STAGED only (not restarted)' }} |
+
+**Service status after run:** vdsmd={{ h.services.vdsmd }}, sanlock={{ h.services.sanlock }}, libvirtd={{ h.services.libvirtd }}
+{% if not h.restart_enabled %}
+
+> Config was **staged** on this host. Activate it by rebooting the host from
+> the OLVM web UI, one host at a time:
+> `Compute > Hosts > {{ h.hostname }} > Management > Maintenance → Restart → Activate`.
+{% endif %}
+{% endfor %}
+
+---
+
+## 3. Engine configuration
+{% if report_engine %}
+{% for e in report_engine %}
+
+### `{{ e.hostname }}`
+
+- ovirt-engine: **{{ e.active }}** ({{ e.version }})
+- Engine restart this run: **{{ 'PERFORMED' if e.restarted else ('STAGED — run `systemctl restart ovirt-engine`' if (e.staged | default(false)) else 'NOT NEEDED (no changes)') }}**
+- Status after: {{ e.status_after }}
+
+**Parameters changed this run ({{ e.changed | length }})**
+{% if e.changed | length > 0 %}
+
+| Parameter | Old | New |
+|-----------|-----|-----|
+{% for c in e.changed %}
+| `{{ c.name }}` | {{ c.old }} | {{ c.new }} |
+{% endfor %}
+{% else %}
+_None — all supported parameters already at desired values._
+{% endif %}
+
+**Supported but already correct ({{ e.already | length }}):** {{ e.already | join(', ') if e.already else 'none' }}
+
+**Skipped (not available in this OLVM version) ({{ e.unsupported | length }}):** {{ e.unsupported | join(', ') if e.unsupported else 'none' }}
+{% endfor %}
+{% else %}
+_No engine host in this run (or ovirt-engine not active)._
+{% endif %}
+
+---
+
+## 4. Notes & next steps
+
+- Rollback this run: `./setup.sh --rollback {{ report_backup_stamp }}`
+- Verify: `./verify-olvm-ha.sh --full`
+- The VDSM `[vars]` keys (`heartbeat_interval`, `host_monitor_timeout`,
+  `migration_timeout`) and the HA `agent.conf` keys beyond `monitoring_interval`
+  should be confirmed against the daemon schema on a real system — unknown keys
+  may be silently ignored (see REVIEW notes).
+- `dev_loss_tmo infinity` in the multipath `overrides` block applies globally.
+  In a Dell EMC ME5 (ALUA) environment, consider the ME5-scoped `device {}`
+  option (`multipath_me5_device_block: true`).
+
+_Report generated by olvm-ha-tuning {{ report_version }}._

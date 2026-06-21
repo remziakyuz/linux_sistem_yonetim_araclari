@@ -1,0 +1,2010 @@
+---
+# olvm-ha-tuning.yml
+# Oracle Linux Virtualization Manager (OLVM) HA Timeout Tuning Playbook
+# 
+# Tested on:
+#   - OLVM 4.5.5-1.67.el8
+#   - VDSM 4.50.5.1-8.el8
+#   - Oracle Linux 8.10
+#   - Kernel 5.15.0-uek
+#   - libvirt 9.0.0
+#   - Ansible Core 2.16+
+#
+# Version: 4.22 (control-node wrappers gain -i/--inventory; over 4.21 which fixed the VDSM drop-in escaped-quote that broke vdsmd)
+# Last Updated: 2026-06-21
+#
+# Changes in v4.22 (tooling only; this playbook's tasks are unchanged):
+#   - setup.sh / verify-olvm-ha.sh / fix-ansible-deps.sh now accept
+#     -i / --inventory FILE. Before, only the fixed inventory.yml was used, so
+#     the documented lab/prod command
+#       ./setup.sh custom -i inventory-lab-akyuz.yml -e @vars/lab-akyuz.yml --no-restart
+#     aborted with "Unknown argument: -i". The shipped inventory-lab-akyuz.yml
+#     and inventory-prod-dell-me5.yml are now usable end-to-end (apply, verify,
+#     rollback, syntax-check, dependency install).
+#
+# IMPORTANT: This playbook uses ONLY ansible-core builtin modules.
+# No external collections (community.general, etc.) are required.
+#
+# Architecture: Runs FROM the control/management node against hosts
+# defined in inventory.yml. NOT executed locally on OLVM hosts.
+#
+# Changes in v4.21 (CRITICAL bugfix from a real host failure):
+#   - A real apply wrote the VDSM drop-in with a literal leading/trailing
+#     `\"` character (the deploy task had `content: \"{{ ... }}\"` - the quotes
+#     were escaped, so the rendered file began with `\"#...`). On the next vdsmd
+#     start, VDSM's configparser hit a non-comment, non-section first line and
+#     raised MissingSectionHeaderError -> vdsmd failed to start, the host went
+#     Not Responding, and VM device hooks crashed. FIXED: the deploy tasks now
+#     use plain `content: "{{ ... }}"` (this also affected the multipath drop-in).
+#   - Defense-in-depth: the VDSM drop-in copy now has a `validate:` step that
+#     parses the staged temp file as INI BEFORE installing it. A non-parseable
+#     drop-in can no longer be placed where vdsmd would read it.
+#   - The VDSM drop-in is now [vars]-only. The stray `[sanlock]` section was
+#     removed (sanlock does NOT read vdsm.conf.d; io_timeout, when applied, is
+#     written to /etc/sanlock/sanlock.conf by the sanlock section).
+#   - vdsm_apply_vars_section now DEFAULTS FALSE (the [vars] keys are unverified
+#     against the VDSM 4.50 schema). When false, the managed drop-in is REMOVED,
+#     so a host that received a bad file self-heals on the next run. Drift
+#     detection accounts for this removal; converged re-runs stay changed=0.
+#   - Packaging: only the current REVIEW file is shipped from now on.
+#
+# Changes in v4.20 (verify playbook only; the apply playbook is unchanged):
+#   - verify-olvm-ha.yml no longer calls `vdsm-tool validate-config` (absent on
+#     VDSM 4.50.x; it always reported "FAILED or skipped"). It now validates the
+#     VDSM drop-in by parsing it as INI with Python - the same version-
+#     independent, non-fatal approach the apply playbook adopted in v4.17. The
+#     report line is relabelled "VDSM drop-in INI parse".
+#   - verify-olvm-ha.yml HA quick-status no longer prints "Not a hosted-engine
+#     host" when `hosted-engine --vm-status` happens to return no engine status
+#     but ovirt-ha-agent is active; it now reflects the actual service state.
+#   (A real staged run with the balanced profile confirmed the apply playbook is
+#   clean: engine 4/4 changes, libvirt keepalive correctly left at the vdsm-
+#   managed value, multipath validated, services stayed active.)
+#
+# Changes in v4.19:
+#   - Clarifies and completes the lab -> Dell production path. The lab
+#     (LIO-ORG iSCSI) and the Dell ME5 production cluster run the SAME OLVM
+#     4.5.5 / VDSM 4.50 / OEL 8.10 hosted-engine software, so every fix made in
+#     v4.10-v4.18 is software-level and applies to BOTH:
+#       engine-config tuning, idempotency, two-stage restart, drift-gated
+#       backups, non-fatal validation, version-stable drop-ins, and the
+#       per-section toggles (libvirt keepalive=-1, sanlock io_timeout-not-here,
+#       agent.conf [score] schema) are NOT storage-specific.
+#   - The ONE storage-specific difference is the multipath device block: the
+#     built-in multipath hwtable on this version has NO DellEMC/ME5 entry
+#     (verified from the lab discovery), so ME5 REQUIRES the explicit device {}
+#     stanza (ALUA), whereas the lab's LIO-ORG auto-detects ALUA and uses the
+#     global overrides instead.
+#   - NEW: vars/prod-dell-me5.yml and inventory-prod-dell-me5.yml - the
+#     production profile carries the same correct toggle decisions as the lab
+#     but turns the ME5 device block ON. Verified: ME5 ALUA block renders and a
+#     converged re-run is changed=0 with the host-file sections off.
+#
+# Changes in v4.18:
+#   - Driven by a discovery snapshot of a real OEL 8.10 / VDSM 4.50 hosted-engine
+#     lab (LIO-ORG iSCSI storage, ALUA auto-detected - NOT Dell ME5):
+#   - NEW per-section apply toggles so the playbook only writes what is verified
+#     effective in a given environment:
+#       * apply_libvirt_keepalive (DEFAULT FALSE) - oVirt/vdsm deliberately sets
+#         keepalive_interval=-1 in libvirtd.conf; forcing 5 fought vdsm. Off now.
+#       * apply_sanlock_conf (default true) - in oVirt the lease io_timeout is set
+#         by VDSM, not via sanlock.conf; turn off where it has no effect.
+#       * apply_ha_agent (default true) - real agent.conf uses a [score] section,
+#         not [agent] monitoring_interval; turn off where keys are unverified.
+#       (vdsm_apply_vars_section already existed.)
+#     Drift detection (Section 1.5) respects every toggle, so a disabled section
+#     never triggers a backup or a re-change loop.
+#   - engine_vds_connection_timeout var lets a profile soften vdsConnectionTimeout
+#     (default target 5 is aggressive; the lab profile uses 8).
+#   - NEW environment files: inventory-lab-akyuz.yml and vars/lab-akyuz.yml,
+#     which disable the unverified host-file sections and tune only the two
+#     surfaces verified effective there: engine-config + multipath overrides.
+#
+# Changes in v4.17:
+#   - BUGFIX (real system): the "validate vdsm config" handler ran
+#     `vdsm-tool validate-config`, which does NOT exist on every VDSM build
+#     (OEL 8.10 / VDSM 4.50.x prints the usage text and returns rc=1). Because
+#     it ran during handler flush AFTER the config was written, with
+#     failed_when on rc, it ABORTED the play on the second host (changed config,
+#     no restart, failed=1). VDSM is now validated by parsing the drop-in as INI
+#     with Python (version independent), and the check is NON-FATAL.
+#   - All validation handlers are now NON-FATAL by design: they validate and
+#     print a WARNING, but never abort a restart-enabled run after files were
+#     written (which would leave a host half-applied). `multipath -t` is also
+#     non-fatal now and only runs when multipathd is active.
+#   - Drop-in files no longer embed the playbook version in their content
+#     ("# Managed by Ansible (olvm-ha-tuning)"), so upgrading the playbook does
+#     NOT cause a one-time content change/backup on the next run. The version is
+#     still recorded in the playbook header, README, and the run reports.
+#
+# Changes in v4.16:
+#   - TRUE NO-OP ON A CONVERGED RE-RUN. Previously, even when every tuning
+#     value was already correct, the per-run BACKUP section still ran (it
+#     created a fresh timestamped backup dir and copied the configs every
+#     time), so the PLAY RECAP showed changed=8 per host and it LOOKED like
+#     changes were made. Now a read-only DRIFT DETECTION pass (Section 1.5)
+#     runs first: it renders the desired drop-in contents as facts, compares
+#     them to the live files with a check_mode copy, and checks the managed
+#     key lines via slurp. It sets `any_change_needed`. The entire backup
+#     section is gated on `any_change_needed`, so when nothing differs:
+#       * no backup is taken, nothing is written,
+#       * PLAY RECAP shows changed=0 for the hosts,
+#       * the play prints "All managed settings are already current".
+#     Verified end-to-end: first run changes + backs up; an identical second
+#     run is changed=0 with drift detection matching the real apply exactly.
+#   - The two drop-in contents are now single-source facts (vdsm_dropin_content,
+#     multipath_dropin_content) used by both the drift pre-flight and the real
+#     copy, so detection can never disagree with what would be written.
+#   - Tip: for a guaranteed zero-change check run, backups are skipped
+#     automatically when converged; pass -e create_backup=false to skip them
+#     always.
+#
+# Changes in v4.15:
+#   - The generated ME5 multipath drop-in (conf.d/99-ha-tuning.conf) is now
+#     SELF-DOCUMENTING: every line carries a comment with (a) what it does,
+#     (b) the Dell ME5 recommended value, and (c) the multipath/oVirt default
+#     (original) value. Verified against the Dell PowerVault ME5 Series
+#     Administrator's Guide (2024), "Best practices > Multipath configuration"
+#     (device {} example p.126, Table 27 p.125).
+#   - Compatibility summary embedded in the file header: the 7 ALUA/path
+#     attributes MATCH Dell's recommended example; the 3 timeout lines
+#     (no_path_retry / fast_io_fail_tmo / dev_loss_tmo) are oVirt HA overrides
+#     that Dell does NOT prescribe (Dell: "retain the default settings for the
+#     remaining attributes") - each is annotated with its trade-off.
+#
+# Changes in v4.14:
+#   - setup.sh now accepts `-e KEY=VALUE` / `--extra-vars KEY=VALUE` and forwards
+#     them to ansible-playbook (was: "Unknown argument: -e"). User vars are
+#     passed last so they take precedence. e.g.
+#       ./setup.sh balanced --no-restart -e multipath_me5_device_block=true
+#   - Restart safety is now a TWO-stage confirmation. Default and recommended is
+#     NO restart. If a restart is requested interactively, setup.sh warns and
+#     asks twice; BOTH must be accepted or it falls back to staging. Only
+#     `--force --restart` restarts non-interactively.
+#   - The Dell ME5 / multipath device-block variables moved OUT of this playbook
+#     and into the profile files (vars/*.yml): multipath_me5_device_block,
+#     multipath_me5_vendor, multipath_me5_product, and the ALUA attributes. The
+#     tasks reference them with `| default(...)` so a custom vars file that omits
+#     them still works.
+#
+# Workflow (unchanged, idempotent): each run READS the current values from the
+# hosts and the engine, COMPARES them to the profile, and only UPDATES the ones
+# that differ; a no-op re-run changes nothing and restarts nothing.
+#
+# Changes in v4.13:
+#   - MULTIPATH/VDSM: confirmed the supported way to customize multipath under
+#     oVirt/OLVM is a drop-in in /etc/multipath/conf.d/ (which this playbook
+#     already uses) - NOT editing /etc/multipath.conf and NOT vdsm-tool.
+#     vdsm-tool only (a) lays down the VDSM-managed /etc/multipath.conf base
+#     and (b) writes vdsm_blacklist.conf via `vdsm-tool config-lvm-filter`
+#     (local-disk blacklist); it has no command to inject device tuning.
+#     oVirt docs: "do not customize /etc/multipath.conf ... create a file in
+#     /etc/multipath/conf.d". Our file is 99-... so it is applied last and wins.
+#   - Dell ME5 device block is now ALUA-correct. Previously the ME5 stanza set
+#     only no_path_retry/fast_io_fail_tmo/dev_loss_tmo, omitting the ALUA path
+#     attributes. ME5 is SCSI-3 ALUA, so per the Dell PowerVault ME5
+#     Administrator's Guide the device block now also sets
+#     path_grouping_policy=group_by_prio, path_checker=tur,
+#     hardware_handler="1 alua", prio=alua, failback=immediate,
+#     rr_weight=uniform, path_selector="service-time 0" (all tunable). The HA
+#     timeouts are layered on top. Verify exact vendor/product on the host with
+#     `multipathd show paths format "%d %s"` and ALUA with `multipath -v3 | grep alua`.
+#
+# Changes in v4.12:
+#   - ENGINE IDEMPOTENCY BUGFIX (critical): the regex that parses the current
+#     value out of `engine-config -g NAME` ("NAME: VALUE version: general") was
+#     over-escaped (\\\\s instead of a plain space match), so on a real system
+#     it stripped nothing and current_engine_map held the RAW line
+#     ("VdsRefreshRate: 2 version: general") instead of the bare value ("2").
+#     The comparison (desired != current) was therefore ALWAYS true, so ALL 17
+#     engine parameters were re-applied on every run and ovirt-engine was
+#     queued for restart every time - even when every value already matched
+#     (the report showed "17 changed" with old==new like 2 -> 2). The parse now
+#     uses backslash-free patterns (' version:.*$' and '^[^:]*:[ ]*'); a no-op
+#     re-run now yields an EMPTY apply list, no engine restart, and the report
+#     shows "0 changed / 17 already correct". verify-olvm-ha.yml parses the
+#     same way so its report shows clean values too.
+#
+# Changes in v4.11:
+#   - SAFE BY DEFAULT: restart_enabled now defaults to FALSE everywhere (apply
+#     play AND engine play). A direct `ansible-playbook` run STAGES the config
+#     and does NOT restart sanlock/vdsmd/libvirtd, nor auto-restart
+#     ovirt-engine. setup.sh asks interactively ("Restart services now? [no]")
+#     and passes restart_enabled=true only on explicit opt-in (--restart or a
+#     "yes" answer). --force without --restart stays safe (no restart).
+#   - ENGINE restart is now gated on restart_enabled too (was unconditional on
+#     config change). When staged, the engine-config values are written to the
+#     DB and the playbook prints the manual step: systemctl restart ovirt-engine.
+#   - BUGFIX (dry-run): "[ENGINE] Verify engine is active after restart" failed
+#     during `setup.sh` dry-run (--check) with 10 retries then
+#     "Command would have run if not in check mode" (empty stdout in check mode
+#     never satisfied `until ... == active`). The post-restart wait/verify are
+#     now skipped under check mode (not ansible_check_mode), so the dry-run
+#     completes cleanly.
+#
+# Changes in v4.10:
+#   - IDEMPOTENCY (critical, finishes the v4.9 work): the VDSM and multipath
+#     drop-in files embedded the run timestamp (ansible_date_time.iso8601) in
+#     their CONTENT. Because that timestamp changes every run, the `copy`
+#     tasks reported "changed" on EVERY apply, which fired the
+#     restart-sanlock / restart-vdsmd / reload-multipathd handlers and
+#     bounced those daemons on a LIVE hypervisor on every run - even a pure
+#     no-op re-apply. v4.9 fixed engine idempotency but left this. The
+#     volatile timestamp is removed; the drop-in content is now stable, so a
+#     second identical run is a true no-op (changed=0, no restarts).
+#   - NEW: run report. After a successful apply the playbook renders an HTML
+#     and a Markdown report (templates/report.{html,md}.j2) to ./reports/ on
+#     the control node, documenting every operation performed per host plus
+#     the engine parameter changes. Toggle with generate_report (default true).
+#   - NEW (opt-in): multipath_me5_device_block - when true, scopes the HA
+#     storage settings to a Dell EMC ME5 `device {}` stanza instead of the
+#     global `overrides {}` block (REVIEW 2.3). Default false preserves the
+#     existing overrides behavior.
+#   - vdsm_apply_vars_section (default FALSE as of v4.21) controls whether the
+#     VDSM [vars] drop-in is written at all. When false the managed drop-in is
+#     removed, so the host uses the stock VDSM config. sanlock io_timeout is
+#     never written into vdsm.conf.d (sanlock does not read it there).
+#   - Per-task change tracking: drop-in/lineinfile results are registered and
+#     summarized so the report and the on-screen summary show exactly what
+#     changed vs what was already correct.
+#   - Doc consistency: failover figures relabeled as heuristic upper bounds
+#     everywhere (setup.sh usage, inventory header version 4.8 -> 4.10).
+#
+# Changes in v4.9:
+#   - ENGINE IDEMPOTENCY (major): engine-config is now compared current-vs-
+#     desired and only mismatched parameters are applied. Previously every
+#     run reported "changed" and restarted ovirt-engine (needless downtime).
+#   - Engine play: meta end_play -> end_host (one inactive engine host no
+#     longer aborts the whole play).
+#   - VDSM version gate now actually enforces the MINOR version (min_vdsm_minor
+#     was defined but unused).
+#   - --no-restart is now wired through (restart_enabled var gates handlers);
+#     in 4.8 the flag was a no-op because handlers always flushed.
+#   - Consistent backup timestamp across hosts (backup_stamp extra-var) so a
+#     single rollback_date restores every host (serial:1 gave each host a
+#     different per-host timestamp before).
+#   - verify: aggregate summary "params tuned: X / 0" fixed (play vars are not
+#     visible via hostvars; totals now persisted as facts).
+#   - verify: failover classification bands recalibrated so the shipped
+#     profiles map to their own labels (balanced previously showed
+#     CONSERVATIVE). Failover figure relabeled as a heuristic upper bound.
+#   - rollback: simple (no-date) rollback now also removes the in-place
+#     lineinfile keys from sanlock.conf / agent.conf / libvirtd.conf, so it
+#     truly reverts to defaults instead of half-reverting.
+#   - verify-olvm-ha.sh --version no longer maps to a non-existent tag.
+#   - ENGINE PARAMS reconciled against a real `engine-config --all` dump:
+#       * corrected wrong default annotations (e.g. ServerRebootTimeout
+#         default is 600, not 300; vdsConnectionTimeout default 20; etc.)
+#       * of the 17 "tuned" params only 4 actually differ from the 4.5.5
+#         default (VdsRefreshRate, ServerRebootTimeout, vdsConnectionTimeout,
+#         FenceQuietTimeBetweenOperationsInSec); the other 13 were being set
+#         to their own default (no-op). They are now grouped as an explicit
+#         DRIFT GUARD block and clearly labelled "= default".
+#       * REVIEW warnings added on risky values; ServerRebootTimeout set to
+#         300 (was 90 - too low for bare-metal POST/RAID init);
+#         vdsConnectionTimeout=5 still flagged as aggressive.
+#       * fence-confirmation timing params (FenceStart/StopStatusRetries +
+#         DelayBetweenRetries, KdumpStartedTimeout, DelayResetForSpmInSeconds,
+#         VmGracefulShutdownTimeout) added to the informational list - they
+#         dominate real fencing latency.
+#
+# Changes in v4.8:
+#   - Engine tunable parameters expanded 9 -> 17, ALL confirmed available
+#     in OLVM 4.5.5-1.67.el8 against actual `engine-config -l` output
+#   - New tunable parameters added:
+#       * VdsRefreshRate (host status polling)
+#       * VdsRecoveryTimeoutInMinutes (host recovery timeout)
+#       * NetworkConnectivityCheckTimeoutInSeconds (network rollback)
+#       * HostPreparingForMaintenanceIdleTime (maintenance idle retry)
+#       * MaxStorageVdsDelayCheckSec, MaxStorageVdsTimeoutCheckSec
+#       * NumberOfFailedRunsOnVds, MaxRerunVmOnVdsCount (VM rerun)
+#   - New engine_verify_only list (10 params): shown for awareness
+#     but intentionally NOT modified (vdsTimeout, vdsRetries,
+#     PMHealthCheckEnabled, kdump fence settings, fence retries, etc.)
+#   - verify-olvm-ha.yml: two-tier engine report (tunable + informational)
+#   - All parameter list reconciled against actual OLVM 4.5.5 output
+#
+# Changes in v4.7:
+#   - Initial engine_settings expansion from 3 to 9 HA-relevant parameters
+#   - verify-olvm-ha.yml: NEW engine verification play
+#   - Aggregate summary now includes engine status
+#
+# Changes in v4.6:
+#   - Architecture clarified: control-node driven (was implicit before)
+#   - New verify-olvm-ha.yml playbook for Ansible-driven verification
+#   - verify-olvm-ha.sh is now a thin wrapper around the playbook
+#   - Tightened lineinfile section anchoring (insertafter '^\[agent\]$')
+#
+# Changes in v4.5:
+#   - Unified version stamps across all files (single source of truth)
+#   - Failover formula now uses integer-safe math everywhere:
+#       (sanlock_io_timeout * 3 / 2) + (ha_monitoring_interval * 3) + 25
+#     replacing the previous "* 1.5" which produced "115.0" in bash
+#     and broke integer comparisons in verify-olvm-ha.sh
+#   - Added pre-deployment failover estimate as validation gate
+#   - More resilient lineinfile section anchoring for agent.conf
+#
+# Changes in v4.4:
+#   - verify-olvm-ha.sh: Fixed "unbound variable" error in multipath sync check
+#   - verify-olvm-ha.sh: Improved variable initialization (safe defaults)
+#   - verify-olvm-ha.sh: Better error handling for missing config values
+#
+# Changes in v4.3:
+#   - Engine: Force ovirt-engine restart AFTER any successful config change
+#   - Engine: Use flush_handlers to restart immediately after changes
+#   - Engine: Added explicit restart verification
+#   - Engine: Improved error messages for unsupported parameters
+#
+# Changes in v4.2:
+#   - Engine config: Dynamically validates available parameters via engine-config -l
+#   - Engine config: Skips unsupported parameters gracefully (no more failures)
+#   - Engine config: Uses --cver=general explicitly for compatibility
+#   - Backup: Improved check_mode handling
+#   - HA Broker: Properly skips when broker.conf doesn't exist (4.5.5 normal)
+
+- name: "OLVM HA Tuning - Pre-flight Validation"
+  hosts: ovirt_hosts
+  become: yes
+  gather_facts: yes
+  any_errors_fatal: true
+  
+  vars:
+    supported_os_major: "8"
+    min_vdsm_major: "4"
+    min_vdsm_minor: "50"
+    
+  tasks:
+    - name: "[VALIDATE] Operating system"
+      assert:
+        that:
+          - ansible_distribution in ['OracleLinux', 'RedHat', 'CentOS']
+          - ansible_distribution_major_version == supported_os_major
+        fail_msg: "Unsupported OS: {{ ansible_distribution }} {{ ansible_distribution_major_version }}. Required: Oracle Linux/RHEL 8"
+        success_msg: "OS validated: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+      tags: validate
+
+    - name: "[VALIDATE] Check VDSM"
+      command: rpm -q vdsm --queryformat '%{VERSION}'
+      register: vdsm_version_check
+      changed_when: false
+      failed_when: vdsm_version_check.rc != 0
+      check_mode: no
+      tags: validate
+
+    - name: "[VALIDATE] Check sanlock"
+      command: rpm -q sanlock --queryformat '%{VERSION}'
+      register: sanlock_version_check
+      changed_when: false
+      failed_when: sanlock_version_check.rc != 0
+      check_mode: no
+      tags: validate
+
+    - name: "[VALIDATE] Check libvirt"
+      command: rpm -q libvirt --queryformat '%{VERSION}'
+      register: libvirt_version_check
+      changed_when: false
+      failed_when: libvirt_version_check.rc != 0
+      check_mode: no
+      tags: validate
+
+    - name: "[VALIDATE] Check ovirt-hosted-engine-ha (optional)"
+      command: rpm -q ovirt-hosted-engine-ha --queryformat '%{VERSION}'
+      register: ha_version_check
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      tags: validate
+
+    - name: "[VALIDATE] Verify VDSM version meets minimum requirements"
+      assert:
+        that:
+          - vdsm_version_check.stdout is defined
+          - vdsm_version_check.stdout | length > 0
+          - >
+            (vdsm_version_check.stdout.split('.')[0] | int > (min_vdsm_major | int))
+            or
+            ((vdsm_version_check.stdout.split('.')[0] | int == (min_vdsm_major | int))
+             and (vdsm_version_check.stdout.split('.')[1] | int >= (min_vdsm_minor | int)))
+        fail_msg: "VDSM version '{{ vdsm_version_check.stdout | default('UNKNOWN') }}' is too old or missing. Required: >= {{ min_vdsm_major }}.{{ min_vdsm_minor }}"
+        success_msg: "VDSM version OK: {{ vdsm_version_check.stdout }}"
+      tags: validate
+
+    - name: "[VALIDATE] Check for multipath devices"
+      command: multipath -l
+      register: multipath_check
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      tags: validate
+
+    - name: "[VALIDATE] Set environment facts"
+      set_fact:
+        has_multipath_devices: "{{ multipath_check.rc == 0 and multipath_check.stdout_lines | length > 0 }}"
+        is_hosted_engine_host: "{{ ha_version_check.rc == 0 }}"
+      tags: validate
+
+    - name: "[VALIDATE] Display environment summary"
+      debug:
+        msg:
+          - "===================================================="
+          - "Pre-flight Validation: {{ ansible_hostname }}"
+          - "===================================================="
+          - "OS:                   {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel:               {{ ansible_kernel }}"
+          - "Python:               {{ ansible_python_version }}"
+          - "VDSM:                 {{ vdsm_version_check.stdout }}"
+          - "Hosted-Engine HA:     {{ ha_version_check.stdout if ha_version_check.rc == 0 else 'Not Installed' }}"
+          - "Sanlock:              {{ sanlock_version_check.stdout }}"
+          - "Libvirt:              {{ libvirt_version_check.stdout }}"
+          - "Multipath Devices:    {{ 'Detected' if has_multipath_devices else 'Not Found' }}"
+          - "Hosted-Engine Host:   {{ 'Yes' if is_hosted_engine_host else 'No' }}"
+          - "===================================================="
+      tags: validate
+
+    - name: "[VALIDATE] Check critical services"
+      command: systemctl is-active {{ item }}
+      register: service_check
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      loop:
+        - vdsmd
+        - sanlock
+        - libvirtd
+      tags: validate
+
+    - name: "[VALIDATE] Verify critical services are active"
+      assert:
+        that:
+          - item.stdout is defined
+          - item.stdout == 'active'
+        fail_msg: "Service {{ item.item }} is not active (state: {{ item.stdout | default('unknown') }})"
+      loop: "{{ service_check.results }}"
+      tags: validate
+
+
+- name: "OLVM HA Tuning - Apply Configuration"
+  hosts: ovirt_hosts
+  become: yes
+  gather_facts: yes
+  serial: 1                          # Process hosts one at a time for safety
+  any_errors_fatal: true
+  
+  vars:
+    # ===== VDSM Settings =====
+    vdsm_heartbeat_interval: 10
+    vdsm_host_monitor_timeout: 30
+    vdsm_migration_timeout: 180
+    
+    # ===== Sanlock Settings =====
+    sanlock_io_timeout: 50
+    sanlock_watchdog_fire_timeout: 35
+    
+    # ===== Multipath Settings =====
+    multipath_polling_interval: 5
+    
+    # ===== HA Agent Settings =====
+    ha_monitoring_interval: 10
+    ha_connection_timeout: 12
+    ha_score_penalty: 500
+    ha_state_transition_timeout: 35
+    
+    # ===== Libvirt Settings =====
+    libvirt_keepalive_interval: 5
+    libvirt_keepalive_count: 5
+    
+    # ===== Backup =====
+    # backup_stamp lets the control node pass ONE timestamp for all hosts so a
+    # single rollback_date restores every host. Falls back to per-host time.
+    backup_stamp: "{{ ansible_date_time.iso8601_basic_short }}"
+    backup_dir: "/root/olvm-ha-backup-{{ backup_stamp }}"
+    create_backup: true
+
+    # SAFE BY DEFAULT (v4.11): restart_enabled defaults to FALSE, so a direct
+    # `ansible-playbook` run STAGES the config and does NOT restart sanlock /
+    # vdsmd / libvirtd on live hosts. setup.sh asks interactively and passes
+    # restart_enabled=true only if you explicitly opt in. Restarting those
+    # daemons on an active hypervisor is slow and can make the engine see the
+    # host as Non-Responsive; the recommended path is to stage here, then
+    # reboot each host one at a time from the OLVM web UI.
+    restart_enabled: false
+
+    # When false, the VDSM [vars] keys (heartbeat_interval, host_monitor_timeout,
+    # migration_timeout) are NOT written - only the always-valid [sanlock]
+    # io_timeout block is. Set false if you have confirmed those keys are not in
+    # your VDSM schema (see REVIEW 2.1). Default true preserves prior behavior.
+    vdsm_apply_vars_section: false
+    # Per-section apply toggles (v4.21). Discovery on a real OEL 8.10 / VDSM
+    # 4.50 hosted-engine lab showed these host-FILE edits are unverified or
+    # conflict with oVirt-managed values, so they can be turned off per profile:
+    #   * apply_libvirt_keepalive defaults FALSE - oVirt/vdsm deliberately sets
+    #     keepalive_interval=-1 in libvirtd.conf; forcing 5 fights vdsm.
+    #   * apply_sanlock_conf / apply_ha_agent default TRUE for backward compat,
+    #     but the lab profile (vars/lab-akyuz.yml) turns them off because the
+    #     effective surface there is engine-config + multipath.
+    apply_sanlock_conf: true
+    apply_ha_agent: true
+    apply_libvirt_keepalive: false
+
+    # NOTE (v4.21): the Dell ME5 / multipath device-block variables are NOT
+    # defined here anymore - they live in the profile files (vars/*.yml):
+    #   multipath_me5_device_block, multipath_me5_vendor, multipath_me5_product,
+    #   multipath_me5_path_grouping_policy, multipath_me5_path_checker,
+    #   multipath_me5_hardware_handler, multipath_me5_prio, multipath_me5_failback,
+    #   multipath_me5_rr_weight, multipath_me5_path_selector
+    # The tasks below reference them with safe `| default(...)` fallbacks, so the
+    # playbook still runs if a custom vars file omits them.
+
+    # ===== File Paths =====
+    vdsm_dropin_conf: /etc/vdsm/vdsm.conf.d/99-ha-tuning.conf
+    sanlock_legacy_conf: /etc/sanlock/sanlock.conf
+    multipath_dropin_conf: /etc/multipath/conf.d/99-ha-tuning.conf
+    ha_agent_conf: /etc/ovirt-hosted-engine-ha/agent.conf
+    ha_broker_conf: /etc/ovirt-hosted-engine-ha/broker.conf
+    libvirt_conf: /etc/libvirt/libvirtd.conf
+    
+  tasks:
+    # =============================================================
+    # SECTION 1: PRE-FLIGHT FILE EXISTENCE CHECKS
+    # =============================================================
+    - name: "[CHECK] Stat all configuration files"
+      stat:
+        path: "{{ item }}"
+      register: file_stats
+      loop:
+        - "{{ vdsm_dropin_conf }}"
+        - /etc/vdsm/vdsm.conf
+        - "{{ sanlock_legacy_conf }}"
+        - "{{ ha_agent_conf }}"
+        - "{{ ha_broker_conf }}"
+        - "{{ libvirt_conf }}"
+        - "{{ multipath_dropin_conf }}"
+      check_mode: no
+      tags: 
+        - backup
+        - always
+
+    - name: "[CHECK] Set file existence facts"
+      set_fact:
+        vdsm_dropin_exists: "{{ file_stats.results[0].stat.exists }}"
+        vdsm_conf_exists: "{{ file_stats.results[1].stat.exists }}"
+        sanlock_conf_exists: "{{ file_stats.results[2].stat.exists }}"
+        ha_agent_exists: "{{ file_stats.results[3].stat.exists }}"
+        ha_broker_exists: "{{ file_stats.results[4].stat.exists }}"
+        libvirt_conf_exists: "{{ file_stats.results[5].stat.exists }}"
+        multipath_dropin_exists: "{{ file_stats.results[6].stat.exists }}"
+      tags:
+        - backup
+        - always
+
+    # =============================================================
+    # SECTION 1.5: DESIRED CONTENT + DRIFT DETECTION (read-only)
+    #   Reads current state, compares to desired, and sets
+    #   `any_change_needed`. Backups (Section 2) run ONLY when a real change
+    #   is pending, so a converged re-run is a true no-op (changed=0) and the
+    #   report says "all settings already current".
+    # =============================================================
+    - name: "[CHECK] Is multipathd active?"
+      command: systemctl is-active multipathd
+      register: multipathd_active
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      tags:
+        - always
+        - multipath
+
+    - name: "[CHECK] Calculate no_path_retry value"
+      set_fact:
+        calculated_no_path_retry: "{{ ((sanlock_io_timeout | int) * 8 / (multipath_polling_interval | int)) | int }}"
+      tags:
+        - always
+        - multipath
+
+    - name: "[CHECK] Build desired VDSM drop-in content"
+      set_fact:
+        vdsm_dropin_content: |
+          # OLVM HA Tuning - VDSM Configuration
+          # Managed by Ansible (olvm-ha-tuning) - DO NOT EDIT MANUALLY.
+          # This file is regenerated by the playbook on every apply; any manual
+          # change is overwritten. (No run timestamp is embedded on purpose, so
+          # an unchanged re-apply is a true no-op and does NOT restart vdsmd.)
+          # Only valid VDSM [vars] keys belong here; sanlock io_timeout is NOT
+          # configured here (sanlock does not read vdsm.conf.d) - it is handled
+          # in /etc/sanlock/sanlock.conf by the sanlock section instead.
+          #
+          # Estimated failover (heuristic upper bound):
+          #   ~{{ ((sanlock_io_timeout | int) * 3 // 2 + (ha_monitoring_interval | int) * 3 + 25) | int }}s
+          [vars]
+          heartbeat_interval = {{ vdsm_heartbeat_interval }}
+          host_monitor_timeout = {{ vdsm_host_monitor_timeout }}
+          migration_timeout = {{ vdsm_migration_timeout }}
+      tags:
+        - always
+
+    - name: "[CHECK] Build desired multipath drop-in content"
+      set_fact:
+        multipath_dropin_content: |
+          # OLVM HA Tuning - Multipath Configuration
+          # Managed by Ansible (olvm-ha-tuning) - DO NOT EDIT MANUALLY.
+          # Regenerated on every apply; no run timestamp is embedded so an
+          # unchanged re-apply is a true no-op and does NOT reconfigure multipathd.
+          #
+          # Synchronization with Sanlock:
+          #   sanlock_io_timeout = {{ sanlock_io_timeout }}s
+          #   polling_interval   = {{ multipath_polling_interval }}s
+          #   no_path_retry      = (io_timeout * 8) / polling_interval = {{ calculated_no_path_retry }}
+          #
+          # Reference: multipath.conf(5)
+          # - polling_interval MUST be in 'defaults' section
+          # - no_path_retry can be in 'overrides' (global) or a 'devices' stanza
+          {% if (multipath_me5_device_block | default(false)) | bool %}
+          # ============================================================
+          # Dell EMC ME5 device stanza ({{ multipath_me5_vendor | default('DellEMC') }}/{{ multipath_me5_product | default('ME5') }}) - ALUA
+          # ------------------------------------------------------------
+          # Compatibility with the Dell PowerVault ME5 Series Administrator's
+          # Guide (2024) > "Best practices > Multipath configuration":
+          #   * The ALUA / path attributes below MATCH Dell's recommended
+          #     device {} example (page 126) and Table 27 (required: prio,
+          #     failback, vendor, product).
+          #   * The 3 timeout lines (no_path_retry / fast_io_fail_tmo /
+          #     dev_loss_tmo) are NOT from Dell. Dell says "retain the default
+          #     settings for the remaining attributes". They are intentional
+          #     oVirt HA overrides - see the per-line notes.
+          # Confirm on THIS host (values can differ by multipath-tools version):
+          #   multipath -v3               # exact vendor/product strings
+          #   multipath -t                # effective/merged config + defaults
+          #   multipath -v3 | grep alua   # confirm ALUA is actually used
+          # ============================================================
+
+          defaults {
+              # polling_interval: seconds between path health checks.
+              #   this/oVirt base: {{ multipath_polling_interval }}  | multipath default: 5
+              polling_interval     {{ multipath_polling_interval }}
+              # max_polling_interval: upper bound once the interval backs off.
+              #   this: {{ multipath_polling_interval | int * 4 }} (= 4 x polling)  | multipath default: 4 x polling
+              max_polling_interval {{ multipath_polling_interval | int * 4 }}
+          }
+
+          devices {
+              device {
+                  # vendor / product: which array this device{} matches (regex).
+                  #   Dell doc: vendor "DellEMC " (note trailing space, 8-char SCSI
+                  #   T10 id) and product "ME5". "DellEMC" w/o space still matches
+                  #   as a regex. Verify exact strings with: multipath -v3
+                  vendor               "{{ multipath_me5_vendor | default('DellEMC') }}"
+                  product              "{{ multipath_me5_product | default('ME5') }}"
+
+                  # path_grouping_policy: how paths are grouped into prio groups.
+                  #   should be (ALUA): group_by_prio   | multipath default: failover
+                  #   NOTE: not in Dell's minimal example, but it is the correct
+                  #   grouping when prio=alua (harmless to state explicitly).
+                  path_grouping_policy "{{ multipath_me5_path_grouping_policy | default('group_by_prio') }}"
+
+                  # path_checker: how a path is tested for liveness.
+                  #   Dell ME5: tur (TEST UNIT READY)   | RHEL8 default: tur
+                  path_checker         "{{ multipath_me5_path_checker | default('tur') }}"
+
+                  # hardware_handler: kernel handler for path state changes.
+                  #   Dell ME5: "1 alua"   | multipath default: "0" (none)
+                  #   (modern kernels also auto-attach alua via scsi_dh)
+                  hardware_handler     "{{ multipath_me5_hardware_handler | default('1 alua') }}"
+
+                  # prio: how path priority is computed (picks the optimal path).
+                  #   Dell ME5 REQUIRED: alua   | multipath default: const (equal -
+                  #   WRONG for an ALUA array; would not prefer optimal paths)
+                  prio                 "{{ multipath_me5_prio | default('alua') }}"
+
+                  # failback: when to return to a restored higher-prio path.
+                  #   Dell ME5 REQUIRED: immediate   | multipath default: manual
+                  failback             "{{ multipath_me5_failback | default('immediate') }}"
+
+                  # rr_weight: I/O weighting across paths within a group.
+                  #   Dell ME5: uniform   | multipath default: uniform (same)
+                  rr_weight            "{{ multipath_me5_rr_weight | default('uniform') }}"
+
+                  # path_selector: algorithm to pick the next path in a group.
+                  #   Dell ME5: "service-time 0"   | RHEL8 default: "service-time 0"
+                  path_selector        "{{ multipath_me5_path_selector | default('service-time 0') }}"
+
+                  # ---- below: oVirt HA overrides, NOT Dell ME5 settings ----
+                  # Dell: "retain the default settings for the remaining attributes".
+
+                  # no_path_retry: number of polling_interval cycles to QUEUE I/O
+                  #   after the LAST path fails, before failing I/O.
+                  #   this: {{ calculated_no_path_retry }} (= sanlock_io_timeout*8 / polling_interval ->
+                  #     queues ~{{ calculated_no_path_retry }} x {{ multipath_polling_interval }}s before failing)
+                  #   Dell ME5: not set (keep default) | multipath default: fail
+                  #     (no queue) | oVirt base multipath.conf: usually 4
+                  #   TRADE-OFF: high = rides out path blips but PAUSES VMs on real
+                  #   storage loss; low (e.g. 4) = fails fast so HA restarts the VM.
+                  no_path_retry        {{ calculated_no_path_retry }}
+
+                  # fast_io_fail_tmo: seconds before failing I/O on a path once a
+                  #   transport problem is detected.
+                  #   this: 5   | Dell ME5: not set | multipath default: 5 (same)
+                  fast_io_fail_tmo     5
+
+                  # dev_loss_tmo: seconds before the SCSI device is removed after
+                  #   its transport is lost. "infinity" = never remove it.
+                  #   this: infinity (keep device so it recovers without a rescan)
+                  #   Dell ME5: not set | multipath default: 600 (10 min)
+                  #   NOTE: high no_path_retry + infinity can queue I/O a long time;
+                  #   tune no_path_retry to your HA goal (fast failover vs ride-through).
+                  dev_loss_tmo         infinity
+              }
+          }
+          {% else %}
+          #
+          # Scope: GLOBAL overrides (applies to ALL devices). For a mixed array
+          # environment consider multipath_me5_device_block=true instead.
+
+          defaults {
+              polling_interval     {{ multipath_polling_interval }}
+              max_polling_interval {{ multipath_polling_interval | int * 4 }}
+          }
+
+          overrides {
+              no_path_retry        {{ calculated_no_path_retry }}
+              fast_io_fail_tmo     5
+              dev_loss_tmo         infinity
+          }
+          {% endif %}
+      tags:
+        - always
+
+    - name: "[DRIFT] Pre-flight VDSM drop-in (read-only)"
+      copy:
+        dest: "{{ vdsm_dropin_conf }}"
+        content: "{{ vdsm_dropin_content }}"
+        mode: '0644'
+        owner: root
+        group: root
+      check_mode: yes
+      register: pf_vdsm
+      when: vdsm_apply_vars_section | bool
+      tags:
+        - always
+
+    - name: "[DRIFT] Stat managed VDSM drop-in (for removal when disabled)"
+      stat:
+        path: "{{ vdsm_dropin_conf }}"
+      register: vdsm_dropin_stat
+      tags:
+        - always
+
+    - name: "[DRIFT] Pre-flight multipath drop-in (read-only)"
+      copy:
+        dest: "{{ multipath_dropin_conf }}"
+        content: "{{ multipath_dropin_content }}"
+        mode: '0644'
+        owner: root
+        group: root
+      check_mode: yes
+      register: pf_multipath
+      when: multipathd_active.stdout == 'active'
+      tags:
+        - always
+
+    - name: "[DRIFT] Read current key files (sanlock / ha-agent / ha-broker / libvirt)"
+      slurp:
+        src: "{{ item }}"
+      register: pf_slurp
+      failed_when: false
+      check_mode: no
+      loop:
+        - "{{ sanlock_legacy_conf }}"
+        - "{{ ha_agent_conf }}"
+        - "{{ ha_broker_conf }}"
+        - "{{ libvirt_conf }}"
+      loop_control:
+        label: "{{ item }}"
+      tags:
+        - always
+
+    - name: "[DRIFT] Decode current key-file contents"
+      set_fact:
+        _cur_sanlock: "{{ (pf_slurp.results[0].content | default('') | b64decode) if (pf_slurp.results[0].content is defined) else '' }}"
+        _cur_haagent: "{{ (pf_slurp.results[1].content | default('') | b64decode) if (pf_slurp.results[1].content is defined) else '' }}"
+        _cur_habroker: "{{ (pf_slurp.results[2].content | default('') | b64decode) if (pf_slurp.results[2].content is defined) else '' }}"
+        _cur_libvirt: "{{ (pf_slurp.results[3].content | default('') | b64decode) if (pf_slurp.results[3].content is defined) else '' }}"
+      tags:
+        - always
+
+    - name: "[DRIFT] Compute desired key lines"
+      set_fact:
+        _desired_sanlock_lines:
+          - "io_timeout = {{ sanlock_io_timeout }}"
+          - "watchdog_fire_timeout = {{ sanlock_watchdog_fire_timeout }}"
+        _desired_haagent_lines:
+          - "monitoring_interval = {{ ha_monitoring_interval }}"
+          - "connection_timeout = {{ ha_connection_timeout }}"
+          - "score_penalty = {{ ha_score_penalty }}"
+          - "state_transition_timeout = {{ ha_state_transition_timeout }}"
+        _desired_habroker_lines:
+          - "interval = {{ ha_monitoring_interval }}"
+        _desired_libvirt_lines:
+          - "keepalive_interval = {{ libvirt_keepalive_interval }}"
+          - "keepalive_count = {{ libvirt_keepalive_count }}"
+      tags:
+        - always
+
+    - name: "[DRIFT] Determine per-area drift (a desired line not present verbatim => drift)"
+      set_fact:
+        _vdsm_remove_needed: "{{ (not (vdsm_apply_vars_section | bool)) and (vdsm_dropin_stat.stat.exists | default(false)) }}"
+        _sanlock_drift: "{{ (apply_sanlock_conf | bool) and sanlock_conf_exists and (_desired_sanlock_lines | reject('in', _cur_sanlock.split('\n')) | list | length > 0) }}"
+        _haagent_drift: "{{ (apply_ha_agent | bool) and ha_agent_exists and (_desired_haagent_lines | reject('in', _cur_haagent.split('\n')) | list | length > 0) }}"
+        _habroker_drift: "{{ (apply_ha_agent | bool) and ha_broker_exists and (_desired_habroker_lines | reject('in', _cur_habroker.split('\n')) | list | length > 0) }}"
+        _libvirt_drift: "{{ (apply_libvirt_keepalive | bool) and libvirt_conf_exists and (_desired_libvirt_lines | reject('in', _cur_libvirt.split('\n')) | list | length > 0) }}"
+      tags:
+        - always
+
+    - name: "[DRIFT] Set any_change_needed"
+      set_fact:
+        any_change_needed: "{{ (pf_vdsm.changed | default(false)) or (_vdsm_remove_needed | bool) or (pf_multipath.changed | default(false)) or (_sanlock_drift | bool) or (_haagent_drift | bool) or (_habroker_drift | bool) or (_libvirt_drift | bool) }}"
+      tags:
+        - always
+
+    - name: "[DRIFT] Report when nothing needs changing"
+      debug:
+        msg:
+          - "All managed settings on {{ ansible_hostname }} are already current."
+          - "No configuration change is needed; skipping backup and writes."
+      when: not (any_change_needed | bool)
+      tags:
+        - always
+
+    # =============================================================
+    # SECTION 2: BACKUP
+    # =============================================================
+    - name: "[BACKUP] Create backup directory"
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+      when:
+        - create_backup
+        - any_change_needed | bool
+      tags: backup
+
+    - name: "[BACKUP] Backup VDSM drop-in"
+      copy:
+        src: "{{ vdsm_dropin_conf }}"
+        dest: "{{ backup_dir }}/99-ha-tuning.conf.backup"
+        remote_src: yes
+        mode: '0600'
+      when: 
+        - create_backup
+        - any_change_needed | bool
+        - vdsm_dropin_exists
+        - not ansible_check_mode
+      tags: backup
+
+    - name: "[BACKUP] Backup VDSM main config"
+      copy:
+        src: /etc/vdsm/vdsm.conf
+        dest: "{{ backup_dir }}/vdsm.conf.backup"
+        remote_src: yes
+        mode: '0600'
+      when: 
+        - create_backup
+        - any_change_needed | bool
+        - vdsm_conf_exists
+        - not ansible_check_mode
+      tags: backup
+
+    - name: "[BACKUP] Backup sanlock config"
+      copy:
+        src: "{{ sanlock_legacy_conf }}"
+        dest: "{{ backup_dir }}/sanlock.conf.backup"
+        remote_src: yes
+        mode: '0600'
+      when: 
+        - create_backup
+        - any_change_needed | bool
+        - sanlock_conf_exists
+        - not ansible_check_mode
+      tags: backup
+
+    - name: "[BACKUP] Backup HA agent config"
+      copy:
+        src: "{{ ha_agent_conf }}"
+        dest: "{{ backup_dir }}/agent.conf.backup"
+        remote_src: yes
+        mode: '0600'
+      when: 
+        - create_backup
+        - any_change_needed | bool
+        - ha_agent_exists
+        - not ansible_check_mode
+      tags: backup
+
+    - name: "[BACKUP] Backup HA broker config"
+      copy:
+        src: "{{ ha_broker_conf }}"
+        dest: "{{ backup_dir }}/broker.conf.backup"
+        remote_src: yes
+        mode: '0600'
+      when: 
+        - create_backup
+        - any_change_needed | bool
+        - ha_broker_exists
+        - not ansible_check_mode
+      tags: backup
+
+    - name: "[BACKUP] Backup libvirt config"
+      copy:
+        src: "{{ libvirt_conf }}"
+        dest: "{{ backup_dir }}/libvirtd.conf.backup"
+        remote_src: yes
+        mode: '0600'
+      when: 
+        - create_backup
+        - any_change_needed | bool
+        - libvirt_conf_exists
+        - not ansible_check_mode
+      tags: backup
+
+    - name: "[BACKUP] Backup multipath drop-in"
+      copy:
+        src: "{{ multipath_dropin_conf }}"
+        dest: "{{ backup_dir }}/multipath-99-ha-tuning.conf.backup"
+        remote_src: yes
+        mode: '0600'
+      when: 
+        - create_backup
+        - any_change_needed | bool
+        - multipath_dropin_exists
+        - not ansible_check_mode
+      tags: backup
+
+    - name: "[BACKUP] Save backup metadata"
+      copy:
+        dest: "{{ backup_dir }}/BACKUP_INFO.txt"
+        content: |
+          OLVM HA Tuning - Backup Information
+          ====================================
+          Date:                    {{ ansible_date_time.iso8601 }}
+          Host:                    {{ ansible_hostname }}
+          OS:                      {{ ansible_distribution }} {{ ansible_distribution_version }}
+          
+          Files Backed Up:
+            VDSM drop-in:    {{ 'Yes' if vdsm_dropin_exists else 'No (did not exist)' }}
+            VDSM main:       {{ 'Yes' if vdsm_conf_exists else 'No' }}
+            Sanlock:         {{ 'Yes' if sanlock_conf_exists else 'No' }}
+            HA Agent:        {{ 'Yes' if ha_agent_exists else 'No' }}
+            HA Broker:       {{ 'Yes' if ha_broker_exists else 'No' }}
+            Libvirt:         {{ 'Yes' if libvirt_conf_exists else 'No' }}
+            Multipath:       {{ 'Yes' if multipath_dropin_exists else 'No (did not exist)' }}
+          
+          Settings Applied:
+            VDSM heartbeat_interval: {{ vdsm_heartbeat_interval }}s
+            Sanlock io_timeout:      {{ sanlock_io_timeout }}s
+            HA monitoring_interval:  {{ ha_monitoring_interval }}s
+            Multipath polling:       {{ multipath_polling_interval }}s
+          
+          To rollback:
+            ansible-playbook olvm-ha-rollback.yml -e "rollback_date={{ backup_stamp }}"
+        mode: '0600'
+      when: 
+        - create_backup
+        - any_change_needed | bool
+        - not ansible_check_mode
+      tags: backup
+
+    # =============================================================
+    # SECTION 3: VDSM CONFIGURATION
+    # =============================================================
+    - name: "[VDSM] Ensure config directory exists"
+      file:
+        path: /etc/vdsm/vdsm.conf.d
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+      tags: vdsm
+
+    - name: "[VDSM] Deploy VDSM drop-in configuration"
+      copy:
+        dest: "{{ vdsm_dropin_conf }}"
+        content: "{{ vdsm_dropin_content }}"
+        mode: '0644'
+        owner: root
+        group: root
+        # Defense-in-depth: parse the staged temp file as INI BEFORE installing
+        # it. If it is not valid (e.g. no section header), copy fails and the
+        # broken file is never placed where vdsmd would read it.
+        validate: "python3 -c 'import configparser,sys; configparser.ConfigParser(strict=False).read(sys.argv[1])' %s"
+      when: vdsm_apply_vars_section | bool
+      register: vdsm_dropin_result
+      notify:
+        - validate vdsm config
+        - warn if vdsm drop-in failed validation
+        - restart vdsmd
+      tags: vdsm
+
+    - name: "[VDSM] Remove managed drop-in when [vars] section is disabled"
+      # When vdsm_apply_vars_section is false we must NOT leave a managed
+      # drop-in behind (it would carry no valid keys and, if a previous run
+      # wrote a bad one, would keep vdsmd from starting). Remove it so the host
+      # falls back to the stock VDSM configuration.
+      file:
+        path: "{{ vdsm_dropin_conf }}"
+        state: absent
+      when: not (vdsm_apply_vars_section | bool)
+      register: vdsm_dropin_removed
+      notify:
+        - restart vdsmd
+      tags: vdsm
+
+    # =============================================================
+    # SECTION 4: SANLOCK LEGACY CONFIGURATION
+    # =============================================================
+    - name: "[SANLOCK] Configure io_timeout in legacy config"
+      lineinfile:
+        path: "{{ sanlock_legacy_conf }}"
+        regexp: '^\s*#?\s*io_timeout\s*='
+        line: "io_timeout = {{ sanlock_io_timeout }}"
+        state: present
+        create: yes
+        mode: '0644'
+        owner: root
+        group: root
+      when:
+        - apply_sanlock_conf | bool
+        - sanlock_conf_exists
+      notify: restart sanlock
+      register: sanlock_io_result
+      tags: sanlock
+
+    - name: "[SANLOCK] Configure watchdog_fire_timeout in legacy config"
+      lineinfile:
+        path: "{{ sanlock_legacy_conf }}"
+        regexp: '^\s*#?\s*watchdog_fire_timeout\s*='
+        line: "watchdog_fire_timeout = {{ sanlock_watchdog_fire_timeout }}"
+        state: present
+        create: yes
+        mode: '0644'
+        owner: root
+        group: root
+      when:
+        - apply_sanlock_conf | bool
+        - sanlock_conf_exists
+      notify: restart sanlock
+      register: sanlock_wd_result
+      tags: sanlock
+
+    # =============================================================
+    # SECTION 5: MULTIPATH CONFIGURATION
+    # =============================================================
+    - name: "[MULTIPATH] Ensure config directory exists"
+      file:
+        path: /etc/multipath/conf.d
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+      when: multipathd_active.stdout == 'active'
+      tags: multipath
+
+    - name: "[MULTIPATH] Deploy multipath HA tuning configuration"
+      copy:
+        dest: "{{ multipath_dropin_conf }}"
+        content: "{{ multipath_dropin_content }}"
+        mode: '0644'
+        owner: root
+        group: root
+      when: multipathd_active.stdout == 'active'
+      register: multipath_dropin_result
+      notify: 
+        - validate multipath config
+        - warn if multipath config failed validation
+        - reload multipathd
+      tags: multipath
+
+    # =============================================================
+    # SECTION 6: HA AGENT CONFIGURATION
+    # =============================================================
+    - name: "[HA-AGENT] Configure monitoring_interval"
+      lineinfile:
+        path: "{{ ha_agent_conf }}"
+        regexp: '^\s*#?\s*monitoring_interval\s*='
+        line: "monitoring_interval = {{ ha_monitoring_interval }}"
+        state: present
+        mode: '0644'
+        owner: root
+        group: root
+        insertafter: '^\[agent\]$'
+      when:
+        - apply_ha_agent | bool
+        - ha_agent_exists
+      notify: restart ovirt-ha-agent
+      register: ha_mon_result
+      tags: ha_agent
+
+    - name: "[HA-AGENT] Configure connection_timeout"
+      lineinfile:
+        path: "{{ ha_agent_conf }}"
+        regexp: '^\s*#?\s*connection_timeout\s*='
+        line: "connection_timeout = {{ ha_connection_timeout }}"
+        state: present
+        mode: '0644'
+        owner: root
+        group: root
+        insertafter: '^\[agent\]$'
+      when:
+        - apply_ha_agent | bool
+        - ha_agent_exists
+      notify: restart ovirt-ha-agent
+      register: ha_conn_result
+      tags: ha_agent
+
+    - name: "[HA-AGENT] Configure score_penalty"
+      lineinfile:
+        path: "{{ ha_agent_conf }}"
+        regexp: '^\s*#?\s*score_penalty\s*='
+        line: "score_penalty = {{ ha_score_penalty }}"
+        state: present
+        mode: '0644'
+        owner: root
+        group: root
+        insertafter: '^\[agent\]$'
+      when:
+        - apply_ha_agent | bool
+        - ha_agent_exists
+      notify: restart ovirt-ha-agent
+      register: ha_score_result
+      tags: ha_agent
+
+    - name: "[HA-AGENT] Configure state_transition_timeout"
+      lineinfile:
+        path: "{{ ha_agent_conf }}"
+        regexp: '^\s*#?\s*state_transition_timeout\s*='
+        line: "state_transition_timeout = {{ ha_state_transition_timeout }}"
+        state: present
+        mode: '0644'
+        owner: root
+        group: root
+        insertafter: '^\[agent\]$'
+      when:
+        - apply_ha_agent | bool
+        - ha_agent_exists
+      notify: restart ovirt-ha-agent
+      register: ha_state_result
+      tags: ha_agent
+
+    # =============================================================
+    # SECTION 7: HA BROKER CONFIGURATION (Optional - 4.5.5 may not have this)
+    # =============================================================
+    - name: "[HA-BROKER] Configure broker interval"
+      lineinfile:
+        path: "{{ ha_broker_conf }}"
+        regexp: '^\s*#?\s*interval\s*='
+        line: "interval = {{ ha_monitoring_interval }}"
+        state: present
+        mode: '0644'
+        owner: root
+        group: root
+        insertafter: '^\[broker\]$'
+      when: ha_broker_exists
+      notify: restart ovirt-ha-broker
+      tags: ha_agent
+
+    - name: "[HA-BROKER] Inform about broker.conf absence (4.5.5 normal)"
+      debug:
+        msg: "HA broker.conf not present - this is normal for OLVM 4.5.5 (broker uses agent.conf settings)"
+      when: not ha_broker_exists
+      tags: ha_agent
+
+    # =============================================================
+    # SECTION 8: LIBVIRT CONFIGURATION
+    # =============================================================
+    - name: "[LIBVIRT] Configure keepalive_interval"
+      lineinfile:
+        path: "{{ libvirt_conf }}"
+        regexp: '^\s*#?\s*keepalive_interval\s*='
+        line: "keepalive_interval = {{ libvirt_keepalive_interval }}"
+        state: present
+        mode: '0644'
+        owner: root
+        group: root
+      when: apply_libvirt_keepalive | bool
+      notify: restart libvirtd
+      register: libvirt_int_result
+      tags: libvirt
+
+    - name: "[LIBVIRT] Configure keepalive_count"
+      lineinfile:
+        path: "{{ libvirt_conf }}"
+        regexp: '^\s*#?\s*keepalive_count\s*='
+        line: "keepalive_count = {{ libvirt_keepalive_count }}"
+        state: present
+        mode: '0644'
+        owner: root
+        group: root
+      when: apply_libvirt_keepalive | bool
+      notify: restart libvirtd
+      register: libvirt_cnt_result
+      tags: libvirt
+
+    # =============================================================
+    # SECTION 9: ENABLE SERVICES
+    # =============================================================
+    - name: "[SERVICES] Ensure core services are enabled"
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+      loop:
+        - vdsmd
+        - sanlock
+        - libvirtd
+      tags: services
+
+    - name: "[SERVICES] Ensure multipathd enabled (if present)"
+      systemd:
+        name: multipathd
+        enabled: yes
+      when: multipathd_active.stdout == 'active'
+      tags: services
+
+    - name: "[SERVICES] Ensure HA services enabled (hosted-engine only)"
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+      loop:
+        - ovirt-ha-agent
+        - ovirt-ha-broker
+      when: ha_agent_exists
+      tags: services
+
+    # =============================================================
+    # SECTION 10: REPORTING
+    # =============================================================
+    - name: "[REPORT] Calculate estimated failover time (integer-safe math)"
+      set_fact:
+        estimated_failover: "{{ ((sanlock_io_timeout | int) * 3 // 2 + (ha_monitoring_interval | int) * 3 + 25) | int }}"
+      tags: always
+
+    - name: "[REPORT] Display configuration summary"
+      debug:
+        msg:
+          - "===================================================="
+          - "OLVM HA Tuning Applied: {{ ansible_hostname }} (v4.22)"
+          - "===================================================="
+          - "VDSM:"
+          - "  heartbeat_interval:    {{ vdsm_heartbeat_interval }}s"
+          - "  host_monitor_timeout:  {{ vdsm_host_monitor_timeout }}s"
+          - "  migration_timeout:     {{ vdsm_migration_timeout }}s"
+          - "Sanlock:"
+          - "  io_timeout:            {{ sanlock_io_timeout }}s"
+          - "  watchdog_fire_timeout: {{ sanlock_watchdog_fire_timeout }}s"
+          - "Multipath ({{ 'configured' if multipathd_active.stdout == 'active' else 'skipped' }}):"
+          - "  polling_interval:      {{ multipath_polling_interval }}s (defaults)"
+          - "  no_path_retry:         {{ calculated_no_path_retry }} (overrides)"
+          - "HA Agent ({{ 'configured' if ha_agent_exists else 'skipped' }}):"
+          - "  monitoring_interval:   {{ ha_monitoring_interval }}s"
+          - "  connection_timeout:    {{ ha_connection_timeout }}s"
+          - "HA Broker:               {{ 'configured' if ha_broker_exists else 'N/A (4.5.5 normal)' }}"
+          - "Libvirt:"
+          - "  keepalive_interval:    {{ libvirt_keepalive_interval }}s"
+          - "  keepalive_count:       {{ libvirt_keepalive_count }}"
+          - "----------------------------------------------------"
+          - "Estimated Failover:      ~{{ estimated_failover }}s"
+          - "Backup Location:         {{ backup_dir }}"
+          - "===================================================="
+      tags: always
+
+    # =============================================================
+    # SECTION 11: FORCE HANDLERS AND VERIFY SERVICES
+    # =============================================================
+    - name: "[VERIFY] WARNING - service restart is slow and disruptive"
+      debug:
+        msg:
+          - "restart_enabled=true : sanlock / vdsmd / libvirtd will now be"
+          - "restarted on this host. On an ACTIVE hypervisor this can take"
+          - "SEVERAL MINUTES and may briefly disrupt storage leases, the SPM"
+          - "role and the engine's view of the host (worst case: the host is"
+          - "marked Non-Responsive and fenced)."
+          - ""
+          - "SAFER ALTERNATIVE for production (recommended):"
+          - "  Re-run with restart_enabled=false  (setup.sh --no-restart)"
+          - "  to only STAGE the config files, then apply them host-by-host"
+          - "  from the OLVM web UI, one host at a time:"
+          - "    Compute > Hosts > <host> > Management > Maintenance   (drains VMs)"
+          - "    Compute > Hosts > <host> > Management > Restart / reboot the host"
+          - "    Compute > Hosts > <host> > Management > Activate"
+          - "  This drains running VMs first, so nothing is interrupted."
+      when: restart_enabled | bool
+      tags: verify
+
+    - name: "[VERIFY] Flush handlers to ensure all restarts happen now"
+      meta: flush_handlers
+
+    - name: "[VERIFY] Config staged - how to apply it safely (no restart done)"
+      debug:
+        msg:
+          - "restart_enabled=false : configuration files were WRITTEN but no"
+          - "service was restarted, so the new values are NOT active yet."
+          - ""
+          - "Recommended way to activate them - per host, one at a time,"
+          - "from the OLVM web UI (drains VMs first, zero interruption):"
+          - "    Compute > Hosts > {{ ansible_hostname }} > Management > Maintenance"
+          - "    Compute > Hosts > {{ ansible_hostname }} > Management > Restart (reboot)"
+          - "    Compute > Hosts > {{ ansible_hostname }} > Management > Activate"
+          - ""
+          - "CLI equivalent on the engine, if you prefer:"
+          - "    hosted-engine --set-maintenance --mode=local   # on the host (HE only)"
+          - "  or move the host to maintenance, then on the host (out of the pool):"
+          - "    systemctl restart sanlock vdsmd libvirtd"
+      when: not (restart_enabled | bool)
+      tags: verify
+
+    - name: "[VERIFY] Wait for services to settle after restart"
+      pause:
+        seconds: 5
+      when: restart_enabled | bool
+
+    - name: "[VERIFY] Check all services are active after restart"
+      command: systemctl is-active {{ item }}
+      register: post_restart_status
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      loop:
+        - vdsmd
+        - sanlock
+        - libvirtd
+      tags: verify
+
+    - name: "[VERIFY] Display post-restart service status"
+      debug:
+        msg:
+          - "===================================================="
+          - "Post-Restart Service Status: {{ ansible_hostname }}"
+          - "===================================================="
+          - "vdsmd:    {{ post_restart_status.results[0].stdout | default('unknown') }}"
+          - "sanlock:  {{ post_restart_status.results[1].stdout | default('unknown') }}"
+          - "libvirtd: {{ post_restart_status.results[2].stdout | default('unknown') }}"
+          - "===================================================="
+      tags: verify
+
+    - name: "[VERIFY] Assert all critical services are active"
+      assert:
+        that:
+          - item.stdout == 'active'
+        fail_msg: "Service {{ item.item }} is NOT active after restart! State: {{ item.stdout }}"
+        success_msg: "Service {{ item.item }}: active ✓"
+      loop: "{{ post_restart_status.results }}"
+      tags: verify
+
+    # =============================================================
+    # SECTION 12: RUN-RESULT FACT (consumed by the report play)
+    # =============================================================
+    - name: "[REPORT] Build per-host run-result fact"
+      set_fact:
+        ha_run_result:
+          hostname: "{{ ansible_hostname }}"
+          restart_enabled: "{{ restart_enabled | bool }}"
+          backup_dir: "{{ backup_dir }}"
+          backup_created: "{{ (create_backup | bool) and (any_change_needed | bool) }}"
+          estimated_failover: "{{ estimated_failover }}"
+          settings:
+            vdsm_heartbeat_interval: "{{ vdsm_heartbeat_interval }}"
+            vdsm_host_monitor_timeout: "{{ vdsm_host_monitor_timeout }}"
+            vdsm_migration_timeout: "{{ vdsm_migration_timeout }}"
+            sanlock_io_timeout: "{{ sanlock_io_timeout }}"
+            sanlock_watchdog_fire_timeout: "{{ sanlock_watchdog_fire_timeout }}"
+            multipath_polling_interval: "{{ multipath_polling_interval }}"
+            no_path_retry: "{{ calculated_no_path_retry }}"
+            ha_monitoring_interval: "{{ ha_monitoring_interval }}"
+            ha_connection_timeout: "{{ ha_connection_timeout }}"
+            ha_score_penalty: "{{ ha_score_penalty }}"
+            ha_state_transition_timeout: "{{ ha_state_transition_timeout }}"
+            libvirt_keepalive_interval: "{{ libvirt_keepalive_interval }}"
+            libvirt_keepalive_count: "{{ libvirt_keepalive_count }}"
+          changes:
+            vdsm_dropin: "{{ 'changed' if (vdsm_dropin_result.changed | default(false)) else 'ok' }}"
+            sanlock_keys: >-
+              {{ 'changed'
+                 if ((sanlock_io_result.changed | default(false)) or (sanlock_wd_result.changed | default(false)))
+                 else ('ok' if sanlock_conf_exists else 'skipped (no sanlock.conf)') }}
+            multipath_dropin: >-
+              {{ ('changed' if (multipath_dropin_result.changed | default(false)) else 'ok')
+                 if (multipathd_active.stdout == 'active') else 'skipped (multipathd inactive)' }}
+            ha_agent_keys: >-
+              {{ ('changed'
+                  if ((ha_mon_result.changed | default(false)) or (ha_conn_result.changed | default(false))
+                      or (ha_score_result.changed | default(false)) or (ha_state_result.changed | default(false)))
+                  else 'ok')
+                 if ha_agent_exists else 'skipped (not a HE host)' }}
+            libvirt_keys: "{{ 'changed' if ((libvirt_int_result.changed | default(false)) or (libvirt_cnt_result.changed | default(false))) else 'ok' }}"
+          services:
+            vdsmd: "{{ post_restart_status.results[0].stdout | default('unknown') }}"
+            sanlock: "{{ post_restart_status.results[1].stdout | default('unknown') }}"
+            libvirtd: "{{ post_restart_status.results[2].stdout | default('unknown') }}"
+      tags:
+        - report
+        - always
+
+  handlers:
+    # NOTE: validation handlers are NON-FATAL by design. They must never abort
+    # a restart-enabled run after the config has already been written (that would
+    # leave a host half-applied). They validate and WARN instead.
+    #
+    # VDSM is validated by parsing the drop-in as INI with Python (version
+    # independent). `vdsm-tool validate-config` is NOT used: it does not exist on
+    # every VDSM build (e.g. OEL 8 / VDSM 4.50.x returns the usage text, rc=1),
+    # which previously aborted the play.
+    - name: validate vdsm config
+      command: >-
+        python3 -c "import configparser,sys; c=configparser.ConfigParser(strict=False); c.read(sys.argv[1])" {{ vdsm_dropin_conf }}
+      register: vdsm_validate_result
+      changed_when: false
+      failed_when: false
+
+    - name: warn if vdsm drop-in failed validation
+      debug:
+        msg: >-
+          WARNING: VDSM drop-in {{ vdsm_dropin_conf }} did not parse as valid INI
+          (rc={{ vdsm_validate_result.rc | default('?') }}). Review it manually;
+          services were NOT blocked by this check.
+      when: (vdsm_validate_result.rc | default(0)) != 0
+
+    - name: validate multipath config
+      command: multipath -t
+      register: multipath_validate_result
+      changed_when: false
+      failed_when: false
+      when: multipathd_active.stdout == 'active'
+
+    - name: warn if multipath config failed validation
+      debug:
+        msg: >-
+          WARNING: 'multipath -t' returned rc={{ multipath_validate_result.rc | default('?') }}.
+          Review {{ multipath_dropin_conf }}; the drop-in is additive and services
+          were NOT blocked by this check.
+      when:
+        - multipathd_active.stdout == 'active'
+        - (multipath_validate_result.rc | default(0)) != 0
+
+    - name: reload multipathd
+      command: multipathd reconfigure
+      register: multipath_reload
+      changed_when: multipath_reload.rc == 0
+      failed_when: false
+      when: restart_enabled | bool
+
+    - name: restart sanlock
+      systemd:
+        name: sanlock
+        state: restarted
+        daemon_reload: yes
+      when: restart_enabled | bool
+
+    - name: restart vdsmd
+      systemd:
+        name: vdsmd
+        state: restarted
+        daemon_reload: yes
+      when: restart_enabled | bool
+
+    - name: restart libvirtd
+      systemd:
+        name: libvirtd
+        state: restarted
+        daemon_reload: yes
+      when: restart_enabled | bool
+
+    - name: restart ovirt-ha-agent
+      systemd:
+        name: ovirt-ha-agent
+        state: restarted
+      when:
+        - ha_agent_exists
+        - restart_enabled | bool
+
+    - name: restart ovirt-ha-broker
+      systemd:
+        name: ovirt-ha-broker
+        state: restarted
+      when:
+        - ha_broker_exists
+        - restart_enabled | bool
+
+
+# =============================================================
+# ENGINE CONFIGURATION (Optional - with dynamic parameter validation)
+# =============================================================
+- name: "OLVM HA Tuning - Engine Configuration"
+  hosts: ovirt_engine
+  become: yes
+  gather_facts: yes
+  any_errors_fatal: false
+  
+  vars:
+    # Engine config parameters - dynamically validated against `engine-config -l`.
+    # Parameters not present in this OLVM version are silently skipped.
+    #
+    # Confirmed available in OLVM 4.5.5-1.67.el8 (verified May 2026).
+    #
+    # References:
+    #   https://www.ovirt.org/develop/sla/ha-timeouts.html
+    #   https://github.com/oVirt/ovirt-engine/blob/master/packaging/etc/engine-config/engine-config.properties
+    #
+    # IMPORTANT - parameters intentionally NOT tuned (left at default):
+    #   * vdsTimeout (default 180s): VDSM operations legitimately need
+    #     that long; reducing causes false-positive failures.
+    #   * vdsRetries (default 0): keeping at 0 makes fencing predictable
+    #     per oVirt HA guidance.
+    #   * EnableAutomaticHostPowerManagement: requires PM agent infrastructure.
+    #   * PMHealthCheckEnabled: boolean, default true is sufficient.
+    #   * FenceKdumpListenerTimeout / FenceKdumpMessageInterval: must be tuned
+    #     in lockstep with fence_kdump listener config — out of scope here.
+    #   * FenceStartStatusRetries / FenceStopStatusRetries: fence-agent-specific.
+    engine_settings:
+      # =========================================================
+      # GROUP A - EFFECTIVE CHANGES (value differs from the 4.5.5
+      # default, so these actually do something). Defaults below were
+      # confirmed against a real `engine-config --all` dump (2026-06).
+      # =========================================================
+      - name: 'VdsRefreshRate'
+        value: 2                       # default 3 -> 2 : poll host status faster
+        description: 'Interval (s) to poll Host status. Default 3. Lower = faster detection, slightly more engine load.'
+      - name: 'vdsConnectionTimeout'
+        value: "{{ engine_vds_connection_timeout | default(5) }}"                       # default 20 -> 5 (override via engine_vds_connection_timeout)
+        description: 'Engine->VDSM connection timeout (s). Default 20. REVIEW: 5s is aggressive; on a loaded engine or congested mgmt network it can cause spurious connection failures. 8-10s is a safer HA value.'
+      - name: 'FenceQuietTimeBetweenOperationsInSec'
+        value: 60                      # default 180 -> 60
+        description: 'Quiet time between Power Management operations (s). Default 180. 60 lets fence ops repeat sooner.'
+      - name: 'ServerRebootTimeout'
+        value: 300                     # default 600 -> 300
+        description: 'Time to wait before a host reboot is considered failed (s). Default 600. Set to 300: bare-metal servers (e.g. Dell PowerEdge) can need ~3 min for POST + RAID init, so 90s would falsely flag a still-booting host as failed. 300 halves the default while staying safely above real boot time.'
+
+      # =========================================================
+      # GROUP B - DRIFT GUARD (value == 4.5.5 default). These do NOT
+      # change anything on a stock engine; they only re-assert the
+      # known-good default if someone changed it by hand. With the
+      # idempotency logic they report "already correct" and never
+      # trigger a restart. Keep them if you want drift protection;
+      # otherwise they can be deleted with zero functional impact.
+      # =========================================================
+      - name: 'TimeoutToResetVdsInSeconds'
+        value: 60                      # = default 60
+        description: 'Base comms timeout before trying to reset a host (s). = 4.5.5 default.'
+      - name: 'VDSAttemptsToResetCount'
+        value: 2                       # = default 2
+        description: 'Attempts to reach a host before reset. = 4.5.5 default.'
+      - name: 'VdsRecoveryTimeoutInMinutes'
+        value: 3                       # = default 3
+        description: 'Host timeout when recovering (min). = 4.5.5 default.'
+      - name: 'NetworkConnectivityCheckTimeoutInSeconds'
+        value: 120                     # = default 120
+        description: 'Network rollback timeout (s). = 4.5.5 default. Do not lower casually: too low risks false network rollback.'
+      - name: 'HostPreparingForMaintenanceIdleTime'
+        value: 300                     # = default 300
+        description: 'Idle time in PreparingForMaintenance before retry (s). = 4.5.5 default. Maintenance only, not failover-critical.'
+      - name: 'StoragePoolRefreshTimeInSeconds'
+        value: 10                      # = default 10
+        description: 'SPM polling rate (s). = 4.5.5 default.'
+      - name: 'SpmCommandFailOverRetries'
+        value: 3                       # = default 3
+        description: 'SPM command failover retries. = 4.5.5 default.'
+      - name: 'SPMFailOverAttempts'
+        value: 3                       # = default 3
+        description: 'SPM connect attempts before failover. = 4.5.5 default.'
+      - name: 'MaxStorageVdsDelayCheckSec'
+        value: 5                       # = default 5
+        description: 'Max delay for storage domain check (s). = 4.5.5 default.'
+      - name: 'MaxStorageVdsTimeoutCheckSec'
+        value: 30                      # = default 30
+        description: 'Max timeout for last storage domain check (s). = 4.5.5 default.'
+      - name: 'NumberOfFailedRunsOnVds'
+        value: 3                       # = default 3
+        description: 'Failed VM runs on a host before action. = 4.5.5 default.'
+      - name: 'MaxRerunVmOnVdsCount'
+        value: 3                       # = default 3
+        description: 'Max VM rerun attempts on a host. = 4.5.5 default.'
+      - name: 'PMHealthCheckIntervalInSec'
+        value: 3600                    # = default 3600
+        description: 'PM health check interval (s). = 4.5.5 default.'
+
+    # Engine parameters we VERIFY/report but do NOT modify.
+    # Values in comments are the confirmed 4.5.5 defaults.
+    engine_verify_only:
+      - 'vdsTimeout'                            # 180s  - VDSM ops need it; DO NOT change
+      - 'vdsRetries'                            # 0     - keep 0 for predictable fencing
+      - 'EnableAutomaticHostPowerManagement'    # false - needs PM agent infrastructure
+      - 'PMHealthCheckEnabled'                  # false - leave as-is
+      - 'FenceKdumpListenerTimeout'             # 90    - tune with fence_kdump listener
+      - 'FenceKdumpMessageInterval'             # 5     - tune with fence_kdump listener
+      # ---- Fence confirmation budget: these DOMINATE fencing latency ----
+      # FenceStart/StopStatusRetries(18) x DelayBetweenRetries(10s) = up to
+      # ~180s each just to confirm a power on/off after a fence. If real
+      # failover feels slow, this is the first place to look (carefully).
+      - 'FenceStartStatusRetries'               # 18
+      - 'FenceStartStatusDelayBetweenRetriesInSec'  # 10
+      - 'FenceStopStatusRetries'                # 18
+      - 'FenceStopStatusDelayBetweenRetriesInSec'   # 10
+      - 'KdumpStartedTimeout'                   # 30
+      - 'DelayResetForSpmInSeconds'             # 20    - delay before resetting SPM host
+      - 'VmGracefulShutdownTimeout'             # 30    - grace given to a VM before kill
+      - 'AsyncTaskPollingRate'                  # 10
+      - 'StorageDomainFailureTimeoutInMinutes'  # 5
+    
+    # Force engine restart even if no changes (useful for testing)
+    force_engine_restart: false
+
+    # SAFE BY DEFAULT: when false, engine-config values are written to the
+    # engine DB but ovirt-engine is NOT auto-restarted (so they are staged, not
+    # active, until you restart it). setup.sh passes restart_enabled=true only
+    # if you opt in to a live restart.
+    restart_enabled: false
+    
+  tasks:
+    - name: "[ENGINE] Check if running on engine"
+      command: systemctl is-active ovirt-engine
+      register: engine_active
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      tags: engine
+
+    - name: "[ENGINE] Skip THIS host if ovirt-engine is not active"
+      meta: end_host
+      when: engine_active.rc != 0
+
+    - name: "[ENGINE] Check engine-config tool"
+      command: which engine-config
+      register: engine_config_check
+      changed_when: false
+      failed_when: engine_config_check.rc != 0
+      check_mode: no
+      tags: engine
+
+    - name: "[ENGINE] List all available engine-config parameters (this may take 10-15s)"
+      command: /usr/bin/engine-config -l
+      register: available_engine_params
+      changed_when: false
+      check_mode: no
+      tags: engine
+
+    - name: "[ENGINE] Identify supported parameters"
+      set_fact:
+        supported_engine_settings: "{{ engine_settings | selectattr('name', 'in', available_engine_params.stdout) | list }}"
+        unsupported_engine_settings: "{{ engine_settings | rejectattr('name', 'in', available_engine_params.stdout) | list }}"
+      tags: engine
+
+    - name: "[ENGINE] Display parameter availability"
+      debug:
+        msg:
+          - "===================================================="
+          - "Engine Parameter Validation (OLVM Version Specific)"
+          - "===================================================="
+          - "Available in this OLVM version:"
+          - "  {{ supported_engine_settings | map(attribute='name') | list | join(', ') if supported_engine_settings else 'None' }}"
+          - ""
+          - "NOT available (will be skipped safely):"
+          - "  {{ unsupported_engine_settings | map(attribute='name') | list | join(', ') if unsupported_engine_settings else 'None' }}"
+          - "===================================================="
+      tags: engine
+
+    - name: "[ENGINE] Get current values of supported parameters"
+      command: "/usr/bin/engine-config -g {{ item.name }}"
+      register: current_values
+      loop: "{{ supported_engine_settings }}"
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      tags: engine
+
+    # Parse `engine-config -g X` output, e.g.
+    #   "VdsRefreshRate: 2 version: general"  ->  "2"
+    # so we can compare current vs desired and stay idempotent.
+    - name: "[ENGINE] Build map of current values"
+      set_fact:
+        current_engine_map: >-
+          {{
+            current_engine_map | default({}) |
+            combine({
+              item.item.name:
+                ((item.stdout | default('')) | regex_replace(' version:.*$', '')
+                                            | regex_replace('^[^:]*:[ ]*', '')
+                                            | trim)
+            })
+          }}
+      loop: "{{ current_values.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: current_values.results is defined
+      tags: engine
+
+    - name: "[ENGINE] Build final apply list (value mismatch only)"
+      set_fact:
+        engine_apply_list: "{{ engine_apply_list | default([]) + [item] }}"
+      loop: "{{ supported_engine_settings }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: (item.value | string) != (current_engine_map[item.name] | default('__MISSING__'))
+      tags: engine
+
+    - name: "[ENGINE] Display planned changes"
+      debug:
+        msg: >-
+          {{ item.name }}: '{{ current_engine_map[item.name] | default('(unset)') }}'
+          -> '{{ item.value }}'
+      loop: "{{ engine_apply_list | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: engine
+
+    - name: "[ENGINE] Report no-op when everything already matches"
+      debug:
+        msg: "All supported engine parameters already at desired values - nothing to change."
+      when: (engine_apply_list | default([])) | length == 0
+      tags: engine
+
+    - name: "[ENGINE] Apply only settings that differ"
+      command: "/usr/bin/engine-config -s {{ item.name }}={{ item.value }} --cver=general"
+      loop: "{{ engine_apply_list | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: engine_config_result
+      changed_when: engine_config_result.rc == 0
+      failed_when:
+        - engine_config_result.rc != 0
+        - "'cannot be found' not in (engine_config_result.stderr | default(''))"
+        - "'not found' not in (engine_config_result.stderr | default(''))"
+        - "'null' not in (engine_config_result.stdout | default(''))"
+      tags: engine
+
+    - name: "[ENGINE] Track if any engine config changed"
+      set_fact:
+        engine_config_changed: "{{ (engine_apply_list | default([])) | length > 0 }}"
+      tags: engine
+
+    # =============================================================
+    # ENGINE RESTART - GUARANTEED via direct task (not handler)
+    # This ensures restart happens immediately after config changes
+    # =============================================================
+    - name: "[ENGINE] Restart ovirt-engine service (after config changes, if restart enabled)"
+      systemd:
+        name: ovirt-engine
+        state: restarted
+        daemon_reload: yes
+      when: (engine_config_changed or force_engine_restart) and (restart_enabled | default(false) | bool)
+      register: engine_restart_result
+      tags: engine
+
+    - name: "[ENGINE] Staged - engine NOT restarted (restart_enabled=false)"
+      debug:
+        msg:
+          - "engine-config values were written to the engine database, but"
+          - "ovirt-engine was NOT restarted, so they are NOT active yet."
+          - "Apply them at a convenient time (brief management-only downtime):"
+          - "    systemctl restart ovirt-engine"
+      when:
+        - (engine_config_changed | default(false))
+        - not (restart_enabled | default(false) | bool)
+      tags: engine
+
+    - name: "[ENGINE] Wait for engine to come back online"
+      wait_for:
+        port: 443
+        host: "{{ ansible_default_ipv4.address }}"
+        delay: 5
+        timeout: 180
+      when:
+        - engine_restart_result is defined and engine_restart_result.changed
+        - not ansible_check_mode
+      tags: engine
+
+    - name: "[ENGINE] Verify engine is active after restart"
+      command: systemctl is-active ovirt-engine
+      register: engine_status_after
+      changed_when: false
+      failed_when: engine_status_after.stdout != 'active'
+      retries: 10
+      delay: 6
+      until: engine_status_after.stdout == 'active'
+      when:
+        - engine_restart_result is defined and engine_restart_result.changed
+        - not ansible_check_mode
+      tags: engine
+
+    - name: "[ENGINE] Display final summary"
+      debug:
+        msg:
+          - "===================================================="
+          - "Engine Configuration Summary"
+          - "===================================================="
+          - "Changed this run ({{ (engine_apply_list | default([])) | length }}):"
+          - "{% if engine_apply_list | default([]) %}{% for item in engine_apply_list %}  ✓ {{ item.name }} = {{ item.value }}{% if not loop.last %}\n{% endif %}{% endfor %}{% else %}  None (already at desired values){% endif %}"
+          - ""
+          - "Supported but already correct:"
+          - "{% set changed_names = (engine_apply_list | default([])) | map(attribute='name') | list %}{% set already = supported_engine_settings | rejectattr('name', 'in', changed_names) | list %}{% if already %}{% for item in already %}  = {{ item.name }} = {{ item.value }}{% if not loop.last %}\n{% endif %}{% endfor %}{% else %}  None{% endif %}"
+          - ""
+          - "Skipped (not available in this OLVM version):"
+          - "{% if unsupported_engine_settings %}{% for item in unsupported_engine_settings %}  ⏭ {{ item.name }}{% if not loop.last %}\n{% endif %}{% endfor %}{% else %}  None{% endif %}"
+          - "----------------------------------------------------"
+          - "Engine Restart: {{ 'PERFORMED ✓' if (engine_restart_result is defined and engine_restart_result.changed | default(false)) else ('STAGED - run: systemctl restart ovirt-engine' if (engine_config_changed | default(false)) else 'NOT NEEDED (no changes)') }}"
+          - "Engine Status:  {{ engine_status_after.stdout if engine_status_after is defined and engine_status_after.stdout is defined else 'not restarted' }}"
+          - "===================================================="
+      tags: engine
+
+    - name: "[ENGINE] Get ovirt-engine package version (for report)"
+      shell: "rpm -q ovirt-engine --queryformat '%{VERSION}-%{RELEASE}' 2>/dev/null || echo 'unknown'"
+      register: engine_pkg_ver
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      tags:
+        - engine
+        - report
+
+    - name: "[ENGINE] Build changed parameter list (name/old/new) for report"
+      set_fact:
+        engine_changed_list: "{{ engine_changed_list | default([]) + [{'name': item.name, 'old': (current_engine_map[item.name] | default('(unset)')), 'new': item.value}] }}"
+      loop: "{{ engine_apply_list | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags:
+        - engine
+        - report
+
+    - name: "[ENGINE] Build engine run-result fact (for report)"
+      set_fact:
+        engine_run_result:
+          hostname: "{{ ansible_hostname }}"
+          active: "{{ engine_active.stdout | default('inactive') }}"
+          version: "{{ engine_pkg_ver.stdout | default('unknown') }}"
+          restarted: "{{ (engine_restart_result is defined and (engine_restart_result.changed | default(false))) }}"
+          staged: "{{ (engine_config_changed | default(false)) and not (restart_enabled | default(false) | bool) }}"
+          status_after: "{{ engine_status_after.stdout if (engine_status_after is defined and engine_status_after.stdout is defined) else 'not restarted' }}"
+          changed: "{{ engine_changed_list | default([]) }}"
+          already: >-
+            {{ (supported_engine_settings | default([]))
+               | rejectattr('name', 'in', (engine_apply_list | default([]) | map(attribute='name') | list))
+               | map(attribute='name') | list }}
+          unsupported: "{{ (unsupported_engine_settings | default([])) | map(attribute='name') | list }}"
+      tags:
+        - engine
+        - report
+
+
+# =============================================================
+# RUN REPORT (control node) - renders HTML + Markdown of every
+# operation performed this run. Toggle with -e generate_report=false.
+# Reads per-host ha_run_result and engine_run_result facts via hostvars.
+# =============================================================
+- name: "OLVM HA Tuning - Generate Run Report"
+  hosts: localhost
+  gather_facts: yes
+  any_errors_fatal: false
+
+  vars:
+    generate_report: true
+    report_dir: "{{ playbook_dir }}/reports"
+    report_version: "4.22"
+    # Passed by setup.sh; sensible defaults for direct ansible-playbook runs.
+    report_profile: "{{ report_profile | default('custom') }}"
+    report_backup_stamp: "{{ backup_stamp | default(ansible_date_time.iso8601_basic_short) }}"
+    report_restart_enabled: "{{ (restart_enabled | default(false)) | bool }}"
+    # Classification bands (kept in sync with verify-olvm-ha.yml)
+    failover_aggressive_max: 120
+    failover_balanced_max: 145
+    failover_conservative_max: 180
+
+  tasks:
+    - name: "[REPORT] Build enriched per-host list"
+      set_fact:
+        report_hosts: >-
+          {{
+            report_hosts | default([]) + [
+              (hostvars[item].ha_run_result | combine({
+                'changed_any': ((hostvars[item].ha_run_result.changes.values() | map('trim') | select('equalto','changed') | list | length) > 0),
+                'change_count': (hostvars[item].ha_run_result.changes.values() | map('trim') | select('equalto','changed') | list | length),
+                'services_summary': (hostvars[item].ha_run_result.services.vdsmd ~ '/' ~ hostvars[item].ha_run_result.services.sanlock ~ '/' ~ hostvars[item].ha_run_result.services.libvirtd),
+                'failover_class': (
+                  'AGGRESSIVE'        if (hostvars[item].ha_run_result.estimated_failover | int) <= failover_aggressive_max
+                  else 'BALANCED'     if (hostvars[item].ha_run_result.estimated_failover | int) <= failover_balanced_max
+                  else 'CONSERVATIVE' if (hostvars[item].ha_run_result.estimated_failover | int) <= failover_conservative_max
+                  else 'VERY_CONSERVATIVE'
+                )
+              }))
+            ]
+          }}
+      loop: "{{ groups['ovirt_hosts'] | default([]) }}"
+      loop_control:
+        label: "{{ item }}"
+      when: hostvars[item].ha_run_result is defined
+      run_once: true
+      tags:
+        - report
+        - always
+
+    - name: "[REPORT] Build engine list"
+      set_fact:
+        report_engine: "{{ report_engine | default([]) + [hostvars[item].engine_run_result] }}"
+      loop: "{{ groups['ovirt_engine'] | default([]) }}"
+      loop_control:
+        label: "{{ item }}"
+      when: hostvars[item].engine_run_result is defined
+      run_once: true
+      tags:
+        - report
+        - always
+
+    - name: "[REPORT] Skip if no host results (e.g. tag-limited run)"
+      debug:
+        msg: "No per-host run results found - report generation skipped (run a full apply first)."
+      when: (report_hosts | default([])) | length == 0
+      run_once: true
+      tags:
+        - report
+        - always
+
+    - name: "[REPORT] Ensure report directory exists"
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+      when:
+        - generate_report | bool
+        - (report_hosts | default([])) | length > 0
+      run_once: true
+      tags:
+        - report
+        - always
+
+    - name: "[REPORT] Set common report facts"
+      set_fact:
+        report_generated: "{{ ansible_date_time.iso8601 }}"
+        report_engine: "{{ report_engine | default([]) }}"
+      run_once: true
+      tags:
+        - report
+        - always
+
+    - name: "[REPORT] Render Markdown report"
+      template:
+        src: "templates/report.md.j2"
+        dest: "{{ report_dir }}/olvm-ha-report-{{ report_backup_stamp }}.md"
+        mode: '0644'
+      when:
+        - generate_report | bool
+        - (report_hosts | default([])) | length > 0
+      run_once: true
+      tags:
+        - report
+        - always
+
+    - name: "[REPORT] Render HTML report"
+      template:
+        src: "templates/report.html.j2"
+        dest: "{{ report_dir }}/olvm-ha-report-{{ report_backup_stamp }}.html"
+        mode: '0644'
+      when:
+        - generate_report | bool
+        - (report_hosts | default([])) | length > 0
+      run_once: true
+      tags:
+        - report
+        - always
+
+    - name: "[REPORT] Announce report paths"
+      debug:
+        msg:
+          - "===================================================="
+          - "Run report generated:"
+          - "  Markdown: {{ report_dir }}/olvm-ha-report-{{ report_backup_stamp }}.md"
+          - "  HTML:     {{ report_dir }}/olvm-ha-report-{{ report_backup_stamp }}.html"
+          - "===================================================="
+      when:
+        - generate_report | bool
+        - (report_hosts | default([])) | length > 0
+      run_once: true
+      tags:
+        - report
+        - always

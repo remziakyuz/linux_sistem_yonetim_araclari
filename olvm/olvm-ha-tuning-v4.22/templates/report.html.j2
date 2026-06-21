@@ -1,0 +1,180 @@
+{% macro pill(state) -%}
+{% if state == 'changed' %}<span class="pill chg">changed</span>
+{%- elif state == 'ok' or state == 'already correct' %}<span class="pill ok">already correct</span>
+{%- else %}<span class="pill skip">{{ state }}</span>{% endif %}
+{%- endmacro -%}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OLVM HA Tuning – Run Report {{ report_backup_stamp }}</title>
+<style>
+  :root{
+    --bg:#0f1419; --panel:#1a2129; --panel2:#222c37; --ink:#e6edf3;
+    --muted:#9aa7b4; --line:#2d3742; --accent:#3fb950; --accent2:#58a6ff;
+    --warn:#d29922; --bad:#f85149; --chip:#30363d;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 20px 64px}
+  header{border-bottom:1px solid var(--line);padding-bottom:20px;margin-bottom:28px}
+  h1{font-size:24px;margin:0 0 6px}
+  h2{font-size:19px;margin:36px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  h3{font-size:16px;margin:24px 0 10px;color:var(--accent2)}
+  .sub{color:var(--muted);font-size:14px}
+  .meta{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
+  .chip{background:var(--chip);border:1px solid var(--line);border-radius:20px;
+    padding:5px 13px;font-size:13px}
+  .chip b{color:var(--accent2)}
+  .note{background:var(--panel);border-left:3px solid var(--warn);
+    padding:12px 16px;border-radius:6px;margin:18px 0;color:var(--muted);font-size:14px}
+  table{width:100%;border-collapse:collapse;margin:14px 0;background:var(--panel);
+    border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  th,td{padding:9px 13px;text-align:left;border-bottom:1px solid var(--line);font-size:14px}
+  th{background:var(--panel2);color:var(--muted);font-weight:600;
+    text-transform:uppercase;font-size:11px;letter-spacing:.04em}
+  tr:last-child td{border-bottom:none}
+  td code,h3 code,.mono{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:13px}
+  .pill{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600}
+  .ok{background:rgba(63,185,80,.15);color:var(--accent)}
+  .chg{background:rgba(88,166,255,.15);color:var(--accent2)}
+  .skip{background:rgba(154,167,180,.15);color:var(--muted)}
+  .stage{background:rgba(210,153,34,.15);color:var(--warn)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:18px 22px;margin:18px 0}
+  footer{margin-top:48px;color:var(--muted);font-size:13px;text-align:center;
+    border-top:1px solid var(--line);padding-top:18px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+  @media(max-width:720px){.grid2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>OLVM HA Tuning &mdash; Run Report</h1>
+  <div class="sub">Oracle Linux Virtualization Manager &middot; high-availability timeout tuning</div>
+  <div class="meta">
+    <span class="chip">Generated <b>{{ report_generated }}</b></span>
+    <span class="chip">Version <b>{{ report_version }}</b></span>
+    <span class="chip">Profile <b>{{ report_profile }}</b></span>
+    <span class="chip">Mode <b>{{ 'STAGED' if not report_restart_enabled else 'APPLIED' }}</b></span>
+    <span class="chip">Backup <b>{{ report_backup_stamp }}</b></span>
+    <span class="chip">Hosts <b>{{ report_hosts | length }}</b></span>
+  </div>
+</header>
+
+<div class="note">
+  <b>Estimated failover</b> is a heuristic upper bound
+  <span class="mono">(sanlock_io &times; 3/2) + (ha_mon &times; 3) + 25</span>, not a measured value.
+  Validate with a real failover test (fence a host) in a maintenance window.
+</div>
+
+<h2>1. Summary</h2>
+<table>
+  <tr><th>Host</th><th>Tuning</th><th>Failover (heuristic)</th><th>Changes</th><th>Services after</th></tr>
+  {% for h in report_hosts %}
+  <tr>
+    <td><code>{{ h.hostname }}</code></td>
+    <td>{% if h.changed_any %}<span class="pill chg">APPLIED</span>{% else %}<span class="pill ok">NO-OP</span>{% endif %}</td>
+    <td>~{{ h.estimated_failover }}s &middot; {{ h.failover_class }}</td>
+    <td>{{ h.change_count }}</td>
+    <td><code>{{ h.services_summary }}</code></td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>2. Per-host detail</h2>
+{% for h in report_hosts %}
+<div class="card">
+  <h3><code>{{ h.hostname }}</code></h3>
+  <div class="grid2">
+    <div>
+      <table>
+        <tr><th>Setting</th><th>Value</th></tr>
+        <tr><td>VDSM heartbeat_interval</td><td>{{ h.settings.vdsm_heartbeat_interval }}s</td></tr>
+        <tr><td>VDSM host_monitor_timeout</td><td>{{ h.settings.vdsm_host_monitor_timeout }}s</td></tr>
+        <tr><td>VDSM migration_timeout</td><td>{{ h.settings.vdsm_migration_timeout }}s</td></tr>
+        <tr><td>Sanlock io_timeout</td><td>{{ h.settings.sanlock_io_timeout }}s</td></tr>
+        <tr><td>Sanlock watchdog_fire_timeout</td><td>{{ h.settings.sanlock_watchdog_fire_timeout }}s</td></tr>
+        <tr><td>Multipath polling_interval</td><td>{{ h.settings.multipath_polling_interval }}s</td></tr>
+        <tr><td>Multipath no_path_retry</td><td>{{ h.settings.no_path_retry }}</td></tr>
+      </table>
+    </div>
+    <div>
+      <table>
+        <tr><th>Setting</th><th>Value</th></tr>
+        <tr><td>HA monitoring_interval</td><td>{{ h.settings.ha_monitoring_interval }}s</td></tr>
+        <tr><td>HA connection_timeout</td><td>{{ h.settings.ha_connection_timeout }}s</td></tr>
+        <tr><td>HA score_penalty</td><td>{{ h.settings.ha_score_penalty }}</td></tr>
+        <tr><td>HA state_transition_timeout</td><td>{{ h.settings.ha_state_transition_timeout }}s</td></tr>
+        <tr><td>Libvirt keepalive_interval</td><td>{{ h.settings.libvirt_keepalive_interval }}s</td></tr>
+        <tr><td>Libvirt keepalive_count</td><td>{{ h.settings.libvirt_keepalive_count }}</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <table>
+    <tr><th>Operation</th><th>Result</th></tr>
+    <tr><td>Backup directory <code>{{ h.backup_dir }}</code></td><td>{% if h.backup_created %}<span class="pill chg">created</span>{% else %}<span class="pill skip">skipped</span>{% endif %}</td></tr>
+    <tr><td>VDSM drop-in</td><td>{{ pill(h.changes.vdsm_dropin) }}</td></tr>
+    <tr><td>Sanlock legacy keys</td><td>{{ pill(h.changes.sanlock_keys) }}</td></tr>
+    <tr><td>Multipath drop-in</td><td>{{ pill(h.changes.multipath_dropin) }}</td></tr>
+    <tr><td>HA agent keys</td><td>{{ pill(h.changes.ha_agent_keys) }}</td></tr>
+    <tr><td>Libvirt keepalive keys</td><td>{{ pill(h.changes.libvirt_keys) }}</td></tr>
+    <tr><td>Service restart</td><td>{% if h.restart_enabled %}<span class="pill chg">performed</span>{% else %}<span class="pill stage">staged only</span>{% endif %}</td></tr>
+  </table>
+  {% if not h.restart_enabled %}
+  <div class="note">Config was <b>staged</b>. Activate by rebooting this host from the OLVM web UI,
+  one at a time: <span class="mono">Compute &gt; Hosts &gt; {{ h.hostname }} &gt; Management &gt; Maintenance &rarr; Restart &rarr; Activate</span>.</div>
+  {% endif %}
+</div>
+{% endfor %}
+
+<h2>3. Engine configuration</h2>
+{% if report_engine %}
+{% for e in report_engine %}
+<div class="card">
+  <h3><code>{{ e.hostname }}</code></h3>
+  <div class="meta">
+    <span class="chip">ovirt-engine <b>{{ e.active }}</b></span>
+    <span class="chip">version <b>{{ e.version }}</b></span>
+    <span class="chip">restart <b>{{ 'PERFORMED' if e.restarted else ('STAGED' if (e.staged | default(false)) else 'NOT NEEDED') }}</b></span>
+    <span class="chip">status after <b>{{ e.status_after }}</b></span>
+  </div>
+  <h3 style="margin-top:18px">Parameters changed this run ({{ e.changed | length }})</h3>
+  {% if e.changed | length > 0 %}
+  <table>
+    <tr><th>Parameter</th><th>Old</th><th>New</th></tr>
+    {% for c in e.changed %}
+    <tr><td><code>{{ c.name }}</code></td><td>{{ c.old }}</td><td><b>{{ c.new }}</b></td></tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="sub">None — all supported parameters already at desired values.</p>
+  {% endif %}
+  <p class="sub"><b>Already correct ({{ e.already | length }}):</b> {{ e.already | join(', ') if e.already else 'none' }}</p>
+  <p class="sub"><b>Skipped — not available in this OLVM version ({{ e.unsupported | length }}):</b> {{ e.unsupported | join(', ') if e.unsupported else 'none' }}</p>
+</div>
+{% endfor %}
+{% else %}
+<p class="sub">No engine host in this run (or ovirt-engine not active).</p>
+{% endif %}
+
+<h2>4. Notes &amp; next steps</h2>
+<div class="card">
+  <ul>
+    <li>Rollback this run: <span class="mono">./setup.sh --rollback {{ report_backup_stamp }}</span></li>
+    <li>Verify: <span class="mono">./verify-olvm-ha.sh --full</span></li>
+    <li>Confirm VDSM <code>[vars]</code> keys and extra <code>agent.conf</code> keys against the
+        daemon schema on a real system — unknown keys may be silently ignored.</li>
+    <li><code>dev_loss_tmo infinity</code> in the multipath <code>overrides</code> block applies globally.
+        For Dell EMC ME5 (ALUA), consider <span class="mono">multipath_me5_device_block: true</span>.</li>
+  </ul>
+</div>
+
+<footer>Generated by olvm-ha-tuning {{ report_version }} &middot; {{ report_generated }}</footer>
+</div>
+</body>
+</html>

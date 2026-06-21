@@ -1,0 +1,54 @@
+---
+# inventory.yml
+# Version: 4.22
+# OLVM/oVirt Ansible Inventory
+#
+# Tested on:
+#   - OLVM 4.5.5-1.67.el8
+#   - VDSM 4.50.5.1-8.el8
+#   - Oracle Linux 8.10
+#
+# IMPORTANT: Update IP addresses according to your environment
+
+all:
+  children:
+    # ============================================================
+    # Hypervisor hosts (run VMs)
+    # ============================================================
+    ovirt_hosts:
+      hosts:
+        # Update these to match your environment
+        olvm01.lab.akyuz.tech:
+          ansible_host: 192.168.1.111
+        olvm02.lab.akyuz.tech:
+          ansible_host: 192.168.1.112
+      vars:
+        ansible_user: root
+        ansible_python_interpreter: /usr/bin/python3
+        # SSH connection settings
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o ConnectTimeout=15'
+        # Use SSH key authentication (recommended)
+        # ansible_ssh_private_key_file: ~/.ssh/id_rsa
+        # Or password (less secure)
+        # ansible_ssh_pass: "yourpassword"
+        # ansible_become_pass: "yourpassword"
+
+    # ============================================================
+    # Engine VM (manager) - Optional
+    # ============================================================
+    ovirt_engine:
+      hosts:
+        engine:
+          ansible_host: olvmm.lab.akyuz.tech
+      vars:
+        ansible_user: root
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o ConnectTimeout=15'
+
+  # ============================================================
+  # Global variables for all hosts
+  # ============================================================
+  vars:
+    # Project metadata
+    project_name: "OLVM HA Tuning"
+    project_version: "4.22"

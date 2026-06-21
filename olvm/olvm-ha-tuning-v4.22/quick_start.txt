@@ -1,0 +1,53 @@
+# OLVM HA Tuning - Quick Start (v4.22)
+# ====================================
+# 
+# ALL COMMANDS BELOW RUN ON THE CONTROL NODE.
+# You never log into OLVM hosts to use these scripts.
+# Ansible drives everything via inventory.yml over SSH.
+
+# 1. Prepare directory layout on the control node
+mkdir -p ~/olvm-ha-tuning/vars
+cd ~/olvm-ha-tuning
+
+# 2. Copy artifacts to their locations
+#    Put *.sh, *.yml, *.md, *.txt in this directory; vars/*.yml in vars/.
+
+# 3. Set permissions
+chmod +x *.sh
+
+# 4. Edit inventory (update IPs / hostnames)
+vi inventory.yml
+
+# 5. Setup SSH key-based access to all OLVM hosts (one-time)
+ssh-copy-id root@192.168.1.111
+ssh-copy-id root@192.168.1.112
+
+# 6. Install Python dependencies on all hosts (via Ansible)
+./fix-ansible-deps.sh
+
+# 7. Validate environment
+ansible -i inventory.yml all -m ping
+ansible-playbook -i inventory.yml test-connection.yml
+
+# 8. Offline syntax validation (no host access needed)
+./setup.sh --check-syntax
+
+# 9. Apply the RECOMMENDED balanced profile
+./setup.sh balanced
+
+# 10. Verify across all hosts AND engine (Ansible-driven, runs from control node)
+./verify-olvm-ha.sh --quick      # short summary per host + engine
+./verify-olvm-ha.sh --full       # detailed report per host + engine
+./verify-olvm-ha.sh --failover   # just the failover estimate
+./verify-olvm-ha.sh --engine     # engine HA parameters only (v4.7+)
+./verify-olvm-ha.sh --logs 60    # recent logs (last 60 min)
+
+# 11. Verify a single host
+./verify-olvm-ha.sh --host olvm01
+
+# 12. Rollback (when needed)
+./setup.sh --rollback                       # Remove drop-ins (revert to defaults)
+./setup.sh --rollback 20260510T010146       # Restore from specific backup
+
+# 13. Optional: custom tag combination
+./verify-olvm-ha.sh --tags vdsm,multipath

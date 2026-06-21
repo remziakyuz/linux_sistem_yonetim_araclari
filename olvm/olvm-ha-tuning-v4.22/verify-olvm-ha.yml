@@ -1,0 +1,957 @@
+---
+# verify-olvm-ha.yml
+# OLVM HA Configuration Verification Playbook (Ansible-driven)
+# Version: 4.22
+#
+# Tested on:
+#   - OLVM 4.5.5-1.67.el8
+#   - VDSM 4.50.5.1-8.el8
+#   - Oracle Linux 8.10
+#   - Ansible Core 2.16+
+#
+# Runs FROM the control node, queries all hosts via inventory.yml.
+# All values gathered via Ansible facts/modules (no remote bash scripts).
+#
+# Usage:
+#   ansible-playbook -i inventory.yml verify-olvm-ha.yml
+#   ansible-playbook -i inventory.yml verify-olvm-ha.yml -e "report_mode=quick"
+#   ansible-playbook -i inventory.yml verify-olvm-ha.yml --tags failover
+#   ansible-playbook -i inventory.yml verify-olvm-ha.yml --tags logs -e "log_lookback_minutes=60"
+#
+# DESIGN NOTE on tags:
+#   Many tasks register facts that downstream tasks depend on (stat
+#   results consumed by parse tasks; parse results consumed by failover
+#   calculation). For ANY --tags selection to work, all prerequisite
+#   gather/parse/calc tasks carry the 'always' tag. Section-specific
+#   reports carry only their section tag.
+
+- name: "OLVM HA Verification - Gather and Report"
+  hosts: ovirt_hosts
+  become: yes
+  gather_facts: yes
+  any_errors_fatal: false
+  
+  vars:
+    # NOTE: Cannot use "{{ report_mode | default('full') }}" here — that creates
+    # a self-reference recursion. Use the 'd' Jinja2 lookup pattern instead,
+    # or check existence via 'is defined'. We reference these via extra-vars
+    # only, with defaults at the consumption site.
+    
+    vdsm_dropin: /etc/vdsm/vdsm.conf.d/99-ha-tuning.conf
+    sanlock_conf: /etc/sanlock/sanlock.conf
+    multipath_dropin: /etc/multipath/conf.d/99-ha-tuning.conf
+    ha_agent_conf: /etc/ovirt-hosted-engine-ha/agent.conf
+    ha_broker_conf: /etc/ovirt-hosted-engine-ha/broker.conf
+    libvirt_conf: /etc/libvirt/libvirtd.conf
+    
+    default_sanlock_io_timeout: 10
+    default_ha_monitoring_interval: 20
+    
+    # Classification bands. NOTE: the failover figure is a heuristic UPPER
+    # bound, not a measured value (see formula below). Bands are calibrated so
+    # the shipped profiles map to their own names:
+    #   aggressive  (io=40,mon=10) -> 60+30+25 = 115  -> AGGRESSIVE
+    #   balanced    (io=50,mon=10) -> 75+30+25 = 130  -> BALANCED
+    #   conservative(io=60,mon=15) -> 90+45+25 = 160  -> CONSERVATIVE
+    # The ONLY ground truth is an actual failover test in a maintenance window.
+    failover_aggressive_max: 120
+    failover_balanced_max: 145
+    failover_conservative_max: 180
+    
+    required_packages:
+      - vdsm
+      - sanlock
+      - libvirt
+      - device-mapper-multipath
+    
+    optional_packages:
+      - ovirt-hosted-engine-ha
+    
+    core_services:
+      - vdsmd
+      - sanlock
+      - libvirtd
+    
+    optional_services:
+      - multipathd
+      - ovirt-ha-agent
+      - ovirt-ha-broker
+
+  pre_tasks:
+    - name: "[INIT] Normalize report_mode and log_lookback_minutes from extra-vars"
+      set_fact:
+        report_mode_effective: "{{ (report_mode | default('full')) | string }}"
+        log_lookback_minutes_effective: "{{ (log_lookback_minutes | default(10)) | int }}"
+      tags: always
+
+  tasks:
+    # =============================================================
+    # PRE-FLIGHT GATHER (always - regardless of --tags)
+    # =============================================================
+    
+    - name: "[GATHER] OS release info"
+      slurp:
+        src: "{{ item }}"
+      register: os_release_files
+      failed_when: false
+      loop:
+        - /etc/oracle-release
+        - /etc/redhat-release
+      tags: always
+
+    - name: "[GATHER] Decode OS release"
+      set_fact:
+        os_release: "{{ (item.content | b64decode | trim) if (item.content is defined) else '' }}"
+      loop: "{{ os_release_files.results }}"
+      when:
+        - os_release is not defined or os_release == ''
+        - item.content is defined
+      tags: always
+
+    - name: "[GATHER] Package versions"
+      shell: "rpm -q {{ item }} --queryformat '%{VERSION}-%{RELEASE}' 2>/dev/null || echo 'NOT_INSTALLED'"
+      register: pkg_versions
+      changed_when: false
+      check_mode: no
+      loop: "{{ required_packages + optional_packages }}"
+      tags: always
+
+    - name: "[GATHER] Build package version map"
+      set_fact:
+        pkg_map: "{{ pkg_map | default({}) | combine({item.item: item.stdout}) }}"
+      loop: "{{ pkg_versions.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: always
+
+    - name: "[GATHER] Service active states"
+      command: "systemctl is-active {{ item }}"
+      register: service_states
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      loop: "{{ core_services + optional_services }}"
+      tags: always
+
+    - name: "[GATHER] Build service state map"
+      set_fact:
+        svc_map: "{{ svc_map | default({}) | combine({item.item: item.stdout | default('inactive')}) }}"
+      loop: "{{ service_states.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: always
+
+    - name: "[GATHER] Stat all config files"
+      stat:
+        path: "{{ item }}"
+      register: config_stats
+      loop:
+        - "{{ vdsm_dropin }}"
+        - "{{ multipath_dropin }}"
+        - "{{ ha_agent_conf }}"
+        - "{{ ha_broker_conf }}"
+        - "{{ libvirt_conf }}"
+        - "{{ sanlock_conf }}"
+      tags: always
+
+    - name: "[GATHER] Build config-exists map"
+      set_fact:
+        vdsm_dropin_exists: "{{ config_stats.results[0].stat.exists }}"
+        multipath_dropin_exists: "{{ config_stats.results[1].stat.exists }}"
+        ha_agent_exists: "{{ config_stats.results[2].stat.exists }}"
+        ha_broker_exists: "{{ config_stats.results[3].stat.exists }}"
+        libvirt_conf_exists: "{{ config_stats.results[4].stat.exists }}"
+        sanlock_conf_exists: "{{ config_stats.results[5].stat.exists }}"
+      tags: always
+
+    # =============================================================
+    # PARSE CONFIG VALUES (always - needed for any report)
+    # =============================================================
+    
+    - name: "[PARSE] VDSM heartbeat_interval"
+      shell: |
+        awk '/^\[vars\]/{in_section=1; next} /^\[/{in_section=0} in_section && $1=="heartbeat_interval"{print $3; exit}' \
+          "{{ vdsm_dropin }}" 2>/dev/null || true
+      register: vdsm_heartbeat
+      changed_when: false
+      check_mode: no
+      when: vdsm_dropin_exists
+      tags: always
+
+    - name: "[PARSE] VDSM host_monitor_timeout"
+      shell: |
+        awk '/^\[vars\]/{in_section=1; next} /^\[/{in_section=0} in_section && $1=="host_monitor_timeout"{print $3; exit}' \
+          "{{ vdsm_dropin }}" 2>/dev/null || true
+      register: vdsm_host_monitor
+      changed_when: false
+      check_mode: no
+      when: vdsm_dropin_exists
+      tags: always
+
+    - name: "[PARSE] Sanlock io_timeout (from VDSM config)"
+      shell: |
+        awk '/^\[sanlock\]/{in_section=1; next} /^\[/{in_section=0} in_section && $1=="io_timeout"{print $3; exit}' \
+          "{{ vdsm_dropin }}" 2>/dev/null || true
+      register: sanlock_io
+      changed_when: false
+      check_mode: no
+      when: vdsm_dropin_exists
+      tags: always
+
+    - name: "[PARSE] Multipath polling_interval"
+      shell: |
+        grep -E '^\s*polling_interval' "{{ multipath_dropin }}" 2>/dev/null | head -1 | awk '{print $2}' || true
+      register: mp_polling
+      changed_when: false
+      check_mode: no
+      when: multipath_dropin_exists
+      tags: always
+
+    - name: "[PARSE] Multipath no_path_retry"
+      shell: |
+        grep -E '^\s*no_path_retry' "{{ multipath_dropin }}" 2>/dev/null | head -1 | awk '{print $2}' || true
+      register: mp_no_path_retry
+      changed_when: false
+      check_mode: no
+      when: multipath_dropin_exists
+      tags: always
+
+    - name: "[PARSE] HA monitoring_interval"
+      shell: |
+        grep '^monitoring_interval\s*=' "{{ ha_agent_conf }}" 2>/dev/null | awk '{print $3}' || true
+      register: ha_mon_interval
+      changed_when: false
+      check_mode: no
+      when: ha_agent_exists
+      tags: always
+
+    - name: "[PARSE] HA connection_timeout"
+      shell: |
+        grep '^connection_timeout\s*=' "{{ ha_agent_conf }}" 2>/dev/null | awk '{print $3}' || true
+      register: ha_conn_timeout
+      changed_when: false
+      check_mode: no
+      when: ha_agent_exists
+      tags: always
+
+    - name: "[PARSE] Libvirt keepalive_interval"
+      shell: |
+        grep '^keepalive_interval\s*=' "{{ libvirt_conf }}" 2>/dev/null | awk '{print $3}' || true
+      register: libvirt_keepalive_int
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      when: libvirt_conf_exists
+      tags: always
+
+    - name: "[PARSE] Libvirt keepalive_count"
+      shell: |
+        grep '^keepalive_count\s*=' "{{ libvirt_conf }}" 2>/dev/null | awk '{print $3}' || true
+      register: libvirt_keepalive_cnt
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      when: libvirt_conf_exists
+      tags: always
+
+    # =============================================================
+    # COMPUTE FAILOVER (always - cheap, used by all reports)
+    # =============================================================
+    
+    - name: "[CALC] Effective sanlock_io_timeout"
+      set_fact:
+        effective_sanlock_io: >-
+          {{
+            (sanlock_io.stdout | default('') | trim) | int
+            if ((sanlock_io is defined) and
+                (sanlock_io.stdout is defined) and
+                ((sanlock_io.stdout | default('') | trim) | regex_search('^[0-9]+$')))
+            else default_sanlock_io_timeout
+          }}
+        sanlock_io_is_default: >-
+          {{
+            not ((sanlock_io is defined) and
+                 (sanlock_io.stdout is defined) and
+                 ((sanlock_io.stdout | default('') | trim) | regex_search('^[0-9]+$')))
+          }}
+      tags: always
+
+    - name: "[CALC] Effective ha_monitoring_interval"
+      set_fact:
+        effective_ha_mon: >-
+          {{
+            (ha_mon_interval.stdout | default('') | trim) | int
+            if ((ha_mon_interval is defined) and
+                (ha_mon_interval.stdout is defined) and
+                ((ha_mon_interval.stdout | default('') | trim) | regex_search('^[0-9]+$')))
+            else default_ha_monitoring_interval
+          }}
+        ha_mon_is_default: >-
+          {{
+            not ((ha_mon_interval is defined) and
+                 (ha_mon_interval.stdout is defined) and
+                 ((ha_mon_interval.stdout | default('') | trim) | regex_search('^[0-9]+$')))
+          }}
+      tags: always
+
+    - name: "[CALC] Estimated failover (integer math)"
+      set_fact:
+        estimated_failover: >-
+          {{
+            ((effective_sanlock_io | int) * 3 // 2) +
+            ((effective_ha_mon | int) * 3) + 25
+          }}
+      tags: always
+
+    - name: "[CALC] Classify failover"
+      set_fact:
+        failover_class: >-
+          {{
+            'AGGRESSIVE'        if (estimated_failover | int) <= failover_aggressive_max
+            else 'BALANCED'     if (estimated_failover | int) <= failover_balanced_max
+            else 'CONSERVATIVE' if (estimated_failover | int) <= failover_conservative_max
+            else 'VERY_CONSERVATIVE'
+          }}
+      tags: always
+
+    - name: "[CALC] Multipath sync status"
+      set_fact:
+        expected_no_path_retry: >-
+          {{
+            ((effective_sanlock_io | int) * 8 //
+             ((mp_polling.stdout | default('') | trim) | int))
+            if ((mp_polling is defined) and
+                (mp_polling.stdout is defined) and
+                ((mp_polling.stdout | default('') | trim) | regex_search('^[0-9]+$')) and
+                ((mp_polling.stdout | default('') | trim) | int > 0))
+            else 0
+          }}
+        mp_sync_status: >-
+          {{
+            'OK' if ((mp_polling is defined) and
+                     (mp_polling.stdout is defined) and
+                     ((mp_polling.stdout | default('') | trim) | regex_search('^[0-9]+$')) and
+                     ((mp_polling.stdout | default('') | trim) | int > 0) and
+                     (mp_no_path_retry is defined) and
+                     (mp_no_path_retry.stdout is defined) and
+                     ((mp_no_path_retry.stdout | default('') | trim) | regex_search('^[0-9]+$')) and
+                     ((mp_no_path_retry.stdout | default('') | trim) | int ==
+                      ((effective_sanlock_io | int) * 8 // ((mp_polling.stdout | default('') | trim) | int))))
+            else 'NOT_SYNCED' if multipath_dropin_exists
+            else 'NOT_CONFIGURED'
+          }}
+      tags: always
+
+    # =============================================================
+    # OPTIONAL VALIDATION (tagged - only run when requested)
+    # =============================================================
+    
+    - name: "[VDSM] Validate VDSM drop-in is parseable INI (version-independent)"
+      # vdsm-tool validate-config does not exist on every VDSM build (OEL 8.10 /
+      # VDSM 4.50.x prints usage and returns rc=1), so validate the drop-in by
+      # parsing it as INI with Python instead. Non-fatal.
+      command: >-
+        python3 -c "import configparser,sys; c=configparser.ConfigParser(strict=False);
+        c.read('{{ vdsm_dropin }}'); sys.exit(0)"
+      register: vdsm_validate
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      when:
+        - svc_map.vdsmd | default('inactive') == 'active'
+        - vdsm_dropin_exists | default(false)
+      tags:
+        - vdsm
+        - full
+
+    - name: "[MULTIPATH] Validate multipath config"
+      command: multipath -t
+      register: multipath_validate
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      when: svc_map.multipathd | default('inactive') == 'active'
+      tags:
+        - multipath
+        - full
+
+    - name: "[MULTIPATH] List multipath devices"
+      shell: multipath -l 2>/dev/null | head -20 || true
+      register: multipath_devices
+      changed_when: false
+      check_mode: no
+      when: svc_map.multipathd | default('inactive') == 'active'
+      tags:
+        - multipath
+        - full
+
+    - name: "[HA] hosted-engine --vm-status"
+      command: hosted-engine --vm-status
+      register: he_vm_status
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      when: ha_agent_exists
+      tags:
+        - ha
+        - quick
+        - full
+
+    - name: "[STORAGE] oVirt-related mounts"
+      shell: |
+        df -h 2>/dev/null | grep -E 'rhev|engine|nfs|gluster|iscsi' || true
+      register: storage_mounts
+      changed_when: false
+      check_mode: no
+      tags:
+        - storage
+        - full
+
+    # =============================================================
+    # LOGS (only on demand via --tags logs)
+    # =============================================================
+    
+    - name: "[LOGS] Recent VDSM errors"
+      shell: |
+        journalctl -u vdsmd --since "{{ log_lookback_minutes_effective }} minutes ago" -p err --no-pager -n 5 2>/dev/null || true
+      register: log_vdsm
+      changed_when: false
+      check_mode: no
+      tags:
+        - logs
+        - never
+
+    - name: "[LOGS] Recent sanlock issues"
+      shell: |
+        journalctl -u sanlock --since "{{ log_lookback_minutes_effective }} minutes ago" --no-pager -n 5 2>/dev/null | grep -v INFO || true
+      register: log_sanlock
+      changed_when: false
+      check_mode: no
+      tags:
+        - logs
+        - never
+
+    - name: "[LOGS] Recent HA agent warnings"
+      shell: |
+        journalctl -u ovirt-ha-agent --since "{{ log_lookback_minutes_effective }} minutes ago" -p warning --no-pager -n 5 2>/dev/null || true
+      register: log_ha
+      changed_when: false
+      check_mode: no
+      tags:
+        - logs
+        - never
+
+    # =============================================================
+    # REPORTS (chosen by tag)
+    # =============================================================
+    
+    - name: "[REPORT] Quick status"
+      debug:
+        msg: |
+          ====================================================
+          Quick Status: {{ ansible_hostname }} ({{ ansible_default_ipv4.address | default('?') }})
+          ====================================================
+          OLVM:
+            OS:            {{ os_release | default(ansible_distribution + ' ' + ansible_distribution_version) }}
+            VDSM:          {{ pkg_map.vdsm | default('?') }}
+            HE-HA:         {{ pkg_map['ovirt-hosted-engine-ha'] | default('?') }}
+          
+          Services:
+            vdsmd:           {{ svc_map.vdsmd | default('?') }}
+            sanlock:         {{ svc_map.sanlock | default('?') }}
+            libvirtd:        {{ svc_map.libvirtd | default('?') }}
+            multipathd:      {{ svc_map.multipathd | default('?') }}
+            ovirt-ha-agent:  {{ svc_map['ovirt-ha-agent'] | default('?') }}
+            ovirt-ha-broker: {{ svc_map['ovirt-ha-broker'] | default('?') }}
+          
+          Tuning Status:
+          {% if vdsm_dropin_exists %}
+            Custom tuning APPLIED
+            VDSM heartbeat_interval: {{ (vdsm_heartbeat.stdout | default('') | trim) if (vdsm_heartbeat is defined and (vdsm_heartbeat.stdout | default('') | trim) != '') else 'default' }}s
+            Sanlock io_timeout:      {{ effective_sanlock_io }}s{% if sanlock_io_is_default %} (DEFAULT){% endif %}
+            HA monitoring_interval:  {{ effective_ha_mon }}s{% if ha_mon_is_default %} (DEFAULT){% endif %}
+            Estimated failover:      ~{{ estimated_failover }}s ({{ failover_class }})
+          {% else %}
+            Using DEFAULT settings (slow failover - run setup.sh balanced)
+            Estimated failover:      ~{{ estimated_failover }}s ({{ failover_class }})
+          {% endif %}
+          
+          HA Status:
+          {% if he_vm_status is defined and he_vm_status.rc is defined and he_vm_status.rc == 0 and he_vm_status.stdout is defined %}
+          {{ (he_vm_status.stdout_lines | select('search', 'Engine status|Host ID|Score') | list)[:6] | join('\n') | indent(2, true) }}
+          {% elif (svc_map.get('ovirt-ha-agent', 'inactive') == 'active') %}
+            ovirt-ha-agent active (hosted-engine); `hosted-engine --vm-status` returned no engine status this run
+          {% else %}
+            Not a hosted-engine host (ovirt-ha-agent not active)
+          {% endif %}
+          ====================================================
+      tags:
+        - quick
+        - full
+
+    - name: "[REPORT] Full report"
+      debug:
+        msg: |
+          ====================================================
+          Full Verification Report: {{ ansible_hostname }}
+          ====================================================
+          
+          [VERSION]
+            OS:              {{ os_release | default(ansible_distribution + ' ' + ansible_distribution_version) }}
+            Kernel:          {{ ansible_kernel }}
+            Python:          {{ ansible_python_version }}
+          
+          [PACKAGES]
+          {% for pkg in (required_packages + optional_packages) %}
+            {{ '%-30s' | format(pkg + ':') }} {{ pkg_map[pkg] | default('?') }}
+          {% endfor %}
+          
+          [VDSM CONFIG]
+          {% if vdsm_dropin_exists %}
+            Drop-in:                       {{ vdsm_dropin }} (EXISTS)
+            heartbeat_interval:            {{ (vdsm_heartbeat.stdout | default('') | trim) if (vdsm_heartbeat is defined and (vdsm_heartbeat.stdout | default('') | trim) != '') else 'default' }}s
+            host_monitor_timeout:          {{ (vdsm_host_monitor.stdout | default('') | trim) if (vdsm_host_monitor is defined and (vdsm_host_monitor.stdout | default('') | trim) != '') else 'default' }}s
+            sanlock io_timeout:            {{ effective_sanlock_io }}s{% if sanlock_io_is_default %} (DEFAULT - tuning not applied){% endif %}
+            VDSM drop-in INI parse:        {{ 'PASSED' if (vdsm_validate is defined and vdsm_validate.rc is defined and vdsm_validate.rc == 0) else ('FAILED' if (vdsm_validate is defined and vdsm_validate.rc is defined) else 'skipped (no drop-in)') }}
+          {% else %}
+            Drop-in:                       {{ vdsm_dropin }} (NOT FOUND - using defaults)
+            Effective sanlock io_timeout:  {{ effective_sanlock_io }}s (DEFAULT)
+          {% endif %}
+          
+          [MULTIPATH CONFIG]
+          {% if svc_map.multipathd | default('inactive') != 'active' %}
+            multipathd not running (storage may not use multipath)
+          {% elif multipath_dropin_exists %}
+            Drop-in:                       {{ multipath_dropin }} (EXISTS)
+            polling_interval:              {{ (mp_polling.stdout | default('') | trim) if (mp_polling is defined and (mp_polling.stdout | default('') | trim) != '') else 'unknown' }}s
+            no_path_retry:                 {{ (mp_no_path_retry.stdout | default('') | trim) if (mp_no_path_retry is defined and (mp_no_path_retry.stdout | default('') | trim) != '') else 'unknown' }}
+            expected no_path_retry:        {{ expected_no_path_retry }}
+            sync status:                   {{ mp_sync_status }}{% if mp_sync_status == 'NOT_SYNCED' %} - re-run setup.sh balanced{% endif %}
+            multipath -t validation:       {{ 'PASSED' if (multipath_validate is defined and multipath_validate.rc is defined and multipath_validate.rc == 0) else 'FAILED or skipped' }}
+          {% else %}
+            Drop-in:                       {{ multipath_dropin }} (NOT FOUND)
+            Recommendation:                Run setup.sh balanced from control node
+          {% endif %}
+          
+          [HA AGENT CONFIG]
+          {% if ha_agent_exists %}
+            agent.conf:                    EXISTS
+            monitoring_interval:           {{ effective_ha_mon }}s{% if ha_mon_is_default %} (DEFAULT){% endif %}
+            connection_timeout:            {{ (ha_conn_timeout.stdout | default('') | trim) if (ha_conn_timeout is defined and (ha_conn_timeout.stdout | default('') | trim) != '') else 'default' }}s
+            ovirt-ha-agent:                {{ svc_map['ovirt-ha-agent'] | default('?') }}
+            ovirt-ha-broker:               {{ svc_map['ovirt-ha-broker'] | default('?') }}
+          {% else %}
+            Not a hosted-engine host (agent.conf not found)
+          {% endif %}
+          
+          [LIBVIRT CONFIG]
+            keepalive_interval:            {{ (libvirt_keepalive_int.stdout | default('') | trim) if (libvirt_keepalive_int is defined and (libvirt_keepalive_int.stdout | default('') | trim) != '') else 'default' }}s
+            keepalive_count:               {{ (libvirt_keepalive_cnt.stdout | default('') | trim) if (libvirt_keepalive_cnt is defined and (libvirt_keepalive_cnt.stdout | default('') | trim) != '') else 'default' }}
+            libvirtd:                      {{ svc_map.libvirtd | default('?') }}
+          
+          [FAILOVER ESTIMATION (integer-safe math)]
+            Formula:                       (sanlock_io * 3 / 2) + (ha_mon * 3) + 25
+            Calculation:                   ({{ effective_sanlock_io }} * 3 / 2) + ({{ effective_ha_mon }} * 3) + 25
+                                         = {{ (effective_sanlock_io | int) * 3 // 2 }} + {{ (effective_ha_mon | int) * 3 }} + 25
+                                         = {{ estimated_failover }}s
+            Classification:                {{ failover_class }}
+          
+          [STORAGE]
+          {% if storage_mounts is defined and storage_mounts.stdout is defined and storage_mounts.stdout != '' %}
+          {{ storage_mounts.stdout | indent(2, true) }}
+          {% else %}
+            No oVirt storage mounts found
+          {% endif %}
+          
+          ====================================================
+      when: report_mode_effective == "full"
+      tags: full
+
+    - name: "[REPORT] Failover estimate"
+      debug:
+        msg: |
+          ====================================================
+          Failover Estimate: {{ ansible_hostname }}
+          ====================================================
+          Sanlock I/O Timeout:    {{ effective_sanlock_io }}s{% if sanlock_io_is_default %} (DEFAULT){% endif %}
+          HA Monitoring Interval: {{ effective_ha_mon }}s{% if ha_mon_is_default %} (DEFAULT){% endif %}
+          
+          Formula:    (sanlock_io * 3 / 2) + (ha_mon * 3) + 25
+          Breakdown:  {{ (effective_sanlock_io | int) * 3 // 2 }} + {{ (effective_ha_mon | int) * 3 }} + 25
+          
+          Estimated:  ~{{ estimated_failover }}s  ({{ failover_class }})
+
+          NOTE: heuristic upper bound, not a measured value. Validate with a
+          real failover test (fence a host) in a maintenance window.
+          ====================================================
+      tags: failover
+
+    - name: "[REPORT] VDSM only"
+      debug:
+        msg: |
+          [VDSM] {{ ansible_hostname }}
+          Drop-in:                       {{ vdsm_dropin }} {{ '(EXISTS)' if vdsm_dropin_exists else '(NOT FOUND)' }}
+          heartbeat_interval:            {{ (vdsm_heartbeat.stdout | default('') | trim) if (vdsm_heartbeat is defined and (vdsm_heartbeat.stdout | default('') | trim) != '') else 'default' }}
+          host_monitor_timeout:          {{ (vdsm_host_monitor.stdout | default('') | trim) if (vdsm_host_monitor is defined and (vdsm_host_monitor.stdout | default('') | trim) != '') else 'default' }}
+          sanlock io_timeout:            {{ effective_sanlock_io }}s
+          VDSM drop-in INI parse:        {{ 'PASSED' if (vdsm_validate is defined and vdsm_validate.rc is defined and vdsm_validate.rc == 0) else ('FAILED' if (vdsm_validate is defined and vdsm_validate.rc is defined) else 'skipped (no drop-in)') }}
+          vdsmd service:                 {{ svc_map.vdsmd | default('?') }}
+      tags: vdsm
+
+    - name: "[REPORT] Sanlock only"
+      debug:
+        msg: |
+          [SANLOCK] {{ ansible_hostname }}
+          io_timeout (effective):  {{ effective_sanlock_io }}s{% if sanlock_io_is_default %} (DEFAULT - tuning not applied){% endif %}
+          sanlock service:         {{ svc_map.sanlock | default('?') }}
+      tags: sanlock
+
+    - name: "[REPORT] Multipath only"
+      debug:
+        msg: |
+          [MULTIPATH] {{ ansible_hostname }}
+          multipathd:               {{ svc_map.multipathd | default('?') }}
+          Drop-in:                  {{ multipath_dropin }} {{ '(EXISTS)' if multipath_dropin_exists else '(NOT FOUND)' }}
+          polling_interval:         {{ (mp_polling.stdout | default('') | trim) if (mp_polling is defined and (mp_polling.stdout | default('') | trim) != '') else 'unknown' }}
+          no_path_retry:            {{ (mp_no_path_retry.stdout | default('') | trim) if (mp_no_path_retry is defined and (mp_no_path_retry.stdout | default('') | trim) != '') else 'unknown' }}
+          expected no_path_retry:   {{ expected_no_path_retry }}
+          sync status:              {{ mp_sync_status }}
+          multipath -t validation:  {{ 'PASSED' if (multipath_validate is defined and multipath_validate.rc is defined and multipath_validate.rc == 0) else 'skipped' }}
+      tags: multipath
+
+    - name: "[REPORT] HA only"
+      debug:
+        msg: |
+          [HA] {{ ansible_hostname }}
+          agent.conf:               {{ 'EXISTS' if ha_agent_exists else 'NOT FOUND (not a HE host)' }}
+          monitoring_interval:      {{ effective_ha_mon }}s
+          connection_timeout:       {{ (ha_conn_timeout.stdout | default('') | trim) if (ha_conn_timeout is defined and (ha_conn_timeout.stdout | default('') | trim) != '') else 'default' }}
+          ovirt-ha-agent:           {{ svc_map['ovirt-ha-agent'] | default('?') }}
+          ovirt-ha-broker:          {{ svc_map['ovirt-ha-broker'] | default('?') }}
+      tags: ha
+
+    - name: "[REPORT] Libvirt only"
+      debug:
+        msg: |
+          [LIBVIRT] {{ ansible_hostname }}
+          keepalive_interval:       {{ (libvirt_keepalive_int.stdout | default('') | trim) if (libvirt_keepalive_int is defined and (libvirt_keepalive_int.stdout | default('') | trim) != '') else 'default' }}
+          keepalive_count:          {{ (libvirt_keepalive_cnt.stdout | default('') | trim) if (libvirt_keepalive_cnt is defined and (libvirt_keepalive_cnt.stdout | default('') | trim) != '') else 'default' }}
+          libvirtd service:         {{ svc_map.libvirtd | default('?') }}
+      tags: libvirt
+
+    - name: "[REPORT] Storage only"
+      debug:
+        msg: |
+          [STORAGE] {{ ansible_hostname }}
+          {% if storage_mounts is defined and storage_mounts.stdout is defined and storage_mounts.stdout != '' %}
+          {{ storage_mounts.stdout | indent(2, true) }}
+          {% else %}
+          No oVirt storage mounts found
+          {% endif %}
+      tags: storage
+
+    - name: "[REPORT] Recent logs"
+      debug:
+        msg: |
+          ====================================================
+          Recent Issues - Last {{ log_lookback_minutes_effective }} minutes: {{ ansible_hostname }}
+          ====================================================
+          [VDSM Errors]
+          {% if log_vdsm is defined and log_vdsm.stdout is defined and log_vdsm.stdout != '' %}
+          {{ log_vdsm.stdout | indent(2, true) }}
+          {% else %}
+            No errors
+          {% endif %}
+          
+          [Sanlock Issues]
+          {% if log_sanlock is defined and log_sanlock.stdout is defined and log_sanlock.stdout != '' %}
+          {{ log_sanlock.stdout | indent(2, true) }}
+          {% else %}
+            No issues
+          {% endif %}
+          
+          [HA Agent Warnings]
+          {% if log_ha is defined and log_ha.stdout is defined and log_ha.stdout != '' %}
+          {{ log_ha.stdout | indent(2, true) }}
+          {% else %}
+            No warnings
+          {% endif %}
+          ====================================================
+      tags:
+        - logs
+        - never
+
+# =============================================================
+# PLAY 2: ENGINE VERIFICATION (queries engine via inventory)
+# =============================================================
+- name: "OLVM HA Verification - Engine"
+  hosts: ovirt_engine
+  become: yes
+  gather_facts: yes
+  any_errors_fatal: false
+  
+  vars:
+    # Tunable parameters (kept in sync with olvm-ha-tuning.yml engine_settings)
+    engine_check_params:
+      # Host monitoring / fencing
+      - 'VdsRefreshRate'
+      - 'ServerRebootTimeout'
+      - 'TimeoutToResetVdsInSeconds'
+      - 'VDSAttemptsToResetCount'
+      - 'vdsConnectionTimeout'
+      - 'VdsRecoveryTimeoutInMinutes'
+      - 'NetworkConnectivityCheckTimeoutInSeconds'
+      - 'HostPreparingForMaintenanceIdleTime'
+      # Storage / SPM
+      - 'StoragePoolRefreshTimeInSeconds'
+      - 'SpmCommandFailOverRetries'
+      - 'SPMFailOverAttempts'
+      - 'MaxStorageVdsDelayCheckSec'
+      - 'MaxStorageVdsTimeoutCheckSec'
+      # VM rerun
+      - 'NumberOfFailedRunsOnVds'
+      - 'MaxRerunVmOnVdsCount'
+      # Power management
+      - 'FenceQuietTimeBetweenOperationsInSec'
+      - 'PMHealthCheckIntervalInSec'
+    
+    # Parameters we display but do NOT modify (for operator awareness)
+    engine_verify_only:
+      - 'vdsTimeout'
+      - 'vdsRetries'
+      - 'EnableAutomaticHostPowerManagement'
+      - 'PMHealthCheckEnabled'
+      - 'FenceKdumpListenerTimeout'
+      - 'FenceKdumpMessageInterval'
+      - 'FenceStartStatusRetries'
+      - 'FenceStartStatusDelayBetweenRetriesInSec'
+      - 'FenceStopStatusRetries'
+      - 'FenceStopStatusDelayBetweenRetriesInSec'
+      - 'KdumpStartedTimeout'
+      - 'DelayResetForSpmInSeconds'
+      - 'VmGracefulShutdownTimeout'
+      - 'AsyncTaskPollingRate'
+      - 'StorageDomainFailureTimeoutInMinutes'
+  
+  tasks:
+    - name: "[ENGINE] Check if running on engine host"
+      command: systemctl is-active ovirt-engine
+      register: engine_active
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      tags:
+        - engine
+        - always
+    
+    - name: "[ENGINE] Skip rest of play if ovirt-engine is not active"
+      meta: end_host
+      when: engine_active.rc != 0
+    
+    - name: "[ENGINE] Get engine package version"
+      shell: "rpm -q ovirt-engine --queryformat '%{VERSION}-%{RELEASE}' 2>/dev/null || echo 'NOT_INSTALLED'"
+      register: engine_pkg
+      changed_when: false
+      check_mode: no
+      tags:
+        - engine
+        - always
+    
+    - name: "[ENGINE] List all available engine-config parameters"
+      command: /usr/bin/engine-config -l
+      register: engine_params_available
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      tags:
+        - engine
+        - always
+    
+    - name: "[ENGINE] Identify supported parameters (tunable)"
+      set_fact:
+        engine_supported: "{{ engine_check_params | select('in', engine_params_available.stdout) | list }}"
+        engine_unsupported: "{{ engine_check_params | reject('in', engine_params_available.stdout) | list }}"
+        engine_verify_supported: "{{ engine_verify_only | select('in', engine_params_available.stdout) | list }}"
+        # Play vars are NOT visible via hostvars from the aggregate play, so we
+        # persist the totals as facts (otherwise the summary printed "X / 0").
+        engine_check_total: "{{ engine_check_params | length }}"
+        engine_supported_count: "{{ (engine_check_params | select('in', engine_params_available.stdout) | list) | length }}"
+      tags:
+        - engine
+        - always
+    
+    - name: "[ENGINE] Get current value for each tunable parameter"
+      command: "/usr/bin/engine-config -g {{ item }}"
+      register: engine_param_values
+      loop: "{{ engine_supported }}"
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      tags:
+        - engine
+        - always
+    
+    - name: "[ENGINE] Get current value for each verify-only parameter"
+      command: "/usr/bin/engine-config -g {{ item }}"
+      register: engine_verify_values
+      loop: "{{ engine_verify_supported }}"
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      tags:
+        - engine
+        - always
+    
+    - name: "[ENGINE] Build tunable parameter value map"
+      set_fact:
+        engine_param_map: >-
+          {{
+            engine_param_map | default({}) |
+            combine({item.item: ((item.stdout | default('?')) | regex_replace(' version:.*$', '') | regex_replace('^[^:]*:[ ]*', '') | trim)})
+          }}
+      loop: "{{ engine_param_values.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags:
+        - engine
+        - always
+    
+    - name: "[ENGINE] Build verify-only parameter value map"
+      set_fact:
+        engine_verify_map: >-
+          {{
+            engine_verify_map | default({}) |
+            combine({item.item: ((item.stdout | default('?')) | regex_replace(' version:.*$', '') | regex_replace('^[^:]*:[ ]*', '') | trim)})
+          }}
+      loop: "{{ engine_verify_values.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags:
+        - engine
+        - always
+    
+    - name: "[ENGINE] Get ovirt-engine service uptime"
+      shell: |
+        systemctl show ovirt-engine --property=ActiveEnterTimestamp 2>/dev/null | cut -d= -f2 || echo "unknown"
+      register: engine_uptime
+      changed_when: false
+      failed_when: false
+      check_mode: no
+      tags:
+        - engine
+        - full
+    
+    - name: "[ENGINE] Report - Quick / Full"
+      debug:
+        msg: |
+          ====================================================
+          Engine Verification: {{ ansible_hostname }} ({{ ansible_default_ipv4.address | default('?') }})
+          ====================================================
+          ovirt-engine package:   {{ engine_pkg.stdout | default('?') }}
+          ovirt-engine service:   {{ engine_active.stdout | default('?') }}
+          {% if engine_uptime is defined and engine_uptime.stdout is defined and engine_uptime.stdout != 'unknown' %}
+          Service started:        {{ engine_uptime.stdout | trim }}
+          {% endif %}
+          
+          [Tunable HA Parameters] ({{ engine_supported | length }} / {{ engine_check_params | length }} supported)
+          {% for p in engine_check_params %}
+          {% if p in engine_supported %}
+            {{ '%-42s' | format(p + ':') }} {{ engine_param_map[p] | default('?') }}
+          {% else %}
+            {{ '%-42s' | format(p + ':') }} not available in this OLVM version
+          {% endif %}
+          {% endfor %}
+          
+          [Informational - NOT tuned] ({{ engine_verify_supported | length }} / {{ engine_verify_only | length }} present)
+          {% for p in engine_verify_only %}
+          {% if p in engine_verify_supported %}
+            {{ '%-42s' | format(p + ':') }} {{ engine_verify_map[p] | default('?') }}
+          {% endif %}
+          {% endfor %}
+          
+          Notes:
+            - vdsTimeout (180s) and vdsRetries (0) are kept at defaults
+              per oVirt HA guidance — DO NOT change.
+            - kdump fence settings need lockstep tuning with listener config.
+          ====================================================
+      tags:
+        - engine
+        - quick
+        - full
+    
+    - name: "[ENGINE] Report - Engine only (--engine tag)"
+      debug:
+        msg: |
+          [ENGINE TUNABLE PARAMETERS] {{ ansible_hostname }}
+          {% for p in engine_supported %}
+            {{ p }} = {{ engine_param_map[p] | default('?') }}
+          {% endfor %}
+          {% if engine_unsupported %}
+          
+          [NOT AVAILABLE IN THIS OLVM VERSION]
+          {% for p in engine_unsupported %}
+            {{ p }}
+          {% endfor %}
+          {% endif %}
+          
+          [INFORMATIONAL - DEFAULTS PRESERVED]
+          {% for p in engine_verify_only %}
+          {% if p in engine_verify_supported %}
+            {{ p }} = {{ engine_verify_map[p] | default('?') }}
+          {% endif %}
+          {% endfor %}
+      tags: engine
+
+
+# =============================================================
+# PLAY 3: AGGREGATE SUMMARY (runs on control node)
+# =============================================================
+- name: "OLVM HA Verification - Aggregate Summary"
+  hosts: localhost
+  gather_facts: no
+  any_errors_fatal: false
+  
+  tasks:
+    - name: "[SUMMARY] Build aggregate report"
+      debug:
+        msg: |
+          ====================================================
+          OLVM HA Verification - Aggregate Summary (v4.22)
+          ====================================================
+          Hypervisor Hosts:
+            Total:        {{ groups['ovirt_hosts'] | default([]) | length }}
+            Reached:      {{ groups['ovirt_hosts'] | default([]) | map('extract', hostvars) | selectattr('ansible_hostname', 'defined') | list | length }}
+            With tuning:  {{ groups['ovirt_hosts'] | default([]) | map('extract', hostvars) | selectattr('vdsm_dropin_exists', 'defined') | selectattr('vdsm_dropin_exists', 'equalto', true) | list | length }}
+          ----------------------------------------------------
+          {% for host in (groups['ovirt_hosts'] | default([])) %}
+          {% set h = hostvars[host] %}
+          {% if h.ansible_hostname is defined %}
+          {{ h.ansible_hostname }}:
+            failover:     ~{{ h.estimated_failover | default('?') }}s ({{ h.failover_class | default('?') }})
+            tuning:       {{ 'APPLIED' if (h.vdsm_dropin_exists | default(false)) else 'NOT APPLIED' }}
+            mp_sync:      {{ h.mp_sync_status | default('?') }}
+          {% else %}
+          {{ host }}: UNREACHABLE
+          {% endif %}
+          {% endfor %}
+          ----------------------------------------------------
+          Engine ({{ groups['ovirt_engine'] | default([]) | length }} host(s)):
+          {% for host in (groups['ovirt_engine'] | default([])) %}
+          {% set h = hostvars[host] %}
+          {% if h.engine_active is defined and h.engine_active.rc == 0 %}
+            {{ h.ansible_hostname | default(host) }}:
+              ovirt-engine:    {{ h.engine_active.stdout | default('?') }}
+              version:         {{ h.engine_pkg.stdout | default('?') }}
+              params tuned:    {{ h.engine_supported_count | default(h.engine_supported | default([]) | length) }} / {{ h.engine_check_total | default('?') }}
+          {% elif h.engine_active is defined %}
+            {{ h.ansible_hostname | default(host) }}: ovirt-engine NOT ACTIVE
+          {% else %}
+            {{ host }}: UNREACHABLE
+          {% endif %}
+          {% endfor %}
+          ====================================================
+      run_once: true
+      tags:
+        - quick
+        - full
+        - engine

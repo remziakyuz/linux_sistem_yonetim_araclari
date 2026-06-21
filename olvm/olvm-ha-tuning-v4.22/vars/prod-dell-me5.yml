@@ -1,0 +1,82 @@
+---
+# vars/prod-dell-me5.yml
+# Version: 4.22
+# =====================================================================
+# PRODUCTION profile for the Dell EMC PowerVault ME5 (iSCSI, ALUA) target.
+#
+# Relationship to the lab profile (vars/lab-akyuz.yml):
+#   The lab and this production stack run the SAME OLVM 4.5.5 / VDSM 4.50 /
+#   OEL 8.10 hosted-engine software. Therefore the host-FILE findings from the
+#   lab are software properties, NOT storage properties, and apply HERE too:
+#     - libvirtd.conf keepalive_interval=-1 is set by vdsm -> leave it.
+#     - sanlock lease io_timeout is set by VDSM, not sanlock.conf.
+#     - agent.conf uses a [score] section, not [agent] monitoring_interval.
+#   So the same sections are OFF here as in the lab.
+#
+#   The ONE storage-specific difference: this array IS a Dell ME5, and the
+#   multipath built-in hardware table on this multipath version (0.8.4-44.el8_10)
+#   has NO DellEMC/ME5 entry (verified from the lab discovery). Without an
+#   explicit device {} stanza, ME5 LUNs fall under `defaults`
+#   (prio=const, path_grouping_policy=failover) = WRONG for an ALUA array.
+#   So the ME5 device block is turned ON here, with the ALUA attributes from the
+#   Dell PowerVault ME5 Administrator's Guide.
+#
+# BEFORE PRODUCTION USE:
+#   1. Run olvm-discovery.py on a Dell host and confirm:
+#        - exact vendor/product strings:   multipath -v3
+#        - whether ALUA already auto-detects: multipath -ll  (hwhandler='1 alua')
+#        - current engine-config values (delta vs the targets below)
+#   2. Adjust multipath_me5_vendor/product if `multipath -v3` shows a different
+#      string (e.g. a trailing space: "DellEMC ").
+#   3. Apply with --no-restart first (stage), validate, then schedule restarts.
+#
+# Run:
+#   ./setup.sh custom -i inventory-prod-dell-me5.yml -e @vars/prod-dell-me5.yml --no-restart
+# =====================================================================
+
+# ---- Host-file sections: same correct decisions as the lab ----
+vdsm_apply_vars_section: false   # heartbeat_interval/host_monitor_timeout not a
+                                 # verified VDSM schema on 4.50.
+apply_sanlock_conf: false        # lease io_timeout is set by VDSM, not sanlock.conf.
+apply_ha_agent: false            # real agent.conf uses [score], not [agent] keys.
+apply_libvirt_keepalive: false   # vdsm deliberately sets keepalive_interval=-1.
+
+# ---- Engine-config (storage-independent; identical to the lab) ----
+# 4 real changes vs stock 4.5.5 defaults: VdsRefreshRate 3->2,
+# vdsConnectionTimeout 20->(8), FenceQuietTimeBetweenOperationsInSec 180->60,
+# ServerRebootTimeout 600->300. The other 13 are drift-guards (no change).
+engine_vds_connection_timeout: 8
+
+# ---- Multipath: Dell ME5 device block ON (the storage-specific part) ----
+multipath_me5_device_block: true
+multipath_me5_vendor: "DellEMC"        # CONFIRM with: multipath -v3  (may be "DellEMC ")
+multipath_me5_product: "ME5"
+# Dell ME5 Administrator's Guide ALUA attributes (already the defaults below):
+multipath_me5_path_grouping_policy: "group_by_prio"
+multipath_me5_path_checker: "tur"
+multipath_me5_hardware_handler: "1 alua"
+multipath_me5_prio: "alua"
+multipath_me5_failback: "immediate"
+multipath_me5_rr_weight: "uniform"
+multipath_me5_path_selector: "service-time 0"
+multipath_polling_interval: 5
+
+# no_path_retry is derived (sanlock_io_timeout * 8 / polling_interval).
+# For fast HA failover prefer a small value instead of the large derived one:
+#   ./setup.sh custom -i inventory-prod-dell-me5.yml -e @vars/prod-dell-me5.yml \
+#             -e calculated_no_path_retry=8 --no-restart
+sanlock_io_timeout: 50
+sanlock_watchdog_fire_timeout: 35
+
+# ---- Values kept for completeness (their sections are OFF above) ----
+vdsm_heartbeat_interval: 10
+vdsm_host_monitor_timeout: 30
+vdsm_migration_timeout: 180
+ha_monitoring_interval: 10
+ha_connection_timeout: 12
+ha_score_penalty: 500
+ha_state_transition_timeout: 35
+libvirt_keepalive_interval: 5
+libvirt_keepalive_count: 5
+
+create_backup: true

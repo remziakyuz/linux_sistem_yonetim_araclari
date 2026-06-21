@@ -1,0 +1,73 @@
+---
+# vars/balanced.yml
+# Version: 4.22
+# ⭐ RECOMMENDED PROFILE - For most production environments ⭐
+#
+# Estimated failover (heuristic upper bound): ~130s  -> class BALANCED
+# Risk Level: Medium
+# Use Case: Standard production with reliable storage and network
+#
+# Tested on:
+#   - OLVM 4.5.5-1.67.el8
+#   - VDSM 4.50.5.1-8.el8
+#   - Oracle Linux 8.10
+#
+# Synchronization formula (integer-safe):
+#   no_path_retry = (sanlock_io_timeout * 8) / polling_interval
+#                 = (50 * 8) / 5 = 80
+#
+# Failover estimate formula (integer-safe, equivalent to *1.5):
+#   failover ~= (sanlock_io_timeout * 3 / 2) + (ha_monitoring_interval * 3) + 25
+#             = (50 * 3 / 2) + (10 * 3) + 25
+#             = 75 + 30 + 25 = 130s (heuristic upper bound; verify with a real failover test)
+#
+# Note: engine_* variables are no longer in this file.
+# Engine parameters are managed dynamically by the playbook
+# (only supported parameters in your OLVM version are applied).
+
+# ===== VDSM Settings =====
+vdsm_heartbeat_interval: 10
+vdsm_host_monitor_timeout: 30
+vdsm_migration_timeout: 180
+
+# ===== Sanlock Settings =====
+sanlock_io_timeout: 50
+sanlock_watchdog_fire_timeout: 35
+
+# ===== Multipath Settings =====
+multipath_polling_interval: 5
+
+# ===== HA Agent Settings =====
+ha_monitoring_interval: 10
+ha_connection_timeout: 12
+ha_score_penalty: 500
+ha_state_transition_timeout: 35
+
+# ===== Libvirt Settings =====
+libvirt_keepalive_interval: 5
+libvirt_keepalive_count: 5
+
+# ===== Backup Settings =====
+create_backup: true
+
+
+# ===== Multipath device-block scope (Dell EMC ME5) =====
+# multipath_me5_device_block:
+#   false (default) -> HA storage timeouts go in a GLOBAL `overrides {}` block
+#                      (applies to ALL arrays on the host).
+#   true            -> timeouts + Dell ME5 ALUA path attributes are scoped to a
+#                      `devices { device { vendor/product } }` stanza, so other
+#                      arrays keep their own defaults. Use this with a Dell ME5.
+# The ALUA attributes follow the Dell PowerVault ME5 Administrator's Guide.
+# Verify vendor/product on the host:  multipathd show paths format "%d %s"
+# Verify ALUA after applying:          multipath -v3 | grep -i alua
+multipath_me5_device_block: false
+multipath_me5_vendor: "DellEMC"
+multipath_me5_product: "ME5"
+multipath_me5_path_grouping_policy: "group_by_prio"
+multipath_me5_path_checker: "tur"
+multipath_me5_hardware_handler: "1 alua"
+multipath_me5_prio: "alua"
+multipath_me5_failback: "immediate"
+multipath_me5_rr_weight: "uniform"
+multipath_me5_path_selector: "service-time 0"

@@ -1,0 +1,79 @@
+---
+# vars/lab-akyuz.yml
+# Version: 4.22
+# =====================================================================
+# Environment-specific profile for the lab.akyuz.tech OLVM cluster,
+# derived from the olvm-discovery.py snapshot taken 2026-06-20
+# (olvm01 / olvm02 hosts, olvmm hosted-engine).
+#
+# Discovery findings that shaped this profile:
+#   * Hosted-engine deployment (ovirt-ha-agent + ovirt-ha-broker active).
+#   * Storage = LIO-ORG iSCSI software target
+#       target  : iqn.2025-01.com.sirket:storage01
+#       portal  : 172.16.166.248:3260
+#       devices : lv_ha_shared01_ / lv_ha_shared02_ (multipath, ALUA)
+#     -> NOT a Dell EMC ME5 array. ALUA is already auto-detected by
+#        multipath (hwhandler='1 alua', prio=50), so NO ME5 device block.
+#   * VDSM 4.50.5.1-8.el8 / sanlock 3.8.4 / multipath 0.8.4-44.el8_10 /
+#     libvirt 9.0.0 / Oracle Linux 8.10.
+#   * libvirtd.conf has keepalive_interval=-1 (set deliberately by vdsm) ->
+#     do NOT override it.
+#   * agent.conf uses a [score] section (base-score, *-score-penalty), not the
+#     [agent] monitoring_interval keys -> the playbook's HA-agent edits are not
+#     verified effective here, so they are OFF.
+#   * sanlock.conf has no io_timeout (oVirt sets the lease io_timeout via VDSM,
+#     not this file) -> sanlock.conf edits OFF.
+#
+# Net effect: on this lab the playbook tunes the TWO surfaces that are verified
+# effective here -> engine-config (4 real changes) and multipath overrides.
+# Everything else is disabled on purpose. Run:
+#   ./setup.sh custom -i inventory-lab-akyuz.yml -e @vars/lab-akyuz.yml --no-restart
+# (or copy these values into vars/custom.yml and run `custom`).
+# =====================================================================
+
+# ---- Section apply toggles (the important part for THIS environment) ----
+vdsm_apply_vars_section: false   # heartbeat_interval/host_monitor_timeout are
+                                 # not present in vdsm.conf here and are not a
+                                 # verified VDSM schema -> do not write them.
+apply_sanlock_conf: false        # io_timeout is not configured via sanlock.conf
+                                 # in oVirt -> writing it has no effect.
+apply_ha_agent: false            # real agent.conf uses [score]; the [agent]
+                                 # monitoring_interval keys are unverified here.
+apply_libvirt_keepalive: false   # vdsm sets keepalive_interval=-1 on purpose;
+                                 # forcing 5 would fight vdsm. Leave it alone.
+
+# ---- Engine-config (verified effective; 4 real changes vs stock defaults) ----
+# These are applied by the engine play regardless of profile; listed here for
+# visibility. Current lab values were the stock 4.5.5 defaults:
+#   VdsRefreshRate            3   -> 2
+#   vdsConnectionTimeout      20  -> (see below; softened to 8 for this lab)
+#   FenceQuietTimeBetween...  180 -> 60
+#   ServerRebootTimeout       600 -> 300
+# vdsConnectionTimeout=5 (the default target) is aggressive on a busy mgmt
+# network; 8 is a safer HA value for this lab.
+engine_vds_connection_timeout: 8
+
+# ---- Multipath (verified effective; global overrides for the LIO-ORG array) --
+multipath_me5_device_block: false      # LIO-ORG, not Dell ME5
+multipath_polling_interval: 5          # = current effective value
+# no_path_retry is derived as sanlock_io_timeout*8 / polling_interval. The LIO
+# target already advertises ALUA + queue_if_no_path. Pick per your priority:
+#   fast HA failover  -> small value (e.g. override: -e calculated_no_path_retry=8)
+#   ride-through      -> large value (the derived default)
+# sanlock_io_timeout below only feeds that derivation now (sanlock.conf is OFF).
+sanlock_io_timeout: 50
+sanlock_watchdog_fire_timeout: 35
+
+# ---- Values kept for completeness (their sections are OFF above) ----
+vdsm_heartbeat_interval: 10
+vdsm_host_monitor_timeout: 30
+vdsm_migration_timeout: 180
+ha_monitoring_interval: 10
+ha_connection_timeout: 12
+ha_score_penalty: 500
+ha_state_transition_timeout: 35
+libvirt_keepalive_interval: 5
+libvirt_keepalive_count: 5
+
+# ---- Backups ----
+create_backup: true

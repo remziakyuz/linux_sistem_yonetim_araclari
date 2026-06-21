@@ -1,0 +1,38 @@
+---
+# inventory-prod-dell-me5.yml
+# Version: 4.22
+# OLVM/oVirt inventory TEMPLATE for the Dell EMC ME5 production cluster.
+#
+# >>> FILL IN the real host/engine names and IPs before use. <<<
+# Storage on this cluster: Dell EMC PowerVault ME5 (iSCSI, ALUA).
+# Confirm the multipath vendor/product with `multipath -v3` on a host and set
+# multipath_me5_vendor/product in vars/prod-dell-me5.yml accordingly.
+
+all:
+  children:
+    ovirt_hosts:
+      hosts:
+        # >>> replace with your real Dell hosts <<<
+        olvmprod01.example.tld:
+          ansible_host: 10.0.0.11
+        olvmprod02.example.tld:
+          ansible_host: 10.0.0.12
+      vars:
+        ansible_user: root
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o ConnectTimeout=15'
+        # ansible_ssh_private_key_file: ~/.ssh/id_rsa
+
+    ovirt_engine:
+      hosts:
+        engine:
+          ansible_host: olvmprodmgr.example.tld   # >>> replace <<<
+      vars:
+        ansible_user: root
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o ConnectTimeout=15'
+
+  vars:
+    project_name: "OLVM HA Tuning"
+    project_version: "4.22"
+    lab_storage_vendor: "DellEMC"      # informational; confirm with multipath -v3
