@@ -1,0 +1,361 @@
+---
+# olvm-vm-ha-lease.yml
+# Version: 4.22
+# =====================================================================
+# Enable High Availability + assign a VM storage LEASE to critical VMs in
+# Oracle Linux Virtualization Manager (OLVM) / oVirt.
+#
+# WHY THIS MATTERS (roadmap item #3 - data integrity / anti-split-brain):
+#   A VM "lease" is a small record the running host holds on a shared storage
+#   domain. If a host becomes isolated, the engine can only safely restart that
+#   VM elsewhere once the lease shows the original host no longer holds it. The
+#   lease is the STORAGE-LEVEL guard that prevents the SAME VM from running on
+#   two hosts at once (split-brain -> disk corruption). "Highly Available" tells
+#   the engine to restart the VM after a host failure; the LEASE makes doing so
+#   safe. Use BOTH together for critical VMs.
+#
+# DESIGN: Zero external collections. This talks to the engine REST API using
+#   ONLY the ansible-core builtin `uri` module - consistent with the rest of
+#   this project (no ovirt.ovirt collection, no ovirt-engine-sdk-python needed).
+#   It runs FROM the control node against the engine over HTTPS (443).
+#
+# REQUIREMENTS:
+#   - The engine FQDN reachable on 443 from the control node.
+#   - An admin user (default admin@internal) and password.
+#   - The lease storage domain must be an ACTIVE data domain (V4+), and the
+#     VM's disks should live on shared storage.
+#
+# AUTH / SECRETS (do NOT put the password in plaintext):
+#   Provide engine_password via ansible-vault or extra-vars, e.g.
+#     ansible-playbook olvm-vm-ha-lease.yml -e @vars/ha-vms.yml \
+#       -e "engine_password=$(cat ~/.olvm_admin_pw)"
+#   or keep it in an ansible-vault file:
+#     ansible-vault create vars/engine-secret.yml   # engine_password: '...'
+#     ansible-playbook olvm-vm-ha-lease.yml -e @vars/ha-vms.yml \
+#       -e @vars/engine-secret.yml --ask-vault-pass
+#
+# USAGE:
+#   # Preview only (no change):
+#   ansible-playbook olvm-vm-ha-lease.yml -i inventory-lab-akyuz.yml \
+#     -e @vars/ha-vms.yml -e @vars/engine-secret.yml --ask-vault-pass --check
+#
+#   # Apply:
+#   ansible-playbook olvm-vm-ha-lease.yml -i inventory-lab-akyuz.yml \
+#     -e @vars/ha-vms.yml -e @vars/engine-secret.yml --ask-vault-pass
+#
+#   # Self-signed engine cert in a lab? add:  -e engine_validate_certs=false
+# =====================================================================
+
+- name: "OLVM - VM High Availability + Lease"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  any_errors_fatal: true
+
+  vars:
+    # ---- Connection ----
+    # Engine FQDN: override with -e engine_fqdn=..., otherwise derived from the
+    # ovirt_engine group in the inventory (first host's ansible_host).
+    engine_fqdn: >-
+      {{ (hostvars[groups['ovirt_engine'][0]].ansible_host
+          if (groups['ovirt_engine'] is defined and (groups['ovirt_engine'] | length) > 0)
+          else '') }}
+    engine_user: "admin@internal"
+    # engine_password: provided via vault / extra-vars (no default on purpose).
+    engine_validate_certs: true        # set false for a self-signed lab engine
+    engine_ca_file: ""                 # optional: path to the engine CA bundle
+    engine_api: "https://{{ engine_fqdn }}/ovirt-engine/api"
+    engine_sso: "https://{{ engine_fqdn }}/ovirt-engine/sso/oauth/token"
+
+    # ---- Behaviour ----
+    # state: present  -> enable HA and assign the lease
+    #        absent   -> disable HA (lease removal is best-effort; see notes)
+    ha_state: "present"
+
+    # ---- The VMs to manage ----
+    # Override via -e @vars/ha-vms.yml. Each entry:
+    #   name:                  (required) exact VM name
+    #   lease_storage_domain:  (required for present) data domain name for the lease
+    #   priority:              (optional) HA priority 1..100 (default 50 = medium)
+    #   resume_behavior:       (optional) auto_resume | leave_paused | kill
+    ha_vms: []
+
+  tasks:
+    - name: "[PRE] Validate inputs"
+      assert:
+        that:
+          - engine_fqdn | length > 0
+          - engine_password is defined and (engine_password | string | length) > 0
+          - ha_vms | length > 0
+        fail_msg: >-
+          Need engine_fqdn (or an ovirt_engine inventory host), engine_password
+          (vault/extra-vars), and a non-empty ha_vms list. See the header usage.
+        success_msg: "Inputs OK: engine={{ engine_fqdn }}, {{ ha_vms | length }} VM(s)."
+
+    - name: "[PRE] Validate each VM entry"
+      assert:
+        that:
+          - item.name is defined and (item.name | length) > 0
+          - (ha_state != 'present') or (item.lease_storage_domain is defined and (item.lease_storage_domain | length) > 0)
+          - (item.priority is not defined) or ((item.priority | int) >= 1 and (item.priority | int) <= 100)
+          - (item.resume_behavior is not defined) or (item.resume_behavior in ['auto_resume','leave_paused','kill'])
+        fail_msg: "Invalid ha_vms entry: {{ item }}"
+      loop: "{{ ha_vms }}"
+      loop_control:
+        label: "{{ item.name | default('?') }}"
+
+    # ---- Resolve common uri options once ----
+    - name: "[INIT] Assemble base validate/ca options"
+      set_fact:
+        _uri_common:
+          validate_certs: "{{ engine_validate_certs | bool }}"
+          ca_path: "{{ engine_ca_file if (engine_ca_file | length) > 0 else omit }}"
+
+    # =================================================================
+    # 1) AUTHENTICATE (SSO -> bearer token)
+    # =================================================================
+    - name: "[AUTH] Get SSO access token"
+      uri:
+        url: "{{ engine_sso }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: password
+          username: "{{ engine_user }}"
+          password: "{{ engine_password }}"
+          scope: "ovirt-app-api"
+        headers:
+          Accept: application/json
+        validate_certs: "{{ engine_validate_certs | bool }}"
+        ca_path: "{{ engine_ca_file if (engine_ca_file | length) > 0 else omit }}"
+        status_code: 200
+        return_content: true
+      register: sso
+      no_log: true
+      check_mode: no
+
+    - name: "[AUTH] Set auth header"
+      set_fact:
+        _api_headers:
+          Accept: application/json
+          Content-Type: application/json
+          Authorization: "Bearer {{ sso.json.access_token }}"
+      no_log: true
+
+    # =================================================================
+    # 2) RESOLVE STORAGE DOMAIN IDs (unique, only for present)
+    # =================================================================
+    - name: "[SD] Collect unique lease storage-domain names"
+      set_fact:
+        _sd_names: "{{ ha_vms | selectattr('lease_storage_domain','defined') | map(attribute='lease_storage_domain') | unique | list }}"
+
+    - name: "[SD] Look up each storage domain by name"
+      uri:
+        url: "{{ engine_api }}/storagedomains?search=name%3D{{ item | urlencode }}"
+        method: GET
+        headers: "{{ _api_headers }}"
+        validate_certs: "{{ engine_validate_certs | bool }}"
+        ca_path: "{{ engine_ca_file if (engine_ca_file | length) > 0 else omit }}"
+        status_code: 200
+        return_content: true
+      register: sd_lookups
+      loop: "{{ _sd_names }}"
+      loop_control:
+        label: "{{ item }}"
+      when: ha_state == 'present'
+      check_mode: no
+
+    - name: "[SD] Build storage-domain name->id map"
+      set_fact:
+        _sd_map: >-
+          {{ _sd_map | default({}) | combine({
+               item.item: (item.json.storage_domain[0].id)
+             }) }}
+      loop: "{{ sd_lookups.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item | default('?') }}"
+      when:
+        - ha_state == 'present'
+        - item.json is defined
+        - item.json.storage_domain is defined
+        - (item.json.storage_domain | length) == 1
+
+    - name: "[SD] Fail on any storage domain that did not resolve to exactly one match"
+      assert:
+        that:
+          - item in (_sd_map | default({}))
+        fail_msg: >-
+          Storage domain '{{ item }}' did not resolve to exactly one active
+          domain. Check the name (and that it is a data domain).
+      loop: "{{ _sd_names }}"
+      when: ha_state == 'present'
+
+    # =================================================================
+    # 3) RESOLVE VM IDs + CURRENT STATE
+    # =================================================================
+    - name: "[VM] Look up each VM by name"
+      uri:
+        url: "{{ engine_api }}/vms?search=name%3D{{ item.name | urlencode }}"
+        method: GET
+        headers: "{{ _api_headers }}"
+        validate_certs: "{{ engine_validate_certs | bool }}"
+        ca_path: "{{ engine_ca_file if (engine_ca_file | length) > 0 else omit }}"
+        status_code: 200
+        return_content: true
+      register: vm_lookups
+      loop: "{{ ha_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+      check_mode: no
+
+    - name: "[VM] Assert each VM resolved to exactly one match"
+      assert:
+        that:
+          - item.json is defined
+          - item.json.vm is defined
+          - (item.json.vm | length) == 1
+        fail_msg: >-
+          VM '{{ item.item.name }}' did not resolve to exactly one VM
+          (found {{ (item.json.vm | default([])) | length }}). Check the name.
+      loop: "{{ vm_lookups.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    # =================================================================
+    # 4) COMPUTE DESIRED CHANGES (idempotent)
+    # =================================================================
+    - name: "[PLAN] Build per-VM desired/current plan"
+      set_fact:
+        _plan: >-
+          {{ _plan | default([]) + [ {
+               'name': v.item.name,
+               'id': v.json.vm[0].id,
+               'cur_ha': ((v.json.vm[0].high_availability.enabled | default(false)) | bool),
+               'cur_priority': ((v.json.vm[0].high_availability.priority | default(0)) | int),
+               'cur_lease_sd': (v.json.vm[0].lease.storage_domain.id | default('')),
+               'want_ha': (ha_state == 'present'),
+               'want_priority': ((v.item.priority | default(50)) | int),
+               'want_lease_sd': ((_sd_map | default({}))[v.item.lease_storage_domain] | default(''))
+                                 if (ha_state == 'present') else '',
+               'resume_behavior': (v.item.resume_behavior | default('')),
+             } ] }}
+      loop: "{{ vm_lookups.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: "[PLAN] Mark which VMs need an update"
+      set_fact:
+        _plan2: >-
+          {{ _plan2 | default([]) + [ p | combine({
+               'needs_update': (
+                 (p.cur_ha != p.want_ha) or
+                 (p.want_ha and (p.cur_priority != p.want_priority)) or
+                 (p.want_lease_sd != p.cur_lease_sd)
+               )
+             }) ] }}
+      loop: "{{ _plan | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: "[PLAN] Show planned actions"
+      debug:
+        msg: >-
+          {{ p.name }}: HA {{ p.cur_ha }}->{{ p.want_ha }}
+          priority {{ p.cur_priority }}->{{ p.want_priority if p.want_ha else 'n/a' }}
+          lease '{{ p.cur_lease_sd | default('none') }}'->'{{ p.want_lease_sd | default('none') }}'
+          => {{ 'UPDATE' if p.needs_update else 'already correct' }}
+      loop: "{{ _plan2 | default([]) }}"
+      loop_control:
+        label: "{{ p.name }}"
+      vars:
+        p: "{{ item }}"
+
+    # =================================================================
+    # 5) APPLY (PUT only the VMs that differ; respects --check)
+    # =================================================================
+    - name: "[APPLY] Update VM HA + lease"
+      uri:
+        url: "{{ engine_api }}/vms/{{ p.id }}"
+        method: PUT
+        headers: "{{ _api_headers }}"
+        validate_certs: "{{ engine_validate_certs | bool }}"
+        ca_path: "{{ engine_ca_file if (engine_ca_file | length) > 0 else omit }}"
+        body_format: json
+        body: >-
+          {{
+            {
+              'high_availability': {
+                'enabled': p.want_ha,
+                'priority': (p.want_priority if p.want_ha else 1)
+              }
+            }
+            | combine(
+                ({'lease': {'storage_domain': {'id': p.want_lease_sd}}} if (p.want_ha and (p.want_lease_sd | length) > 0)
+                 else ({'lease': {}} if (not p.want_ha) else {}))
+              )
+            | combine(
+                ({'storage_error_resume_behaviour': p.resume_behavior} if (p.resume_behavior | length) > 0 else {})
+              )
+          }}
+        status_code: 200
+        return_content: true
+      register: vm_updates
+      loop: "{{ _plan2 | default([]) }}"
+      loop_control:
+        label: "{{ p.name }}"
+      vars:
+        p: "{{ item }}"
+      when:
+        - p.needs_update
+        - not ansible_check_mode
+      changed_when: true
+
+    - name: "[APPLY] Note for check mode"
+      debug:
+        msg: "CHECK MODE: no changes were sent. {{ (_plan2 | selectattr('needs_update') | list | length) }} VM(s) would be updated."
+      when: ansible_check_mode
+
+    # =================================================================
+    # 6) VERIFY + SUMMARY
+    # =================================================================
+    - name: "[VERIFY] Re-read each VM"
+      uri:
+        url: "{{ engine_api }}/vms/{{ p.id }}?detail=high_availability"
+        method: GET
+        headers: "{{ _api_headers }}"
+        validate_certs: "{{ engine_validate_certs | bool }}"
+        ca_path: "{{ engine_ca_file if (engine_ca_file | length) > 0 else omit }}"
+        status_code: 200
+        return_content: true
+      register: vm_verify
+      loop: "{{ _plan2 | default([]) }}"
+      loop_control:
+        label: "{{ p.name }}"
+      vars:
+        p: "{{ item }}"
+      when: not ansible_check_mode
+      check_mode: no
+
+    - name: "[VERIFY] Summary"
+      debug:
+        msg: |
+          ====================================================
+          VM HA + Lease - Summary ({{ ha_state }})
+          ====================================================
+          Engine: {{ engine_fqdn }}
+          {% for r in (vm_verify.results | default([])) %}
+          {% if r.json is defined %}
+          {{ r.item.name }}:
+            HA enabled: {{ r.json.high_availability.enabled | default('?') }}
+            priority:   {{ r.json.high_availability.priority | default('?') }}
+            lease SD:   {{ r.json.lease.storage_domain.id | default('(none)') }}
+          {% endif %}
+          {% endfor %}
+          {% if ansible_check_mode %}
+          (check mode - values above reflect the state BEFORE any change)
+          {% endif %}
+          ====================================================
+          NOTE: 'state: absent' disables HA and attempts to clear the lease, but
+          lease-removal semantics vary by engine version - verify in the portal
+          (Edit VM > High Availability) and prefer the UI if in doubt.
+          ====================================================
