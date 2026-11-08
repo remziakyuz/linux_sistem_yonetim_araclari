@@ -10,8 +10,24 @@
 # NOT: Standart PCP proc PMDA'sinda proses-bazli network metrigi YOKTUR
 # (kernel /proc altinda bunu sunmaz). Network bolumu bu yuzden sistem
 # geneli interface bazlidir. Proses-bazli network icin pcp-pmda-bcc
-# (bcc.proc.net.*) veya netatop gerekir; arsivde bcc metrigi varsa
+# (bcc.proc.net.{tcp,udp}.{send,recv}.bytes) veya netatop gerekir; arsivde bcc metrigi varsa
 # script bunu otomatik raporlar.
+#
+# Surum 1.2 (2026-10-26): bcc metrik adlari duzeltildi - netproc modulu
+#   bcc.proc.net.{tcp,udp}.{send,recv}.bytes uretir; 1.1 olmayan bcc.proc.net.tcp.tx/rx
+#   adini ariyordu ve bcc kurulu olsa da surec bazli ag bolumu hic dolmuyordu.
+# Surum 1.1 (2026-10-19): pcp-setup projesinden depoya alindi (tools/ altinda
+# CEVRIMDISI arac; sunuculara kurulmaz). Sos icindeki arsivler icin:
+#   tools/pcp-top-apps.sh -A <sos>/var/log/pcp/pmlogger/<makine> -d 7 -o rapor.txt
+# Gun secimi arsiv dosya adindan (YYYYMMDD) yapilir; ortalama/tepe degerleri saat
+# diliminden bagimsizdir. Saatli inceleme icin PCP araclarinda -Z <sos etc/localtime>
+# kullanilir (proje kurali).
+#
+# YUK NOTU (sisteme yuk bindirmeme kurali):
+#   pmlogsummary her gunluk arsivi bastan sona okur: arsiv basina ~30 sn tek
+#   cekirdek, -j ile en cok 4 arsiv paralel (4 cekirdek, birkac dakika) + arsiv
+#   boyutu kadar disk okuma. Analiz makinesinde kosulur; canli ortam sunucusunda
+#   KOSULMAZ (etkisi olculmedi). Zorunlu kalirsa: -j 1 ve 'nice -n 19 ionice -c3'.
 #
 # Gereksinimler: pcp (pmlogsummary, pminfo), gawk
 # Arsivlerde proc.* metrikleri loglanmis olmalidir (bkz. script sonundaki uyari).
@@ -92,6 +108,10 @@ if [ ${#ARCHIVES[@]} -eq 0 ]; then
     exit 2
 fi
 echo "Bulunan arsiv sayisi: ${#ARCHIVES[@]} ($ARCHIVE_DIR, son $DAYS gun)" >&2
+# Rapor basligi arsivin kaydedildigi makineyi yazar (cevrimdisi kullanimda analiz
+# makinesinin adi yanlis olur); arsiv etiketinden okunamazsa yerel ad.
+ARSIV_HOST=$(pmdumplog -l "${ARCHIVES[0]}" 2>/dev/null | awk '/^Performance metrics from host/ {print $5; exit}')
+[ -n "$ARSIV_HOST" ] || ARSIV_HOST=$(hostname)
 
 # --- proc metrikleri loglanmis mi kontrol et ---
 HAVE_PROC=0; HAVE_UID=0
@@ -102,7 +122,7 @@ if [ $HAVE_PROC -eq 0 ]; then
     cat >&2 <<'EOF'
 UYARI: Arsivlerde proc.* (proses bazli) metrikler yok!
 Varsayilan pmlogger yapilandirmasi proses metriklerini KAYDETMEZ.
-Etkinlestirmek icin pcp-setup.sh calistirin ya da pmlogger yapilandirmasina
+Etkinlestirmek icin pcp-zeroconf kurun (playbook-pcp pcp-onlem) ya da pmlogger yapilandirmasina
 (control.d/local'daki -c ile gosterilen dosya) sunlari ekleyip pmlogger'i
 yeniden baslatin:
 
@@ -121,12 +141,12 @@ fi
 
 # proses bazli network var mi (pcp-pmda-bcc)?
 HAVE_BCCNET=0
-pminfo -a "${ARCHIVES[0]}" bcc.proc.net.tcp.tx >/dev/null 2>&1 && HAVE_BCCNET=1
+pminfo -a "${ARCHIVES[0]}" bcc.proc.net.tcp.send.bytes >/dev/null 2>&1 && HAVE_BCCNET=1
 
 METRICS="network.interface.in.bytes network.interface.out.bytes"
 [ $HAVE_PROC -eq 1 ]   && METRICS="proc.psinfo.utime proc.psinfo.stime proc.psinfo.rss proc.io.read_bytes proc.io.write_bytes $METRICS"
 [ $HAVE_UID -eq 1 ]    && METRICS="proc.id.uid $METRICS"
-[ $HAVE_BCCNET -eq 1 ] && METRICS="$METRICS bcc.proc.net.tcp.tx bcc.proc.net.tcp.rx"
+[ $HAVE_BCCNET -eq 1 ] && METRICS="$METRICS bcc.proc.net.tcp.send.bytes bcc.proc.net.tcp.recv.bytes bcc.proc.net.udp.send.bytes bcc.proc.net.udp.recv.bytes"
 
 # --- Her arsivi ozetle (paralel) ve tek gawk ile topla ---
 # pmlogsummary -lM cikti formati:
@@ -226,8 +246,8 @@ function flush_archive(    c, k, kk, u) {
     else if (metric == "proc.io.read_bytes")  { a_rd[cmd] += avg; a_prd[key] += avg }
     else if (metric == "proc.io.write_bytes") { a_wr[cmd] += avg; a_pwr[key] += avg }
     else if (metric == "proc.id.uid")         a_uid[key] = int(avg + 0.5)
-    else if (metric == "bcc.proc.net.tcp.tx") a_ntx[cmd] += avg
-    else if (metric == "bcc.proc.net.tcp.rx") a_nrx[cmd] += avg
+    else if (metric ~ /^bcc\.proc\.net\.(tcp|udp)\.send\.bytes$/) a_ntx[cmd] += avg
+    else if (metric ~ /^bcc\.proc\.net\.(tcp|udp)\.recv\.bytes$/) a_nrx[cmd] += avg
 }
 END {
     flush_archive()
@@ -265,7 +285,7 @@ fi
 
 {
     echo "==============================================================================="
-    echo " PCP TOP UYGULAMA RAPORU  -  $(hostname)"
+    echo " PCP TOP UYGULAMA RAPORU  -  $ARSIV_HOST"
     echo " Kapsam   : son $DAYS gun (bugun dahil), $NDAYS gun icin veri bulundu"
     echo " Arsiv    : $ARCHIVE_DIR (${#ARCHIVES[@]} arsiv, toplam $(gawk -v s="$TOTAL_DUR" 'BEGIN{printf "%.1f saat", s/3600}') kayit)"
     echo " Rapor    : $(date '+%F %T')  |  Top $TOPN, komut adina gore gruplu"
@@ -316,7 +336,7 @@ fi
         echo "--- NETWORK KULLANIMI (sistem geneli, interface bazli) -----------------------"
         echo " NOT: Standart PCP arsivlerinde proses bazli network metrigi yoktur."
         echo "      Uygulama bazli network icin 'pcp-pmda-bcc' kurup bcc.proc.net.tcp.*"
-        echo "      metriklerini loglayin; script bir sonraki calismada otomatik kullanir."
+        echo "      metriklerini loglayin (eBPF; etkisi olculmedi, bu yapilandirmada varsayilan KAPALI)."
         printf "%4s  %14s  %14s  %14s  %s\n" "#" "TOPLAM" "GELEN(RX)" "GIDEN(TX)" "INTERFACE"
         sort -t$'\t' -k1,1 -rn "$TMPD/net" | gawk -F'\t' '
             function h(b){ s="B KB MB GB TB PB"; split(s,u," "); i=1; while (b>=1024 && i<6){b/=1024;i++} return sprintf("%.2f %s",b,u[i]) }

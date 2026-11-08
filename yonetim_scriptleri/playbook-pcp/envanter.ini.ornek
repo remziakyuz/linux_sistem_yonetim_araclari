@@ -1,0 +1,46 @@
+# playbook-pcp envanteri (ornek)
+#
+# Bu playbook yalniz pcp_sunucular grubunda kosar (assert). Rol playbook'lari
+# (couchbase/temel/proxy/patroni/postgresql) PCP'yi kendi sunucularinda zaten
+# kurar; bu playbook ayni sunucuda kosarsa onlarin yonettigi ayarlara
+# (saklama gunu, kayit yapilandirmasi) DOKUNMAZ, yalniz raporlar.
+# AMACLAR VE PROJELER KARISTIRILMAZ.
+#
+# Gercek envanter (envanter.ini) .gitignore'da tutulur; bu dosyayi kopyalayin:
+#   cp envanter.ini.ornek envanter.ini
+# Testler YALNIZ test sunucularinda yapilir.
+
+[pcp_sunucular]
+sunucu1 ansible_host=192.0.2.31 ansible_user=root
+sunucu2 ansible_host=192.0.2.32 ansible_user=ansible ansible_become=true ansible_become_method=sudo
+
+# --- Karar degiskenleri (varsayilanlar pcp-onlem.yml icinde) -----------------
+# ONEMLI: asagidaki degiskenler playbook'un 'vars:' bolumundedir; ENVANTERE (host/grup degiskeni)
+# yazilan deger ETKISIZDIR ve sessizce yok sayilir. Yalniz ek degiskenle verilir:
+#   ansible-playbook ... -e uygulama_modu=uygula -e pmda_kapatma_karari=dokunma
+#   AWX: sablonun 'Ek degiskenler' alani. Asagidaki liste yalniz BASVURU icindir.
+# uygulama_modu=rapor|uygula            (varsayilan rapor: sistemde degisiklik YOK)
+# Varsayilan ACIK (yalniz uygula):
+#   kurulum_karari=dokunma              # pcp/pcp-system-tools kurma
+#   zeroconf_karari=dokunma             # pcp-zeroconf kurma
+#   proc_tum_surec_karari=gerekirse     # proc -A ekle (varsayilan dokunma: -A yerel kullaniciya tum surec ortamini acar)
+#   pcp_kurulum_bos_alan_mb=1536        # yeni kurulum bos alan kapisi (MB)
+#   saklama_karari=dokunma              # PMLOGGER_DAILY_PARAMS yazma
+# YALNIZ TEST ORTAMI - arsiv 3 gun (canli ortam 8-32 gun). Ek degiskenle verilir:
+#   -e pcp_saklama_hedef_gun=3 -e pcp_saklama_en_az_gun=3   (AWX: sablon ek degiskeni)
+#   pmrep_sablon_karari=dokunma         # /etc/pcp/pmrep/ozel.conf kurma
+#   dogrula_betigi_karari=dokunma       # /usr/local/bin/pcp-dogrula.sh kurma
+#   eski_kurulum_karari=dokunma         # eski pcp-setup izlerini tasima
+#   pmda_kapatma_karari=dokunma         # dm/dmcache/kvm/nfsclient/openmetrics/opentelemetry/prometheus PMDA kaldirma (yuk kurali)
+#   kayit_grubu_kapatma_karari=dokunma  # zoneinfo/buddyinfo kayit grubu kapatma (kesmeleri kapatan okuma)
+#   pcp_gece_karari=dokunma             # PCP gece isleri sabit saate yayma + gece raporu kapatma (vars uygula)
+#   pcp_gece_pencere_dk=120             # gunluk isler: RHEL 9/10 00:10 + 0-120 dk, RHEL 8 ailesi 03:10 + 0-120 dk
+#   pcp_kontrol_pencere_dk=29           # yarim saatlik isler 0-29 dk
+#   pcp_kapali_pmdalar=['dm','dmcache','kvm','nfsclient','openmetrics','opentelemetry','prometheus']   # varsayilan liste (opentelemetry: RHEL 10)
+#   pcp_kapali_kayit_gruplari=['memory/zoneinfo','memory/buddyinfo']
+# Varsayilan KAPALI (YUK NOTU - once test sunucusunda olcun):
+#   kayit_profili=tam|varsayilan        # vars dokunma
+#   hotproc_karari=uygula
+#   pmie_karari=uygula
+#   pcp_ek_pmdalar=['bonding']         # dm KULLANILAMAZ: pcp_kapali_pmdalar icindedir (yuk kurali)
+#   pcp_ek_paketler=['pcp-pmda-bonding']

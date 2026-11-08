@@ -1,0 +1,41 @@
+# {{ playbook_adi }} (playbook-pcp) tarafindan uretildi - elle degistirmeyin.
+# Kayit profili: tam (kayit_profili=tam). Liste kurulum anindaki canli metrik
+# agacindan uretilmistir. Bilerek DISLANANLAR:
+#   - turetilmis metrikler (PMID domain 511): pmcd yeniden basladiginda pmlogger
+#     hata dongusune girip pmlogger.log'u sisirebiliyor; analiz araclari bunlari
+#     temel metriklerden hesaplar
+#   - proc.psinfo.environ: sureclerin ortam degiskenleri (parola sizintisi riski)
+#   - proc.memory.maps: her surecin /proc/<pid>/maps dosyasini okur (mmap_lock;
+#     buyuk bellekli surecte etkisi OLCULMEDI)
+
+# --- disk ve ag: her disk, bolum ve ag karti ayri ---------------------------
+log mandatory on every {{ pcp_tam_diskag_aralik }} seconds {
+{{ pcp_tam_metrik.devnet }}
+}
+
+# --- sistem geneli: CPU, bellek, dosya sistemi, NFS -------------------------
+log mandatory on every {{ pcp_tam_aralik }} seconds {
+{{ pcp_tam_metrik.sys }}
+}
+
+# --- surec ayrintilari (kullanici kimlikleriyle) -----------------------------
+log mandatory on every {{ pcp_tam_aralik }} seconds {
+{{ pcp_tam_metrik.proc }}
+}
+{% if pcp_tam_metrik.hw | trim | length > 0 %}
+
+# --- donanim: sensorler, disk sagligi (SMART) -------------------------------
+log advisory on every {{ pcp_tam_donanim_aralik }} seconds {
+{{ pcp_tam_metrik.hw }}
+}
+{% endif %}
+
+# --- donanim envanteri (arsiv basina bir kez) --------------------------------
+log mandatory on once {
+{{ pcp_tam_metrik.hinv }}
+}
+
+[access]
+disallow .* : all;
+disallow :* : all;
+allow local:* : enquire;

@@ -1,0 +1,2104 @@
+---
+# ============================================================================
+# PCP KURULUM VE IZLEME YETENEKLERI PLAYBOOK'U
+#
+# KAPSAM      : RHEL 8/9 ve turevleri (Oracle Linux dahil; RHEL 10 bu surumle
+#               sinanmadi) ve Debian 13 (trixie). PCP (Performance
+#               Co-Pilot) paketlerinin kurulumu, pmcd/pmlogger'in etkinlestirilmesi,
+#               surec basina disk G/C gorunurlugu (proc PMDA -A, guvenlik
+#               kapilariyla), arsiv saklama gunu, inceleme sablonlari ve sunucuya
+#               salt okunur dogrulama betigi. Istege bagli (varsayilan KAPALI): tam
+#               kayit profili, hotproc, ek PMDA'lar, pmie esik alarmlari.
+#
+# TEK SAHIP ILKESI: couchbase/temel/proxy/patroni/postgresql rol playbook'lari,
+# pcp-merkezi betigi ya da log-saklama bu sunucuda PCP saklamasini yonetiyorsa saklama gunune
+# DOKUNULMAZ, yalniz raporlanir. pmlogger kayit yapilandirmasina varsayilan
+# dokunulmaz. /var/log/pcp disk korumasi log-saklama'nindir.
+#
+# KULLANIM:
+#   ansible-playbook -i envanter.ini pcp-onlem.yml                          # rapor (varsayilan)
+#   ansible-playbook -i envanter.ini pcp-onlem.yml -e uygulama_modu=uygula --check --diff
+#   ansible-playbook -i envanter.ini pcp-onlem.yml -e uygulama_modu=uygula -l <sunucu>
+#   ansible-playbook -i envanter.ini pcp-onlem.yml --tags dogrula
+#   Sablonda is tipi "check" = rapor; "run" + degisken uygulama_modu=uygula = uygulama.
+#
+# ILKELER:
+#   - Varsayilan uygulama_modu=rapor: sistemde HICBIR degisiklik yapilmaz.
+#   - YEDEKLEME: /var/backup/pcp-onlem/<orijinal dizin>/<dosya>-<damga>;
+#     taranan dizine yedek BIRAKILMAZ, HICBIR SEY SILINMEZ.
+#   - Dogrulamalar kosumu DURDURMAZ (bilgi kipi); bekleme kabuk icinde, ust sinirli.
+#   - serial: 1 - sunucular tek tek islenir, ilk hatada durulur.
+#
+# YUK NOTU (sisteme yuk bindirmeme kurali):
+#   Varsayilan acik adimlar:
+#   - Tespit: rpm (Debian: dpkg-query)/systemctl/df; 'pminfo -f proc.psinfo.pid' ve 'proc.io.read_bytes'
+#     root ve pcp kullanicisiyla birer kez (smaps OKUNMAZ); /var/log/pcp/pmlogger
+#     altinda gun basina 'du -cm'. Kisa surelidir; etkisi OLCULMEDI.
+#   - Uygula: dnf ile pcp/pcp-system-tools/pcp-zeroconf kurulumu (depo IO); Debian 13'te apt ile pcp/pcp-zeroconf
+#     (~6,5 MB; apt paket listesi yalniz kurulacak paket varsa ve 1 saatten eskiyse yenilenir). Debian paketi
+#     pmproxy'yi acilista baslayacak bicimde etkin birakir: bu kosum PCP'yi kurduysa pmproxy disable edilir,
+#     pcp-zeroconf bu kosumda kurulduysa pmie baslatilir (RHEL ile ayni son durum);
+#     proc -A gerekirse pmcd YENIDEN BASLATILIR (pmlogger birkac saniye ornek
+#     kaybeder). -A'nin actigi ek okumalar (/proc/<pid>/io, wchan) test
+#     ortaminda OLCULDU: 96 GB / %80 bellek baskisi altinda 30 GB'lik surecin
+#     bellek islemlerine etkisi yok; maliyetleri surec belleginden bagimsiz.
+#     smaps/maps/environ kayitta varsa ya da pmcd yerel degilse ya da pmproxy
+#     calisiyorsa -A eklenmez (README bolum 4).
+#   - PMDA kapatma: dm, kvm, nfsclient, openmetrics, opentelemetry kaldirilir; pmcd ve pmlogger
+#     yeniden baslatilir (birkac saniye ornek kaybi). Yuk AZALTAN adimdir: dm
+#     PMDA'si her device-mapper/multipath aygitina periyodik ioctl gonderiyordu.
+#   - Kayit grubu kapatma: zoneinfo/buddyinfo kaydi kapatilir (bolge kilidini kesmeler kapaliyken
+#     tutan okuma); pmlogger yeniden baslatilir. Yuk AZALTAN adimdir.
+#   - Gece isleri yayma: PCP zamanlayicilari (pmlogger_daily, pmie_daily, pmlogger_check, pmie_check)
+#     sunucunun kisa adindan hesaplanan sabit saate yayilir ve gece raporu (pmlogger_daily_report) kapatilir;
+#     drop-in yazimi + daemon-reload, zamanlayici yeniden baslatilmaz. Yuk AZALTAN adimdir: gece raporu her
+#     gece tum gun arsivini /var/tmp altina aciyordu (olculdu: isletim sistemi diski 60 sn dolu, yazma
+#     beklemesi 2,7 sn); paket varsayilaninda tum sunucular ayni dakikada calisiyordu. Gecis: ilk gecelerde
+#     pmlogger kendi suresi (-T) dolunca gunde bir yeniden baslar (birkac saniye ornek kaybi).
+#   Varsayilan KAPALI adimlar (etkisi OLCULMEDI; once test sunucusunda olcun):
+#   - kayit_profili=tam: ~700 disk/ag metrigi her disk/bolum/kart icin ayri ve
+#     tum surec agaci; arsiv boyutu belirgin artar. proc.memory.maps DISLANIR.
+#   - hotproc: proc PMDA her yenilemede tum surecleri esige gore degerlendirir.
+#   - pcp_ek_pmdalar: smart (smartctl ile disklere komut gonderir - SAN LUN'larinda
+#     etkisi bilinmiyor), sockets (ss komutu), perfevent (donanim sayaclari),
+#     lmsensors, systemd, mounts, bonding; her biri pmcd yeniden baslatmasi
+#     gerektirir. dm, kvm, nfsclient, openmetrics, opentelemetry kapatilir, burada kullanilamaz.
+#   - pmie: esik alarmlari syslog'a yazar (gunluk hacmi artar).
+#   - Sunucuya kurulan pcp-dogrula.sh: ~40 kisa PCP istemci komutu (1-3 dk);
+#     '-y' secenegi 2 cekirdekte ~40 sn CPU yuku URETIR - canli ortamda KOSULMAZ.
+# ============================================================================
+- name: PCP kurulum ve izleme yetenekleri
+  hosts: pcp_sunucular
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  environment:
+    PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  # Shell modulu /bin/sh ile kosar - RHEL'de bash (posix kipi), Debian'da DASH.
+  # Govdeler bash ister (16# taban, [[ ]], <<<, BASH_REMATCH, local): dash'te gece isleri hatayla durdu, failed_when: false
+  # olan bos alan kapisi SESSIZCE cikti vermedi (kapi atlandi). Yalniz Debian'da /bin/bash; RHEL'de yurutucu DEGISMEZ (omit).
+  module_defaults:
+    ansible.builtin.shell:
+      executable: "{{ '/bin/bash' if (ansible_facts['os_family'] | default('')) == 'Debian' else omit }}"
+
+  vars:
+    # =========================================================================
+    # YEDEKLEME ILKESI
+    # =========================================================================
+    playbook_adi: pcp-onlem
+    yedek_kok: "/var/backup/{{ playbook_adi }}"
+    yedek_damga: "{{ ansible_date_time.iso8601_basic_short | default('bilinmeyen') }}"
+    hedef_grup: pcp_sunucular
+
+    # --- UYGULAMA MODU: rapor = analiz/tespit/rapor +
+    #     dogrulama, sistemde degisiklik YOK; uygula = karar degiskenleri gecerli.
+    uygulama_modu: rapor                # rapor | uygula
+
+    # =========================================================================
+    # KARAR DEGISKENLERI - varsayilan ACIK (yalniz uygula modunda)
+    # =========================================================================
+    # pcp + pcp-system-tools kurulumu, pmcd + pmlogger etkin (yapilandirma karari:
+    # tum sunuculara PCP). pcp-zeroconf AYRI gorevde (tek dnf cagrisinda depoda
+    # zeroconf yoksa hicbir paket kurulmaz).
+    kurulum_karari: uygula              # uygula | dokunma
+    zeroconf_karari: uygula             # uygula | dokunma
+    # proc PMDA -A: proc PMDA istegi SORAN kullanicinin kimligiyle yanitlar; pmlogger
+    # 'pcp' kullanicisiyla calistigindan yalniz sahibine acik /proc dosyalari
+    # (/proc/<pid>/io, wchan, fd, maps, environ) diger kullanicilarin surecleri icin
+    # okunamaz -> arsivde surec basina disk G/C (proc.io.*) yalniz pcp'nin kendi
+    # sureclerinde olur (test ortami: root 221 / pcp 5 deger; surec SAYISI ayni
+    # oldugundan surec sayisi olcutu eksigi gormez). -A sorguyu root olarak yapar.
+    # -A YALNIZ su kosullarda eklenir: pcp kullanicisi root'un gordugu proc.io
+    # degerlerinin pcp_gorunurluk_orani yuzdesinden azini goruyor VE pmcd yalniz yerel
+    # baglanti kabul ediyor (PMCD_LOCAL=1; uzaktan kimliksiz istemci tum surec
+    # ayrintilarini okuyamasin) VE kayit yapilandirmasinda smaps/maps/environ YOK
+    # (-A bunlari tum surecler icin okunur kilar; smaps okumasi buyuk bellekli surecte donma yapar)
+    # VE pmproxy calismiyor (calisirsa uzak istemci pmcd verisine onun uzerinden ulasir).
+    # YUK OLCUMU (test ortami): -A'nin actigi /proc/<pid>/io ve wchan araliksiz
+    # okunurken (saniyede ~13 000) 1 GB'lik surecin mmap/munmap gecikmesi degismedi
+    # (p99 0,08 ms, taban 0,12); ayni yontemde smaps_rollup islem sayisini yariya
+    # indirdi (yontem hassas). Ayrinti README bolum 4.
+    # Varsayilan DOKUNMA. -A ile proc PMDA her istegi root olarak yanitlar;
+    # pmcd.conf [access] 'local:*' tum yerel hesaplara acik oldugundan root olmayan yerel kullanici tum sureclerin ortam
+    # degiskenlerini (proc.psinfo.environ - parola/belirtec olabilir) okuyabilir ve smaps/maps okumasi tetikleyebilir.
+    # Eksiklik yalniz raporlanir; onceden eklenmis -A'ya dokunulmaz. gerekirse = eski davranis (bilincli karar).
+    proc_tum_surec_karari: dokunma      # dokunma | gerekirse
+    # Yeni kurulum bos alan kapisi (bolum doldurulmaz): /var/log/pcp'nin bulunacagi bolumde bos alan bu degerden azsa ya da
+    # kurulum sonrasi bolum %80'i asacaksa PCP KURULMAZ, SORUN raporlanir. 1536 MB = ~2 ham gun (~500 MB/gun, TAHMIN; olculen
+    # aralik 200-1200 MB/gun) + 6 sikistirilmis gun + pay. Ayri ve bos 3 GB LV'de gecer; dolu kok bolumde durur.
+    pcp_kurulum_bos_alan_mb: 1536
+    # Yalniz TEST ortami: en az 8 gunun altindaki saklamaya izin verir. Canli ortamda TANIMLANMAZ.
+    pcp_test_ortami: false
+    pcp_gorunurluk_orani: 80
+    # -A varken kayitta bulunmamasi gereken (mmap_lock alan / gizli bilgi) surec metrikleri
+    pcp_a_riskli_desen: 'proc\.smaps|hotproc\.smaps|proc\.memory\.maps|psinfo\.environ'
+    # PMLOGGER_DAILY_PARAMS: yalniz baska sahip YOKSA yazilir (tek sahip ilkesi).
+    # Kural rol playbook'lariyla ayni: k = min(hedef, max(en az, 2 + (LV x oran
+    # - 2 x ham gun) / xz gun)); oran ayri bolumde 0,8, paylasilan bolumde
+    # pcp_paylasimli_oran; olcum yoksa en az gun.
+    saklama_karari: uygula              # uygula | dokunma
+    # hedef 32 gun: aylik periyodik yukler (ay 28-31 gun + 1 gun pay; yapilandirma karari)
+    pcp_saklama_hedef_gun: 32
+    pcp_saklama_en_az_gun: 8
+    # Gunluk arsiv boyutu gun gun oynar; mevcut -k degeri en_az..hesap araliginda ve hesabin en cok
+    # tolerans gun altindaysa KORUNUR (couchbase-onlem ile ayni kural) - yoksa dosya her gun yeniden yazilirdi
+    pcp_saklama_tolerans_gun: 2
+    # /var/log/pcp ayri bolum degilse alanin bu kadari PCP'ye sayilir (yapilandirma kurali, yuzde 25)
+    pcp_paylasimli_oran: 0.25
+    # PCP saklamasini yazan playbook'lar ve betikler (log-saklama PB_YONETIR tablosunda 'pcp'
+    # tasiyanlar). /var/backup/<ad> varsa sahip.
+    # pcp-merkezi: merkezi PCP toplama betigi istemcide yerel saklamayi -k N ile kisaltir.
+    pcp_saklama_yonetenler: [couchbase-onlem, temel-onlem, proxy-onlem, patroni-onlem, postgresql-onlem, pcp-merkezi]
+    # pmlogger kayit yapilandirmasini (pmlogconf config.default) degistiren playbook'lar
+    pcp_kayit_yonetenler: [couchbase-onlem]
+    # Inceleme sablonlari :canli :obur :agirlik -> /etc/pcp/pmrep/ozel.conf
+    # (~/.pcp/pmrep.conf ASLA olusturulmaz: /etc/pcp/pmrep altindaki hazir sablonlari gizler)
+    pmrep_sablon_karari: uygula         # uygula | dokunma
+    # Salt okunur dogrulama betigi (pcp_files/pcp-dogrula.sh) sunucuya kurulur
+    dogrula_betigi_karari: uygula       # uygula | dokunma
+    pcp_dogrula_yol: /usr/local/bin/pcp-dogrula.sh
+    # Eski pcp-setup kurulumu izleri: control.d altindaki *.pcp-setup.orig (PCP 7
+    # 'Duplicate pmlogger instances' ile pmlogger'i dusurur), taranan dizinlerdeki
+    # yedekler ve pcp-log-guard (log-saklama bekcisi varsa iki silici olur) ->
+    # /var/backup agacina tasinir. Bekci, log-saklama bekcisi YOKSA korunur.
+    eski_kurulum_karari: otomatik       # otomatik | dokunma
+    # Kapatilan PMDA'lar (yuk kurali): dm her device-mapper aygitina (multipath LUN dahil)
+    # DM_TABLE_STATUS ve DM_TARGET_MSG ioctl'u gonderir (pmie'nin hazir dmthin kurallari 10 dk'da bir
+    # 'dmsetup status --target thin-pool' calistirir); SAN'da etkisi OLCULMEDI. kvm (debugfs + perf iz
+    # noktasi), nfsclient ve openmetrics etkisi olculmedi, analizde kullanilmiyor; dmcache ve prometheus bu
+    # PMDA'larin eski adlaridir (dm/openmetrics Upgrade betigi eski satiri gorunce yenisini kurar). Kaldirma PMDA'nin
+    # kendi Remove betigiyle; pcp-zeroconf paket betigi pmcd.conf'ta '<ad>/pmda<ad>' gormezse PMDA'yi
+    # .NeedInstall ile GERI KURAR -> pmcd.conf'a isaret yorum satiri yazilir.
+    pmda_kapatma_karari: uygula         # uygula | dokunma
+    pcp_kapali_pmdalar: [dm, dmcache, kvm, nfsclient, openmetrics, opentelemetry, prometheus]
+    # Kesmeleri kapatan kayit gruplari (yuk kurali): /proc/zoneinfo ve /proc/buddyinfo okumasi cekirdekte bolge
+    # kilidini KESMELER KAPALIYKEN tutar (32 cekirdekte bolge basina en cok 127 us olculdu; sure cekirdek
+    # sayisiyla buyur); analiz araclari bu veriyi kullanmiyor. pmlogconf grup dosyasi 'force exclude' yapilir
+    # (%config(noreplace) - paket guncellemesinde korunur); pmlogger her baslarken pmlogconf -r ile yeniden
+    # yokladigi icin kayit yapilandirmasindaki durum satiri tek basina kalici DEGILDIR (olculdu).
+    kayit_grubu_kapatma_karari: uygula     # uygula | dokunma
+    pcp_kapali_kayit_gruplari: [memory/zoneinfo, memory/buddyinfo]
+    # Gece isleri yuk dagitimi (olcek kurali: ayni ayar 400-1000 VM): PCP zamanlayicilari paket varsayilaninda
+    # HER SUNUCUDA AYNI DAKIKADA calisir; sunucunun kisa adindan sabit kaydirmayla yayilir ve gece raporu
+    # (pmlogger_daily_report) kapatilir. Gunluk isler 00:10 + 0..yayma araligi dk, yarim saatlik isler 0..kontrol araligi dk (en cok 29).
+    pcp_gece_karari: uygula             # uygula | dokunma
+    pcp_gece_pencere_dk: 120
+    pcp_kontrol_pencere_dk: 29
+
+    # =========================================================================
+    # KARAR DEGISKENLERI - varsayilan KAPALI (YUK NOTU: etkisi olculmedi)
+    # =========================================================================
+    # dokunma = mevcut kayit yapilandirmasi korunur; tam = canli metrik agacindan
+    # config.pcp-tam uretilip birincil pmlogger ona yonlendirilir; varsayilan =
+    # birincil pmlogger pmlogconf config.default'a geri yonlendirilir.
+    kayit_profili: dokunma              # dokunma | tam | varsayilan
+    pcp_tam_diskag_aralik: 10           # sn; onerilen kayitla ayni (pcp-setup varsayilani 1 idi)
+    pcp_tam_aralik: 60                  # sn; sistem + surec gruplari
+    pcp_tam_donanim_aralik: 300         # sn; sensor/SMART
+    hotproc_karari: dokunma             # uygula | dokunma
+    pmie_karari: dokunma                # uygula | dokunma
+    pcp_pmie_kurallari:
+      - cpu.util
+      - cpu.load_average
+      - cpu.system
+      - memory.exhausted
+      - memory.swap_low
+      - filesys.filling
+      - filesys.vfs_files
+      - per_disk.average_wait_time
+      - per_netif.errors
+    pcp_pmie_esikleri:
+      - {kural: cpu.util, degisken: threshold, deger: '90%'}
+      - {kural: filesys.filling, degisken: threshold, deger: '90%'}
+    pcp_pmie_yapilandirma: /var/lib/pcp/config/pmie/config.default
+    # Ornek: ['bonding'] - her biri icin YUK NOTU'na bakin; pcp_kapali_pmdalar listesindekiler
+    # (dm, kvm, nfsclient, openmetrics) burada kullanilamaz (on kosul reddeder)
+    pcp_ek_pmdalar: []
+    # Ornek: ['pcp-pmda-dm', 'pcp-pmda-bonding'] (yalniz pcp-*, smartmontools, lm_sensors; Debian: lm-sensors)
+    pcp_ek_paketler: []
+
+    pcp_pmlogger_dizin: /var/lib/pcp/config/pmlogger
+    pcp_tam_ad: config.pcp-tam
+
+  handlers:
+    - name: Systemd yeniden oku
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+  tasks:
+    # =====================================================================
+    # ON KOSULLAR
+    # =====================================================================
+    - name: On kosul - dogru envanter, platform ve karar degiskenleri
+      ansible.builtin.assert:
+        that:
+          - hedef_grup in group_names
+          # RHEL 8/9/10 ailesi ya da Debian 13 (Ubuntu ve Debian 12 ve oncesi sinanmadi - os_family Debian olsa da reddedilir)
+          - (ansible_facts['os_family'] == 'RedHat' and ansible_facts['distribution_major_version'] | int >= 8)
+            or (ansible_facts['distribution'] == 'Debian' and ansible_facts['distribution_major_version'] | int == 13)
+          - uygulama_modu in ['rapor', 'uygula']
+          - kurulum_karari in ['uygula', 'dokunma']
+          - zeroconf_karari in ['uygula', 'dokunma']
+          - proc_tum_surec_karari in ['gerekirse', 'dokunma']
+          - saklama_karari in ['uygula', 'dokunma']
+          - pmrep_sablon_karari in ['uygula', 'dokunma']
+          - dogrula_betigi_karari in ['uygula', 'dokunma']
+          - eski_kurulum_karari in ['otomatik', 'dokunma']
+          - pmda_kapatma_karari in ['uygula', 'dokunma']
+          - kayit_grubu_kapatma_karari in ['uygula', 'dokunma']
+          - pcp_gece_karari in ['uygula', 'dokunma']
+          - (pcp_gece_pencere_dk | int) >= 30 and (pcp_gece_pencere_dk | int) <= 600
+          - (pcp_kontrol_pencere_dk | int) >= 5 and (pcp_kontrol_pencere_dk | int) <= 29
+          - pcp_kapali_kayit_gruplari is sequence and pcp_kapali_kayit_gruplari is not string
+          - pcp_kapali_pmdalar is sequence and pcp_kapali_pmdalar is not string
+          - (pcp_kapali_pmdalar | reject('match', '^[a-z0-9_]+$') | list | length) == 0
+          - (pcp_kapali_pmdalar | intersect(pcp_ek_pmdalar) | list | length) == 0
+          - (pcp_kapali_pmdalar | intersect(['root', 'pmcd', 'proc', 'linux', 'xfs', 'mmv', 'pmproxy']) | list | length) == 0
+          - kayit_profili in ['dokunma', 'tam', 'varsayilan']
+          - hotproc_karari in ['uygula', 'dokunma']
+          - pmie_karari in ['uygula', 'dokunma']
+          - (pcp_paylasimli_oran | float) > 0 and (pcp_paylasimli_oran | float) <= 0.8
+          - (pcp_gorunurluk_orani | int) >= 10 and (pcp_gorunurluk_orani | int) <= 100
+          - (pcp_saklama_en_az_gun | int) >= 2 and (pcp_saklama_en_az_gun | int) <= (pcp_saklama_hedef_gun | int)
+          # en az 8 gunun altina yalniz acik test ortami isaretiyle inilir (test ortami ayari canli ortama tasinirsa o gece
+          # eski PCP arsivi geri donussuz silinmesin)
+          - (pcp_saklama_en_az_gun | int) >= 8 or (pcp_test_ortami | default(false) | bool)
+          - (pcp_tam_diskag_aralik | int) >= 1 and (pcp_tam_aralik | int) >= 1 and (pcp_tam_donanim_aralik | int) >= 1
+          - pcp_ek_pmdalar is sequence and pcp_ek_pmdalar is not string
+          - (pcp_ek_pmdalar | reject('match', '^[a-z0-9_]+$') | list | length) == 0
+          - pcp_ek_paketler is sequence and pcp_ek_paketler is not string
+          - (pcp_ek_paketler | reject('match', '^(pcp-[a-z0-9-]+|smartmontools|lm_sensors|lm-sensors)$') | list | length) == 0
+        fail_msg: >-
+          Bu playbook yalniz '{{ hedef_grup }}' grubundaki RHEL 8/9/10 ailesi ve Debian 13 sunucularda kosar
+          ({{ ansible_facts['distribution'] | default('?') }} {{ ansible_facts['distribution_version'] | default('?') }}).
+          Gecerli degerler: uygulama_modu rapor|uygula; kararlar uygula|dokunma; proc_tum_surec_karari
+          gerekirse|dokunma; eski_kurulum_karari otomatik|dokunma; kayit_profili dokunma|tam|varsayilan;
+          pcp_ek_pmdalar PMDA adlari; pcp_ek_paketler yalniz pcp-*, smartmontools, lm_sensors (Debian: lm-sensors);
+          pcp_kapali_pmdalar PMDA adlari (temel PMDA'lar ve pcp_ek_pmdalar ile kesismez).
+          pcp_saklama_en_az_gun 8 altinda yalniz pcp_test_ortami=true ile (lab sablonu canli ortama kopyalanmasin).
+        quiet: true
+      tags: [always]
+
+    # Platform farklari: paket yoneticisi, paket adlari ve servis ayar dizini. Ayar dizini paket pcp.conf'undaki
+    # PCP_SYSCONFIG_DIR ile ayni (RHEL /etc/sysconfig, Debian /etc/default); PCP kurulu degilken de dosya adlari bilinsin diye
+    # platformdan belirlenir. Debian'da pcp-system-tools yoktur (araclar pcp paketindedir).
+    - name: On kosul - platform (RHEL ailesi / Debian 13)
+      ansible.builtin.set_fact:
+        pcp_aile: "{{ 'Debian' if ansible_facts['os_family'] == 'Debian' else 'RedHat' }}"
+        pcp_ayar_dizin: "{{ '/etc/default' if ansible_facts['os_family'] == 'Debian' else '/etc/sysconfig' }}"
+        pcp_timers_dosya: "{{ ('/etc/default' if ansible_facts['os_family'] == 'Debian' else '/etc/sysconfig') ~ '/pmlogger_timers' }}"
+        pcp_temel_paketler: "{{ ['pcp'] if ansible_facts['os_family'] == 'Debian' else ['pcp', 'pcp-system-tools'] }}"
+        pcp_depo_ipucu: "{{ 'Debian main deposu (apt kaynaklari)' if ansible_facts['os_family'] == 'Debian' else 'AppStream/BaseOS' }}"
+      tags: [always]
+
+    - name: On kosul - UYGULAMA MODU (rapor = degisiklik yok)
+      ansible.builtin.set_fact:
+        kurulum_karari: dokunma
+        zeroconf_karari: dokunma
+        proc_tum_surec_karari: dokunma
+        saklama_karari: dokunma
+        pmrep_sablon_karari: dokunma
+        dogrula_betigi_karari: dokunma
+        eski_kurulum_karari: dokunma
+        pmda_kapatma_karari: dokunma
+        kayit_grubu_kapatma_karari: dokunma
+        pcp_gece_karari: dokunma
+        kayit_profili: dokunma
+        hotproc_karari: dokunma
+        pmie_karari: dokunma
+        pcp_ek_pmdalar: []
+        pcp_ek_paketler: []
+      when: uygulama_modu != 'uygula'
+      tags: [always]
+
+    # -e / AWX ek degiskeni set_fact ile EZILEMEZ (oncelik): rapor modunda ek degiskenle 'uygula' karari verildiyse
+    # sessizce ve YEDEKSIZ degisiklik yapilirdi (yedek gorevi uygulama_modu=uygula kosullu) -> kosum basta durur.
+    - name: On kosul - rapor modunda ek degiskenle verilmis karar var mi?
+      ansible.builtin.assert:
+        that:
+          - kurulum_karari == 'dokunma'
+          - zeroconf_karari == 'dokunma'
+          - proc_tum_surec_karari == 'dokunma'
+          - saklama_karari == 'dokunma'
+          - pmrep_sablon_karari == 'dokunma'
+          - dogrula_betigi_karari == 'dokunma'
+          - eski_kurulum_karari == 'dokunma'
+          - pmda_kapatma_karari == 'dokunma'
+          - kayit_grubu_kapatma_karari == 'dokunma'
+          - pcp_gece_karari == 'dokunma'
+          - kayit_profili == 'dokunma'
+          - hotproc_karari == 'dokunma'
+          - pmie_karari == 'dokunma'
+          - pcp_ek_pmdalar | length == 0
+          - pcp_ek_paketler | length == 0
+        fail_msg: >-
+          uygulama_modu=rapor iken ek degiskenle (-e / AWX ek degiskeni) degisiklik karari verildi; rapor modunda hicbir
+          degisiklik yapilmaz ve yedek alinmaz. Uygulamak icin -e uygulama_modu=uygula ekleyin, yalniz rapor icin karar
+          degiskenlerini kaldirin.
+        quiet: true
+      when: uygulama_modu != 'uygula'
+      tags: [always]
+
+    - name: On kosul - uygulama modu bilgisi
+      ansible.builtin.debug:
+        msg: >-
+          {{ ('UYGULAMA MODU: rapor - sistemde HICBIR degisiklik yapilmaz (tespit/rapor + dogrulama);'
+              ~ ' uygulamak icin -e uygulama_modu=uygula')
+             if uygulama_modu != 'uygula' else
+             ('UYGULAMA MODU: uygula - kurulum=' ~ kurulum_karari ~ ', zeroconf=' ~ zeroconf_karari
+              ~ ', proc -A=' ~ proc_tum_surec_karari ~ ', saklama=' ~ saklama_karari
+              ~ ', sablon=' ~ pmrep_sablon_karari ~ ', dogrula betigi=' ~ dogrula_betigi_karari
+              ~ ', eski kurulum=' ~ eski_kurulum_karari ~ ', PMDA kapatma=' ~ pmda_kapatma_karari
+              ~ ' (' ~ (pcp_kapali_pmdalar | join(',') or 'yok') ~ '), kayit profili=' ~ kayit_profili
+              ~ ', hotproc=' ~ hotproc_karari ~ ', pmie=' ~ pmie_karari
+              ~ ', ek PMDA=' ~ (pcp_ek_pmdalar | join(',') or 'yok')) }}
+      tags: [always]
+
+    # =====================================================================
+    # KURULUM (paketler + pmcd/pmlogger; tespitten ONCE - dosyalar paketle gelir)
+    # =====================================================================
+    # Bos alan kapisi: PCP KURULU DEGILSE ya da pcp kurulu ama pcp-zeroconf kurulacaksa (zeroconf surec
+    # kaydini acar, gunluk arsiv hacmi artar - eskiden pcp kuruluyken kapi hic olcmuyordu); rapor kipinde de olcer.
+    - name: Kurulum - yeni PCP icin bos alan kapisi (bolum doldurulmaz)
+      ansible.builtin.shell: |
+        set -o pipefail
+        {% if pcp_aile == 'Debian' %}
+        paket_var() { [ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" = "install ok installed" ]; }
+        paket_surum() { paket_var "$1" && dpkg-query -W -f='${Version}' "$1" 2>/dev/null; }
+        {% else %}
+        paket_var() { rpm -q "$1" >/dev/null 2>&1; }
+        paket_surum() { rpm -q --qf '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null; }
+        {% endif %}
+        if paket_var pcp; then
+            KAPSAM="pcp-zeroconf"
+            { paket_var pcp-zeroconf || [ {{ zeroconf_karari | quote }} != uygula ]; } && { echo "KURULU"; exit 0; }
+        else
+            KAPSAM="PCP"
+        fi
+        for d in /var/log/pcp /var/log /var /; do [ -d "$d" ] && break; done
+        read -r BOY KUL BOS <<< "$(df -Pm "$d" | awk 'NR==2{print $2, $3, $4}')"
+        GEREK={{ pcp_kurulum_bos_alan_mb | int }}
+        echo "bolum $d: boyut ${BOY} MB, kullanilan ${KUL} MB, bos ${BOS} MB, gereken ${GEREK} MB (kurulacak: $KAPSAM)"
+        if [ -z "$BOS" ] || [ "$BOS" -lt "$GEREK" ] || [ $(( (KUL + GEREK) * 100 )) -gt $(( BOY * 80 )) ]; then echo "YETERSIZ"; fi
+      register: pcp_bos_alan
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      tags: [kurulum]
+
+    - name: Kurulum - bos alan yetersiz (PCP KURULMADI)
+      ansible.builtin.debug:
+        msg: >-
+          SORUN: {{ 'pcp-zeroconf' if 'kurulacak: pcp-zeroconf' in (pcp_bos_alan.stdout | default('')) else 'PCP' }} KURULMADI -
+          {{ pcp_bos_alan.stdout_lines | default([]) | first | default('') }}; bos alan
+          {{ pcp_kurulum_bos_alan_mb }} MB'tan az ya da kurulum sonrasi bolum %80'i asar. /var/log/pcp icin ayri LV
+          ya da alan acilmali; sonra playbook yeniden kosulur.
+      when: "'YETERSIZ' in (pcp_bos_alan.stdout | default(''))"
+      tags: [kurulum]
+
+    - name: Kurulum - PCP paketleri (depo yoksa rapor)
+      ansible.builtin.dnf:
+        name: [pcp, pcp-system-tools]
+        state: present
+      register: pcp_kurulum
+      failed_when: false
+      when:
+        - pcp_aile == 'RedHat'
+        - kurulum_karari == 'uygula'
+        - "'YETERSIZ' not in (pcp_bos_alan.stdout | default(''))"
+      tags: [kurulum]
+
+    # pcp-zeroconf ayri gorevde ve istege bagli: tek dnf cagrisinda depoda pcp-zeroconf yoksa dnf
+    # HICBIR paketi kurmaz ('No package pcp-zeroconf available').
+    - name: Izleme - pcp-zeroconf (surec basina CPU/IO kaydi; depoda yoksa bilgi)
+      ansible.builtin.dnf:
+        name: pcp-zeroconf
+        state: present
+      register: pcp_zeroconf
+      failed_when: false
+      when:
+        - pcp_aile == 'RedHat'
+        - zeroconf_karari == 'uygula'
+        - "'YETERSIZ' not in (pcp_bos_alan.stdout | default(''))"
+      tags: [kurulum]
+
+    - name: Kurulum - ek paketler (istege bagli; her biri tek tek, yoksa bilgi)
+      ansible.builtin.dnf:
+        name: "{{ item }}"
+        state: present
+      loop: "{{ pcp_ek_paketler }}"
+      register: pcp_ek_paket
+      failed_when: false
+      when:   # kurulum karari ve bos alan kapisi ek paketlere de uygulanir
+        - pcp_aile == 'RedHat'
+        - kurulum_karari == 'uygula'
+        - "'YETERSIZ' not in (pcp_bos_alan.stdout | default(''))"
+      tags: [kurulum, pmda]
+
+    # Debian 13: apt paket listesi YALNIZ kurulacak paket varsa (bos alan kapisi KURULU demediyse ya da ek paket
+    # istendiyse) ve liste 1 saatten eskiyse yenilenir - her kosumda depoya ust veri istegi gitmez. Recommends kurulmaz
+    # (libpcp-pmda-perl; perl PMDA'lari kullanilmiyor). Kayit adlari ayri (atlanan gorev ayni adli kaydi ezerdi), asagida
+    # ortak adlara alinir.
+    - name: Kurulum - Debian apt paket listesi (yalniz kurulacak paket varsa, 1 saatten eskiyse)
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      register: pcp_apt_liste
+      failed_when: false
+      when:
+        - pcp_aile == 'Debian'
+        - kurulum_karari == 'uygula' or zeroconf_karari == 'uygula'
+        - "'YETERSIZ' not in (pcp_bos_alan.stdout | default(''))"
+        - "'KURULU' not in (pcp_bos_alan.stdout | default('')) or (pcp_ek_paketler | length > 0 and kurulum_karari == 'uygula')"
+      tags: [kurulum]
+
+    - name: Kurulum - Debian PCP paketi (depo yoksa rapor)
+      ansible.builtin.apt:
+        name: "{{ pcp_temel_paketler }}"
+        state: present
+        install_recommends: false
+      register: pcp_kurulum_deb
+      failed_when: false
+      when:
+        - pcp_aile == 'Debian'
+        - kurulum_karari == 'uygula'
+        - "'YETERSIZ' not in (pcp_bos_alan.stdout | default(''))"
+      tags: [kurulum]
+
+    - name: Kurulum - Debian pcp-zeroconf (surec basina CPU/IO kaydi; depoda yoksa bilgi)
+      ansible.builtin.apt:
+        name: pcp-zeroconf
+        state: present
+        install_recommends: false
+      register: pcp_zeroconf_deb
+      failed_when: false
+      when:
+        - pcp_aile == 'Debian'
+        - zeroconf_karari == 'uygula'
+        - "'YETERSIZ' not in (pcp_bos_alan.stdout | default(''))"
+      tags: [kurulum]
+
+    - name: Kurulum - Debian ek paketler (istege bagli; her biri tek tek, yoksa bilgi)
+      ansible.builtin.apt:
+        name: "{{ item }}"
+        state: present
+        install_recommends: false
+      loop: "{{ pcp_ek_paketler }}"
+      register: pcp_ek_paket_deb
+      failed_when: false
+      when:
+        - pcp_aile == 'Debian'
+        - kurulum_karari == 'uygula'
+        - "'YETERSIZ' not in (pcp_bos_alan.stdout | default(''))"
+      tags: [kurulum, pmda]
+
+    # apt hatasi (or. 'No package matching') failed_when: false altinda rc tasimayabilir: hata = rc != 0 ya da msg hata metni
+    - name: Kurulum - Debian sonuclarini ortak adlara al
+      vars:
+        _hd: 'No package|Unable to|E:|[Ff]ailed'
+      ansible.builtin.set_fact:
+        pcp_kurulum: "{{ pcp_kurulum_deb | combine({'rc': 1} if (pcp_kurulum_deb.msg | default('')) is search(_hd) else {}) }}"
+        pcp_zeroconf: "{{ pcp_zeroconf_deb | combine({'rc': 1} if (pcp_zeroconf_deb.msg | default('')) is search(_hd) else {}) }}"
+        pcp_ek_paket_sonuc: "{{ pcp_ek_paket_deb.results | default([]) }}"
+      when: pcp_aile == 'Debian'
+      tags: [kurulum, pmda]
+
+    - name: Kurulum - Debian apt paket listesi yenilenemedi bilgisi
+      ansible.builtin.debug:
+        msg: >-
+          UYARI: apt paket listesi yenilenemedi ({{ pcp_apt_liste.msg | default('') | truncate(160) }}) - eski listeyle
+          kurulum denendi; apt kaynaklari ({{ pcp_depo_ipucu }}) kontrol edilmeli.
+      when:
+        - pcp_apt_liste is not skipped
+        - (pcp_apt_liste.msg | default('')) is search('Failed|E:|Unable|could not', ignorecase=True)
+      tags: [kurulum]
+
+    - name: Kurulum - PCP paketleri kurulamadi bilgisi
+      ansible.builtin.debug:
+        msg: >-
+          SORUN: {{ pcp_temel_paketler | join('/') }} kurulamadi ({{ (pcp_kurulum.failures | default([pcp_kurulum.msg | default('')]))
+          | join(', ') | truncate(160) }}). Depo tanimi ({{ pcp_depo_ipucu }}) kontrol edilmeli.
+      when:
+        - pcp_kurulum is not skipped
+        - pcp_kurulum.failed | default(false) or (pcp_kurulum.rc | default(0)) != 0
+      tags: [kurulum]
+
+    - name: Izleme - pcp-zeroconf yok bilgisi
+      ansible.builtin.debug:
+        msg: >-
+          BILGI: pcp-zeroconf kurulamadi ({{ (pcp_zeroconf.failures | default([pcp_zeroconf.msg | default('')])) | join(', ') | truncate(120) }}).
+          PCP temel kaydi surer; surec basina CPU kaydi (proc.psinfo.utime/stime) YAPILMAZ.
+          Paket {{ 'Debian main' if pcp_aile == 'Debian' else 'AppStream' }} deposundadir; depo tanimi kontrol edilmeli.
+      when:
+        - pcp_zeroconf is not skipped
+        - (pcp_zeroconf.rc | default(0)) != 0
+      tags: [kurulum]
+
+    - name: Kurulum - kurulamayan ek paketler
+      ansible.builtin.debug:
+        msg: "BILGI: {{ item.item }} kurulamadi (depoda yok olabilir) - ilgili izleme alani eksik kalir"
+      loop: "{{ (pcp_ek_paket_sonuc | default([])) if pcp_aile == 'Debian' else (pcp_ek_paket.results | default([])) }}"
+      loop_control:
+        label: "{{ item.item | default('') }}"
+      when: >-
+        (item.rc | default(0)) != 0
+        or (pcp_aile == 'Debian' and (item.msg | default('')) is search('No package|Unable to|E:|[Ff]ailed'))
+      tags: [kurulum, pmda]
+
+    - name: Kurulum - pmcd ve pmlogger etkin
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop: [pmcd, pmlogger]
+      when:
+        - kurulum_karari == 'uygula'
+        - not ansible_check_mode
+        - (pcp_kurulum.rc | default(0)) == 0
+      failed_when: false
+      tags: [kurulum]
+
+    # Debian 13: paket betigi pmproxy'yi ACILISTA BASLAYACAK bicimde etkinlestirir (44322, tum
+    # arayuzler; calisirsa uzak istemci pmcd verisine ulasir - -A guvenlik kapisi) ve pmie'yi etkin ama CALISMAZ birakir.
+    # RHEL son durumu: pmproxy kapali, pmie pcp-zeroconf ile calisir. Yalniz BU KOSUMDA kurulan pakette esitlenir; once
+    # kurulmus PCP'de servislere dokunulmaz (dogrulama pmproxy acilis durumunu BILGI olarak yazar). pmproxy calisiyorsa
+    # durdurulmaz (bu kosumdan once baslatilmis demektir), raporlanir.
+    - name: Kurulum - Debian paket servis varsayilanini RHEL son durumuna esitle (yalniz bu kosumda kurulan PCP)
+      ansible.builtin.shell: |
+        set -o pipefail
+        DEGISTI=0
+        {% if (pcp_kurulum | default({})) is changed and 'kurulacak: PCP' in (pcp_bos_alan.stdout | default('')) %}
+        if [ "$(systemctl is-enabled pmproxy 2>/dev/null || true)" = enabled ]; then
+            if timeout 60 systemctl disable pmproxy >/dev/null 2>&1; then
+                echo "pmproxy acilista baslamaz (disable; Debian paketi etkin birakmisti)"; DEGISTI=1
+            else
+                echo "SORUN: pmproxy disable edilemedi - acilista baslar (uzak istemci pmcd verisine ulasabilir)"
+            fi
+        fi
+        systemctl is-active --quiet pmproxy 2>/dev/null && echo "UYARI: pmproxy CALISIYOR - durdurulmadi (bu kosumdan once baslatilmis)"
+        {% endif %}
+        {% if (pcp_zeroconf | default({})) is changed %}
+        if ! systemctl is-active --quiet pmie 2>/dev/null; then
+            if timeout 90 systemctl enable --now pmie >/dev/null 2>&1; then
+                echo "pmie baslatildi (RHEL pcp-zeroconf ile ayni son durum)"; DEGISTI=1
+            else
+                echo "UYARI: pmie baslatilamadi (systemctl status pmie)"
+            fi
+        fi
+        {% endif %}
+        [ "$DEGISTI" -eq 1 ] && echo DEGISTI || true
+      register: pcp_deb_servis
+      changed_when: "'DEGISTI' in pcp_deb_servis.stdout"
+      when:
+        - pcp_aile == 'Debian'
+        - kurulum_karari == 'uygula' or zeroconf_karari == 'uygula'
+        - not ansible_check_mode
+        - ((pcp_kurulum | default({})) is changed) or ((pcp_zeroconf | default({})) is changed)
+      tags: [kurulum]
+
+    - name: Kurulum - Debian servis esitleme sonucu
+      ansible.builtin.debug:
+        msg: "{{ pcp_deb_servis.stdout_lines | default([]) | reject('equalto', 'DEGISTI') | list }}"
+      when: pcp_deb_servis is not skipped
+      tags: [kurulum]
+
+    # pcp-zeroconf paket betigi pmcd'yi yeniden baslatir ve PMDA kurulumunu arka planda surdurur;
+    # hemen gelen tespit pmcd hazir degilken G/C gorunurlugunu 0 olcer ve -A ikinci kosuma kalirdi.
+    - name: Kurulum - pmcd hazir olana kadar bekle (yalniz kurulum degistiyse; ust sinir 60 sn)
+      ansible.builtin.shell: |
+        [ -f /etc/pcp.conf ] && . /etc/pcp.conf
+        "${PCP_BINADM_DIR:-/usr/libexec/pcp/bin}/pmcd_wait" -t 60 && echo hazir || echo "UYARI: pmcd 60 sn icinde hazir olmadi"
+      changed_when: false
+      check_mode: false
+      when:
+        - kurulum_karari == 'uygula'
+        - not ansible_check_mode
+        - ((pcp_kurulum | default({})) is changed) or ((pcp_zeroconf | default({})) is changed)
+      tags: [kurulum]
+
+    # =====================================================================
+    # TESPIT (salt okuma; her kosumda)
+    # =====================================================================
+    - name: Tespit - PCP durumu, sahiplik ve eski kurulum izleri
+      ansible.builtin.shell: |
+        set -o pipefail
+        {% if pcp_aile == 'Debian' %}
+        paket_var() { [ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" = "install ok installed" ]; }
+        paket_surum() { paket_var "$1" && dpkg-query -W -f='${Version}' "$1" 2>/dev/null; }
+        {% else %}
+        paket_var() { rpm -q "$1" >/dev/null 2>&1; }
+        paket_surum() { rpm -q --qf '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null; }
+        {% endif %}
+        paket_var pcp && echo "PCP=1" || echo "PCP=0"
+        paket_var pcp-zeroconf && echo "ZEROCONF=1" || echo "ZEROCONF=0"
+        echo "PCP_SURUM=$(paket_surum pcp || echo yok)"
+        for s in pmcd pmlogger pmie; do echo "$(echo "$s" | tr a-z A-Z)=$(systemctl is-active "$s" 2>/dev/null || true)"; done
+        [ -f /etc/pcp.conf ] && . /etc/pcp.conf
+        PMDAS=${PCP_PMDAS_DIR:-/var/lib/pcp/pmdas}
+        SYSCONF=${PCP_SYSCONF_DIR:-/etc/pcp}
+        # servis ayar dizini: RHEL /etc/sysconfig, Debian /etc/default (PCP kurulu degilken platformdan)
+        SCD=${PCP_SYSCONFIG_DIR:-{{ pcp_ayar_dizin }}}
+        TMF="$SCD/pmlogger_timers"
+        PMCDCONF="$SYSCONF/pmcd/pmcd.conf"
+        echo "PMCDCONF=$PMCDCONF"
+        echo "PMDAS=$PMDAS"
+        if grep -qE '^proc[[:space:]].*pmdaproc' "$PMCDCONF" 2>/dev/null; then
+            echo "PROC_SATIR=1"
+            if grep -E '^proc[[:space:]].*pmdaproc' "$PMCDCONF" | grep -qE '[[:space:]]-A([[:space:]]|$)'; then echo "PROC_A=1"; else echo "PROC_A=0"; fi
+        else
+            echo "PROC_SATIR=0"; echo "PROC_A=0"
+        fi
+        # Gorunurluk (yalniz pmcd calisiyorsa): surec sayisi + surec basina G/C degeri sayisi,
+        # root ve pcp kullanicisiyla. Karar G/C degerinden (/proc/<pid>/io yalniz sahibine acik).
+        if systemctl is-active --quiet pmcd 2>/dev/null && command -v pminfo >/dev/null 2>&1; then
+            R=$(timeout 60 pminfo -f proc.psinfo.pid 2>/dev/null | grep -c 'inst \[' || true)
+            P=$(timeout 60 runuser -u pcp -- pminfo -f proc.psinfo.pid 2>/dev/null | grep -c 'inst \[' || true)
+            RI=$(timeout 60 pminfo -f proc.io.read_bytes 2>/dev/null | grep -c 'inst \[' || true)
+            PI=$(timeout 60 runuser -u pcp -- pminfo -f proc.io.read_bytes 2>/dev/null | grep -c 'inst \[' || true)
+            echo "GOR_ROOT=${R:-0}"; echo "GOR_PCP=${P:-0}"; echo "IO_ROOT=${RI:-0}"; echo "IO_PCP=${PI:-0}"
+        else
+            echo "GOR_ROOT=0"; echo "GOR_PCP=0"; echo "IO_ROOT=0"; echo "IO_PCP=0"
+        fi
+        # pmcd yalniz yerel mi: PMCD_LOCAL=1 satiri ACIK olmali. Paket dosyasinda satir YORUMDA gelebilir
+        # (RHEL 10.2 pcp 7.0.3 ve Debian 13 pcp 6.3.8: '# PMCD_LOCAL=1', pmcd 0.0.0.0:44321 dinler); dosya yoksa bilinmiyor = 0.
+        grep -qE '^[[:space:]]*PMCD_LOCAL=1' "$SCD/pmcd" 2>/dev/null && echo "PMCD_YEREL=1" || echo "PMCD_YEREL=0"
+        if grep -qE '^[[:space:]]*PMCD_LOCAL=1' "$SCD/pmcd" 2>/dev/null; then echo "PMCD_LOCAL_SATIR=acik"
+        elif grep -qE '^[[:space:]]*#[[:space:]]*PMCD_LOCAL' "$SCD/pmcd" 2>/dev/null; then echo "PMCD_LOCAL_SATIR=yorumda"
+        else echo "PMCD_LOCAL_SATIR=yok"; fi
+        # pmproxy calisiyorsa uzak istemci pmcd verisine onun uzerinden ulasir (PMCD_LOCAL yetmez)
+        systemctl is-active --quiet pmproxy 2>/dev/null && echo "PMPROXY=1" || echo "PMPROXY=0"
+        # Birincil pmlogger kontrol satiri ve -c yapilandirmasi
+        CTRL=""
+        for f in "$SYSCONF/pmlogger/control.d/local" "$SYSCONF/pmlogger/control"; do
+            [ -f "$f" ] && grep -qE '^[^#]*LOCALHOSTNAME.*-c[[:space:]]' "$f" && { CTRL=$f; break; }
+        done
+        echo "CTRL=$CTRL"
+        CC=""
+        [ -n "$CTRL" ] && CC=$(grep -E '^[^#]*LOCALHOSTNAME' "$CTRL" | head -1 | grep -oE -- '-c[[:space:]]+[^[:space:]]+' | awk '{print $2}' || true)
+        echo "CTRL_C=$CC"
+        [ -f {{ (pcp_pmlogger_dizin ~ '/config.default') | quote }} ] && echo "CONFIG_DEFAULT=1" || echo "CONFIG_DEFAULT=0"
+        # Kayit yapilandirmasinda -A ile tehlikeli olacak metrik var mi?
+        case "$CC" in /*) CF="$CC" ;; "") CF="" ;; *) CF={{ pcp_pmlogger_dizin | quote }}/"$CC" ;; esac
+        RK=""; [ -n "$CF" ] && [ -f "$CF" ] && RK=$(grep -oE {{ pcp_a_riskli_desen | quote }} "$CF" | sort -u | tr '\n' ' ' || true)
+        echo "RISKLI_KAYIT=$RK"
+        # Saklama sahipleri (log-saklama yonetici() ile ayni isaretler)
+        SAHIP=""
+        # Sahip = pmlogger_timers'i GERCEKTEN yedekleyip yazmis playbook (yedek dosyasi); yalniz dizin yetmez: rol playbook'u
+        # PCP yokken kostuysa /var/backup/<ad> baska yedekler icin vardir ve saklama hic yazilmazdi.
+        # pcp-merkezi kendine ayrilmis iz dizini kullanir (dizin varligi = sahip).
+        for ad in {{ pcp_saklama_yonetenler | map('quote') | join(' ') }}; do
+            if [ "$ad" = pcp-merkezi ]; then [ -d "/var/backup/$ad" ] && SAHIP="$SAHIP $ad"
+            else ls "/var/backup/$ad$TMF-"* >/dev/null 2>&1 && SAHIP="$SAHIP $ad"; fi
+        done
+        ls "/var/backup/log-saklama$TMF-"* >/dev/null 2>&1 && SAHIP="$SAHIP log-saklama"
+        grep -qi 'ansible managed' "$TMF" 2>/dev/null && SAHIP="$SAHIP ansible-managed-basligi"
+        echo "SAHIP=${SAHIP# }"
+        KAYIT=""
+        for ad in {{ pcp_kayit_yonetenler | map('quote') | join(' ') }}; do [ -d "/var/backup/$ad" ] && KAYIT="$KAYIT $ad"; done
+        echo "KAYIT_SAHIP=${KAYIT# }"
+        [ -f "$TMF" ] && echo "TIMERS=1" || echo "TIMERS=0"
+        echo "DAILY=$(grep -E '^PMLOGGER_DAILY_PARAMS=' "$TMF" 2>/dev/null | tail -1 | sed -E 's/^[^=]*=//; s/^"//; s/"$//')"
+        # log-saklama bekcisi ve eski pcp-setup izleri
+        [ -x /usr/local/sbin/log-saklama-bekci ] && echo "LS_BEKCI=1" || echo "LS_BEKCI=0"
+        systemctl cat pcp-log-guard.timer >/dev/null 2>&1 && echo "GUARD=1" || echo "GUARD=0"
+        echo "GUARD_DURUM=$(systemctl is-active pcp-log-guard.timer 2>/dev/null || true)"
+        echo "ESKI_ORIG=$(ls -1 "$SYSCONF"/pmlogger/control.d/*.pcp-setup.orig "$PMCDCONF".pcp-setup.orig 2>/dev/null | tr '\n' ' ')"
+        [ -d "$SYSCONF/pmlogger/backup.pcp-setup" ] && echo "ESKI_YEDEK_DIZIN=1" || echo "ESKI_YEDEK_DIZIN=0"
+        # Kapatilacak PMDA listesi: pmcd.conf etkin satiri, yeniden kurulum isareti, bekleyen .NeedInstall
+        AKTIF=""; ISARETSIZ=""; BEKLEYEN=""
+        for m in {{ pcp_kapali_pmdalar | map('quote') | join(' ') }}; do
+            grep -qE "^$m[[:space:]]" "$PMCDCONF" 2>/dev/null && AKTIF="$AKTIF $m"
+            grep -qE "^#.*$m/pmda$m" "$PMCDCONF" 2>/dev/null || ISARETSIZ="$ISARETSIZ $m"
+            ls "$PMDAS/$m"/.NeedInstall* >/dev/null 2>&1 && BEKLEYEN="$BEKLEYEN $m"
+        done
+        echo "PMDA_AKTIF=${AKTIF# }"; echo "PMDA_ISARETSIZ=${ISARETSIZ# }"; echo "PMDA_BEKLEYEN=${BEKLEYEN# }"
+        [ -f "$PMDAS/proc/hotproc.conf" ] && echo "HOTPROC=1" || echo "HOTPROC=0"
+        [ -d "$SYSCONF/pmrep" ] && echo "PMREP_DIZIN=1" || echo "PMREP_DIZIN=0"
+        true
+      register: pcp_tespit
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      tags: [always]
+
+    # anahtar=deger satirlari sozluge (deger '=' icerebilir: yalniz ilk '=' ayirir; dict(zip))
+    - name: Tespit - degerleri ayristir
+      vars:
+        _satir: "{{ pcp_tespit.stdout_lines | default([]) | select('match', '^[A-Z_]+=') | list }}"
+      ansible.builtin.set_fact:
+        pt: >-
+          {{ dict(_satir | map('regex_replace', '^([A-Z_]+)=.*$', '\1')
+                  | zip(_satir | map('regex_replace', '^[A-Z_]+=', ''))) }}
+      tags: [always]
+
+    # Saklama icin gun basina arsiv boyutu: rol playbooklariyla AYNI olcum
+    - name: Tespit - PCP alani ve gun basina arsiv boyutu (tam gunler)
+      ansible.builtin.shell: |
+        # PCP_OLCUM_TAM_GUN (rol playbooklarinda birebir ayni)
+        # Gun boyutu YALNIZ tamamlanmis TAM gunlerden: bugun olculmez, en eski tamamlanmis gun sayilmaz (kurulum gunu
+        # yarim olabilir), en az 2 tam gun yoksa olcum YOK -> en az gun. Eski yontem ilk kurulumda yarim gunu olcup disk
+        # boyutundan bagimsiz hedef gunu yaziyordu. Ham gun = parca sayisi x pmlogger -v
+        # ile olculen boyutun buyugu (yeniden baslatma gecesi birlestirilen gun ham yazilir); xz gun = tamami sikistirilmis
+        # gunlerin en buyugu. AYRI=0: /var/log/pcp ayri bolum degil (paylasilan bolumde pay dusuk tutulur).
+        set -o pipefail
+        # pmlogger_timers yeri pcp.conf icindeki PCP_SYSCONFIG_DIR: RHEL /etc/sysconfig, Debian /etc/default; pcp.conf yoksa RHEL yolu
+        TM=$( [ -f /etc/pcp.conf ] && . /etc/pcp.conf; printf '%s' "${PCP_SYSCONFIG_DIR:-/etc/sysconfig}" )/pmlogger_timers
+        LV=$(df -Pm /var/log/pcp 2>/dev/null | awk 'NR==2{print $2}')
+        # R2: tavan bolum boyutundan degil GERCEK alandan - bos alan + PCP agacinin kendi kullanimi (du: arsiv agaci, gun basina
+        # ~10 dosya; YUK NOTU: olculdu 25-30 ms, patroni-kurulum P5b). Bolumu baskasi doldurmussa saklama ona gore kisalir.
+        BOS=$(df -Pm /var/log/pcp 2>/dev/null | awk 'NR==2{print $4}')
+        KUL=$(du -sm /var/log/pcp 2>/dev/null | cut -f1)
+        if [ "$(findmnt --target /var/log/pcp -n -o TARGET 2>/dev/null)" = "/var/log/pcp" ]; then AYRI=1; else AYRI=0; fi
+        D=/var/log/pcp/pmlogger/$(hostname)
+        [ -d "$D" ] || D=$(find /var/log/pcp/pmlogger -maxdepth 2 -name '*.index*' -printf '%h\n' 2>/dev/null | head -1)
+        HAM=0; XZ=0; GUN=0
+        if [ -n "$D" ] && [ -d "$D" ]; then
+            BUGUN=$(date +%Y%m%d)
+            PC=/etc/pcp/pmlogger
+            VOL=$(grep -hoE -- '-v[[:space:]]*[0-9]+[Mm][Bb]' $PC/control $PC/control.d/* 2>/dev/null | head -1 | tr -dc '0-9' || true)
+            VOL=${VOL:-100}
+            GUNLER=$(find "$D" -maxdepth 1 -mindepth 1 -printf '%f\n' | grep -oE '^[0-9]{8}' | sort -u | grep -vx "$BUGUN" || true)
+            GUN=$(printf '%s\n' "$GUNLER" | grep -c . || true)
+            if [ "$GUN" -ge 3 ]; then
+                for p in $(printf '%s\n' "$GUNLER" | tail -n +2); do
+                    b=$(du -cm "$D"/"$p".* 2>/dev/null | tail -1 | cut -f1)
+                    PARCA=$(find "$D" -maxdepth 1 -name "$p.*" -printf '%f\n' 2>/dev/null | grep -vE '[.](index|meta)([.]|$)' \
+                        | grep -E '[.][0-9]+([.](xz|zst|gz|bz2|lzma))?$' || true)
+                    n=$(printf '%s\n' "$PARCA" | grep -c . || true)
+                    h=$((n * VOL)); [ "$b" -gt "$h" ] && h=$b
+                    [ "$h" -gt "$HAM" ] && HAM=$h
+                    if [ -n "$PARCA" ] && ! printf '%s\n' "$PARCA" | grep -qvE '[.](xz|zst|gz|bz2|lzma)$'; then
+                        [ "$b" -gt "$XZ" ] && XZ=$b
+                    fi
+                done
+            fi
+        fi
+        K=$(grep -E '^PMLOGGER_DAILY_PARAMS=' "$TM" 2>/dev/null | tail -1 \
+            | grep -oE -- '-k[ =]?[0-9]+' | tr -dc '0-9' || true)
+        echo "LV_MB=${LV:-0} HAM_MB=$HAM XZ_MB=$XZ GUN=$GUN AYRI=$AYRI MEVCUT_K=${K:-0} BOS_MB=${BOS:-0} PCP_MB=${KUL:-0}"
+      register: pcp_alan_olcum
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      tags: [always]
+
+    - name: Tespit - kararlarin hesaplanmasi
+      vars:
+        _o: "{{ dict((pcp_alan_olcum.stdout | default('LV_MB=0 HAM_MB=0 XZ_MB=0', true)) | trim | split(' ') | map('split', '=')) }}"
+        _lv: "{{ _o.get('LV_MB', 0) | int }}"
+        _ham: "{{ _o.get('HAM_MB', 0) | int }}"
+        _xz: "{{ (_o.get('XZ_MB', 0) | int) if (_o.get('XZ_MB', 0) | int) > 0 else (_ham | int) }}"
+        _oran: "{{ 0.8 if (_o.get('AYRI', '0') | int) == 1 else (pcp_paylasimli_oran | float) }}"
+        # Tavan (R2): bolum boyutu x pay, AMA bolumdeki baska veri dusulur - PCP ancak bolum %80'e ulasana kadar buyur:
+        # tavan = min(LV x pay, PCP kullanimi + bos alan - LV x 0,2). Ayri LV'de ikisi ~esit; paylasilan dolu bolumde kisalir.
+        _bos: "{{ _o.get('BOS_MB', 0) | int }}"
+        _pcp_kul: "{{ _o.get('PCP_MB', 0) | int }}"
+        _tavan: >-
+          {{ ([((_lv | int) * (_oran | float)) | int, (((_pcp_kul | int) + (_bos | int) - (_lv | int) * 0.2) | int)] | min)
+             if ((_bos | int) > 0 or (_pcp_kul | int) > 0) else (((_lv | int) * (_oran | float)) | int) }}
+        _sigan: >-
+          {{ (2 + (((_tavan | int) - 2 * (_ham | int)) / (_xz | int)) | int)
+             if ((_lv | int) > 0 and (_xz | int) > 0) else (pcp_saklama_en_az_gun | int) }}
+        # R7: pcp-zeroconf bu kosumda kurulduysa surec basina kayit baslar, gun boyutu buyur; olcum onceki kucuk gunlerden
+        # gelir. Hesap ERTELENIR: mevcut -k (en az gun ustundeyse) korunur, yoksa en az gun; 3 tam gun sonra yeniden kosum.
+        _ertele: "{{ ((pcp_zeroconf | default({})) is changed) and (_ham | int) > 0 }}"
+        _io_root: "{{ pt.IO_ROOT | default(0) | int }}"
+        _io_pcp: "{{ pt.IO_PCP | default(0) | int }}"
+        _hesap: "{{ [pcp_saklama_hedef_gun | int, [pcp_saklama_en_az_gun | int, _sigan | int] | max] | min }}"
+        _mevcut: "{{ (((pt.DAILY | default('')) | regex_search('-k[ =]?([0-9]+)', '\\1')) or ['0']) | first | int }}"
+        _koru: >-
+          {{ (_mevcut | int) >= (pcp_saklama_en_az_gun | int)
+             and (_mevcut | int) <= (_hesap | int)
+             and (_mevcut | int) >= (_hesap | int) - (pcp_saklama_tolerans_gun | int) }}
+      ansible.builtin.set_fact:
+        pcp_var: "{{ pt.PCP | default('0') == '1' }}"
+        pcp_saklama_gun: >-
+          {{ (_mevcut | int) if (_koru | bool or (_ertele | bool and (_mevcut | int) >= (pcp_saklama_en_az_gun | int)))
+             else ((pcp_saklama_en_az_gun | int) if (_ertele | bool) else (_hesap | int)) }}
+        pcp_saklama_hesap_gun: "{{ _hesap | int }}"
+        pcp_saklama_korundu: "{{ _koru }}"
+        pcp_saklama_notu: >-
+          LV {{ _lv }} MB ({{ 'ayri bolum' if (_o.get('AYRI', '0') | int) == 1 else 'paylasilan bolum' }}, pay {{ _oran }},
+          tavan {{ _tavan | int }} MB, bos {{ _bos }} MB), gun ham {{ _ham }} / xz {{ _xz }} MB -> sigan {{ _sigan | int }} gun{{
+          ((' - SAKLAMA HESABI ERTELENDI: pcp-zeroconf bu kosumda kuruldu (surec kaydi baslar, olcum onceki kucuk gunlerden);'
+            ~ ' 3 tam gun sonra yeniden kosulmali') if _ertele | bool else '') }}{{
+          (' (OLCUM YOK: en az 3 tamamlanmis gun gerekir, en az gun yazildi)' if (_ham | int) == 0 else '') }}{{
+          (', mevcut -k ' ~ _mevcut ~ ' korundu (hesap ' ~ _hesap ~ ', tolerans ' ~ pcp_saklama_tolerans_gun ~ ' gun)') if _koru | bool else '' }}
+        pcp_gorunurluk_eksik: >-
+          {{ (_io_root | int) > 0 and ((_io_pcp | int) * 100 < (_io_root | int) * (pcp_gorunurluk_orani | int)) }}
+        pcp_a_yaz: >-
+          {{ proc_tum_surec_karari == 'gerekirse' and pt.PROC_SATIR | default('0') == '1'
+             and pt.PROC_A | default('0') == '0'
+             and (_io_root | int) > 0
+             and ((_io_pcp | int) * 100 < (_io_root | int) * (pcp_gorunurluk_orani | int))
+             and pt.PMCD_YEREL | default('0') == '1'
+             and pt.PMPROXY | default('1') == '0'
+             and (pt.RISKLI_KAYIT | default('') | trim | length == 0) }}
+        pcp_saklama_yaz: >-
+          {{ saklama_karari == 'uygula' and pt.TIMERS | default('0') == '1'
+             and (pt.SAHIP | default('') | length == 0) }}
+        pcp_profil_tam: >-
+          {{ kayit_profili == 'tam' and (pt.KAYIT_SAHIP | default('') | length == 0)
+             and pt.CTRL | default('') | length > 0 }}
+        pcp_profil_varsayilan: >-
+          {{ kayit_profili == 'varsayilan' and pt.CTRL | default('') | length > 0
+             and pt.CTRL_C | default('') != 'config.default' and pt.CONFIG_DEFAULT | default('0') == '1' }}
+        pcp_eski_guard_kapat: >-
+          {{ eski_kurulum_karari == 'otomatik' and pt.GUARD | default('0') == '1' and pt.LS_BEKCI | default('0') == '1' }}
+        pcp_saklama_mevcut_gun: "{{ _mevcut | int }}"
+        pcp_saklama_olcum_var: "{{ (_ham | int) > 0 }}"
+        pcp_pmda_kapat: >-
+          {{ pmda_kapatma_karari == 'uygula' and pt.PCP | default('0') == '1'
+             and ((pt.PMDA_AKTIF | default('') | trim | length > 0)
+                  or (pt.PMDA_ISARETSIZ | default('') | trim | length > 0)
+                  or (pt.PMDA_BEKLEYEN | default('') | trim | length > 0)) }}
+        pcp_eski_orig_tasi: >-
+          {{ eski_kurulum_karari == 'otomatik'
+             and ((pt.ESKI_ORIG | default('') | trim | length > 0) or pt.ESKI_YEDEK_DIZIN | default('0') == '1') }}
+      tags: [always]
+
+    # R7 (bu playbook'a ozgu nedenler; zeroconf nedeni yukarida): -A, hotproc, ek PMDA ve tam kayit profili de gun boyutunu
+    # buyutur. Hesap ERTELENIR: mevcut -k (en az gun ustundeyse) korunur, yoksa en az gun; veri silinmez, yeni buyuk deger
+    # yazilmaz. 3 tam gun sonra yeniden kosumda gercek boyuttan hesaplanir (talimat Adim 7).
+    - name: Tespit - kayit hacmi bu kosumda degisiyorsa saklama hesabi ertelenir
+      vars:
+        _neden: >-
+          {{ (['proc -A eklenecek'] if (pcp_a_yaz | bool) else [])
+             + (['hotproc acilacak'] if (hotproc_karari == 'uygula' and (pcp_var | bool) and pt.HOTPROC | default('0') == '0') else [])
+             + (['ek PMDA ' ~ (pcp_ek_pmdalar | join(','))] if (pcp_ek_pmdalar | length > 0) else [])
+             + (['tam kayit profili'] if (pcp_profil_tam | bool) else []) }}
+      ansible.builtin.set_fact:
+        pcp_saklama_gun: >-
+          {{ (pcp_saklama_mevcut_gun | int) if (pcp_saklama_mevcut_gun | int) >= (pcp_saklama_en_az_gun | int)
+             else (pcp_saklama_en_az_gun | int) }}
+        pcp_saklama_korundu: false
+        pcp_saklama_notu: >-
+          {{ pcp_saklama_notu }} - SAKLAMA HESABI ERTELENDI: kayit hacmi bu kosumda degisiyor ({{ _neden | join('; ') }}),
+          olcum onceki gunlerden; 3 tam gun sonra playbook yeniden kosulmali
+      when:
+        - pcp_saklama_olcum_var | bool
+        - _neden | length > 0
+      tags: [always]
+
+    - name: Tespit - PCP durum ozeti
+      ansible.builtin.debug:
+        msg:
+          - >-
+            PCP {{ 'kurulu (' ~ pt.PCP_SURUM ~ ')' if pcp_var | bool else 'KURULU DEGIL' }},
+            pcp-zeroconf {{ 'var' if pt.ZEROCONF | default('0') == '1' else 'yok' }};
+            pmcd={{ pt.PMCD | default('?') }}, pmlogger={{ pt.PMLOGGER | default('?') }}, pmie={{ pt.PMIE | default('?') }}
+          - >-
+            Surec gorunurlugu: surec pcp {{ pt.GOR_PCP | default('?') }} / root {{ pt.GOR_ROOT | default('?') }};
+            surec basina G/C degeri pcp {{ pt.IO_PCP | default('?') }} / root {{ pt.IO_ROOT | default('?') }};
+            proc -A {{ 'var' if pt.PROC_A | default('0') == '1' else 'yok' }}
+            -> {{ 'EKSIK (pcp < %' ~ pcp_gorunurluk_orani ~ ')' if pcp_gorunurluk_eksik | bool else 'yeterli ya da olculemedi' }};
+            pmcd {{ 'yalniz yerel (PMCD_LOCAL=1)' if pt.PMCD_YEREL | default('0') == '1'
+                    else 'UZAK baglanti kabul edebilir (' ~ pcp_ayar_dizin ~ '/pmcd PMCD_LOCAL=1 satiri ' ~ pt.PMCD_LOCAL_SATIR | default('yok') ~ ')' }},
+            pmproxy {{ 'CALISIYOR' if pt.PMPROXY | default('0') == '1' else 'calismiyor' }};
+            kayitta riskli metrik: {{ pt.RISKLI_KAYIT | default('') | trim or 'yok' }}
+          - >-
+            Kapatilacak PMDA'lar ({{ pcp_kapali_pmdalar | join(',') or 'yok' }}): pmcd.conf'ta etkin
+            {{ pt.PMDA_AKTIF | default('') | trim or 'yok' }}; yeniden kurulum isareti eksik
+            {{ pt.PMDA_ISARETSIZ | default('') | trim or 'yok' }}; bekleyen .NeedInstall
+            {{ pt.PMDA_BEKLEYEN | default('') | trim or 'yok' }}
+          - >-
+            Kayit: birincil pmlogger -c {{ pt.CTRL_C | default('?') or '?' }} ({{ pt.CTRL | default('') or 'kontrol satiri yok' }});
+            yonetenler: {{ pt.KAYIT_SAHIP | default('') or 'yok' }}
+          - >-
+            Saklama: PMLOGGER_DAILY_PARAMS="{{ pt.DAILY | default('') }}"; sahip: {{ pt.SAHIP | default('') or 'yok' }};
+            bu playbook'un kurali {{ pcp_saklama_gun }} gun ({{ pcp_saklama_notu }})
+          - >-
+            Disk korumasi: log-saklama bekcisi {{ 'VAR' if pt.LS_BEKCI | default('0') == '1' else 'yok' }};
+            eski pcp-log-guard {{ ('VAR (' ~ pt.GUARD_DURUM ~ ')') if pt.GUARD | default('0') == '1' else 'yok' }};
+            eski pcp-setup yedekleri: {{ pt.ESKI_ORIG | default('') | trim or 'yok' }}{{
+            ' + backup.pcp-setup dizini' if pt.ESKI_YEDEK_DIZIN | default('0') == '1' else '' }}
+      tags: [always]
+
+    # =====================================================================
+    # YEDEK (yalniz uygula modu, degisiklikten ONCE; yalniz YAZILACAK dosyalar -
+    # yedek izi log-saklama'ya 'bu dosyayi pcp-onlem yonetiyor' der)
+    # =====================================================================
+    - name: Yedek - yedeklenecek dosyalar
+      ansible.builtin.set_fact:
+        pcp_yedeklenecek: >-
+          {{ ([pt.PMCDCONF] if (pcp_a_yaz | bool or pcp_ek_pmdalar | length > 0 or pcp_pmda_kapat | bool) else [])
+             + ([pcp_timers_dosya] if pcp_saklama_yaz | bool else [])
+             + ([pt.CTRL] if (pcp_profil_tam | bool or pcp_profil_varsayilan | bool) else [])
+             + ([pcp_pmlogger_dizin ~ '/' ~ pcp_tam_ad] if pcp_profil_tam | bool else [])
+             + ([pt.PMDAS ~ '/proc/hotproc.conf'] if hotproc_karari == 'uygula' else [])
+             + (['/etc/pcp/pmrep/ozel.conf'] if pmrep_sablon_karari == 'uygula' else [])
+             + ([pcp_pmie_yapilandirma] if pmie_karari == 'uygula' else [])
+             + ([pcp_dogrula_yol] if dogrula_betigi_karari == 'uygula' else []) }}
+      tags: [always]
+
+    - name: Yedek - degistirilecek dosyalari zaman damgasiyla yedekle
+      vars:
+        # Playbook'un kendi kurdugu dosya kaynakla AYNIYSA yedeklenmez (ikinci kosum changed 0). config.pcp-tam
+        # sablonu hedefteki metrik listesinden uretildigi icin burada hesaplanamaz (tam profilde ikinci kosum yedek 1)
+        _kaynak_sha:
+          - "/etc/pcp/pmrep/ozel.conf {{ lookup('file', 'pcp_files/ozel.conf', rstrip=False) | hash('sha256') }}"
+          - "{{ pcp_dogrula_yol }} {{ lookup('file', 'pcp_files/pcp-dogrula.sh', rstrip=False) | hash('sha256') }}"
+      ansible.builtin.shell: |
+        set -o pipefail
+        KOK={{ yedek_kok | quote }}
+        DAMGA={{ yedek_damga | quote }}
+        MANIFEST="$KOK/_kosum-$DAMGA.txt"
+        DEGISTI=0
+        HATA=0
+        for f in {{ pcp_yedeklenecek | map('quote') | join(' ') }}; do
+            # R13: kosum oncesi var olmayan dosya isaretlenir; kosum sonu gorevi olusmussa manifeste OLUSTURULDU yazar
+            [ -f "$f" ] || { echo "YOK:$f"; continue; }
+            KS=$(printf '%s\n' {{ _kaynak_sha | map('quote') | join(' ') }} | awk -v f="$f" '$1==f{print $2}')
+            [ -n "$KS" ] && [ "$(sha256sum "$f" | awk '{print $1}')" = "$KS" ] && continue
+            # saklama satiri zaten yazilacak degerse dosya degismeyecek: yedek yok (sifir sunucuda ikinci kosum changed 0)
+            [ "$f" = {{ pcp_timers_dosya | quote }} ] && grep -qxF {{ ('PMLOGGER_DAILY_PARAMS="-E -x 1 -k ' ~ pcp_saklama_gun ~ '"') | quote }} "$f" && continue
+            h="$KOK$f"
+            # icerik TUM yedeklerle karsilastirilir (ls -1t kullanilmaz)
+            zaten=0
+            for y in $(ls -1 "$h"-* 2>/dev/null | sort -r); do
+                [ -f "$y" ] || continue
+                if cmp -s "$f" "$y"; then zaten=1; break; fi
+            done
+            [ "$zaten" -eq 1 ] && continue
+            # yedek alinamazsa (/var/backup dolu, salt okunur...) manifeste satir yazilmaz, SORUN ve YEDEK_ALINAMADI isareti
+            if mkdir -p "$(dirname "$h")" && chmod 0700 "$KOK" && cp -aL "$f" "$h-$DAMGA" && cmp -s "$f" "$h-$DAMGA" \
+                && printf '%s  %s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$f" "$h-$DAMGA" >> "$MANIFEST"; then
+                DEGISTI=1
+            else
+                echo "SORUN: $f yedeklenemedi (hedef $KOK) - bu sunucu ATLANDI, dosyalarina dokunulmadi"
+                HATA=1
+            fi
+        done
+        [ "$DEGISTI" -eq 1 ] && echo DEGISTI
+        [ "$HATA" -eq 0 ] || echo YEDEK_ALINAMADI
+      register: yedek_sonuc
+      changed_when: "'DEGISTI' in yedek_sonuc.stdout"
+      when:
+        - uygulama_modu == 'uygula'
+        - not ansible_check_mode
+        - pcp_yedeklenecek | length > 0
+      tags: [always]
+
+    - name: Yedek - ALINAMADI, bu sunucu ATLANIR (yapilandirma dosyalarina dokunulmadi; sonraki sunuculara devam)
+      ansible.builtin.set_fact:
+        yedek_atlandi: "degisiklik oncesi yedek alinamadi ({{ yedek_kok }} dolu ya da yazilamaz) - dosyalara dokunulmadi"
+      when: "'YEDEK_ALINAMADI' in (yedek_sonuc.stdout | default(''))"
+      tags: [always]
+
+    - name: Yedek - atlanan sunucunun kosumu burada biter (sonda ozet; is basarisiz gorunur)
+      ansible.builtin.meta: end_host
+      when: "'YEDEK_ALINAMADI' in (yedek_sonuc.stdout | default(''))"
+      tags: [always]
+
+    # =====================================================================
+    # ESKI pcp-setup KURULUMU IZLERI (taranan dizinlerden /var/backup'a tasima)
+    # =====================================================================
+    - name: Eski - pcp-setup yedeklerini /var/backup agacina tasi
+      ansible.builtin.shell: |
+        set -o pipefail
+        KOK={{ yedek_kok | quote }}
+        DAMGA={{ yedek_damga | quote }}
+        DEGISTI=0
+        tasi() {
+            k="$1"; [ -e "$k" ] || return 0
+            h="$KOK/eski-pcp-setup$k-$DAMGA"
+            mkdir -p "$(dirname "$h")"; chmod 0700 "$KOK"
+            if [ -f "$k" ]; then OZ=$(sha256sum "$k" | awk '{print $1}'); else OZ=dizin; fi
+            mv "$k" "$h" && { printf '%s  %s (eski pcp-setup izi)  %s\n' "$OZ" "$k" "$h" >> "$KOK/_kosum-$DAMGA.txt"; echo "tasindi: $k -> $h"; DEGISTI=1; }
+        }
+        for f in {{ pt.ESKI_ORIG | default('') | split | map('quote') | join(' ') }}; do tasi "$f"; done
+        tasi /etc/pcp/pmlogger/backup.pcp-setup
+        [ "$DEGISTI" -eq 1 ] && echo DEGISTI || true
+      register: eski_orig
+      changed_when: "'DEGISTI' in eski_orig.stdout"
+      when:
+        - pcp_eski_orig_tasi | bool
+        - not ansible_check_mode
+      tags: [eski]
+
+    - name: Eski - pcp-log-guard kapat ve tasi (log-saklama bekcisi var - tek silici)
+      ansible.builtin.shell: |
+        set -o pipefail
+        KOK={{ yedek_kok | quote }}
+        DAMGA={{ yedek_damga | quote }}
+        systemctl disable --now pcp-log-guard.timer >/dev/null 2>&1 || true
+        systemctl stop pcp-log-guard.service >/dev/null 2>&1 || true
+        for k in /etc/systemd/system/pcp-log-guard.timer /etc/systemd/system/pcp-log-guard.service \
+                 /usr/local/sbin/pcp-log-guard.sh /etc/pcp/pcp-log-guard.conf; do
+            [ -f "$k" ] || continue
+            h="$KOK/eski-pcp-setup$k-$DAMGA"
+            mkdir -p "$(dirname "$h")"; chmod 0700 "$KOK"
+            OZ=$(sha256sum "$k" | awk '{print $1}')
+            mv "$k" "$h" && printf '%s  %s (eski pcp-log-guard)  %s\n' "$OZ" "$k" "$h" >> "$KOK/_kosum-$DAMGA.txt"
+        done
+        echo DEGISTI
+      register: eski_guard
+      changed_when: "'DEGISTI' in eski_guard.stdout"
+      notify: Systemd yeniden oku
+      when:
+        - pcp_eski_guard_kapat | bool
+        - not ansible_check_mode
+      tags: [eski]
+
+    - name: Eski - pcp-log-guard korundu bilgisi
+      ansible.builtin.debug:
+        msg: >-
+          BILGI: eski pcp-log-guard bekcisi bu sunucuda kaliyor ({{ pt.GUARD_DURUM | default('?') }}) - log-saklama
+          bekcisi yok, /var/log/pcp icin baska disk korumasi bulunmuyor. Tek silici ilkesi icin log-saklama
+          (playbook-log-saklama) uygulandiktan sonra bu playbook tekrar kosulursa bekci kapatilip tasinir.
+      when:
+        - pt.GUARD | default('0') == '1'
+        - not (pcp_eski_guard_kapat | bool)
+      tags: [eski]
+
+    # =====================================================================
+    # PMCD: proc -A, hotproc, ek PMDA'lar (tek pmcd yeniden baslatmasi)
+    # =====================================================================
+    # Kaldirma PMDA'nin kendi Remove betigiyle (pmdaproc.sh _remove: PMNS'ten adlar silinir, pmcd.conf'tan
+    # yalniz kendi satiri cikar, pmcd'ye SIGHUP). Isaret satiri [access] bolumunden ONCE yazilir; pcp-zeroconf
+    # %post betigi 'grep -q <ad>/pmda<ad> pmcd.conf' ile bakar, yorum satiri da eslesir. Bekleyen .NeedInstall
+    # silinmez, /var/backup agacina tasinir (pmcd baslarken PMDA'yi yeniden kurardi).
+    - name: PMDA - kapatilacak PMDA'lari kaldir ve yeniden kurulumu engelle
+      ansible.builtin.shell: |
+        set -o pipefail
+        P={{ pt.PMDAS | default('/var/lib/pcp/pmdas') | quote }}
+        C={{ pt.PMCDCONF | default('/etc/pcp/pmcd/pmcd.conf') | quote }}
+        KOK={{ yedek_kok | quote }}
+        DAMGA={{ yedek_damga | quote }}
+        DEGISTI=0
+        # pmcd otomatik PMDA kurulumu (pcp-zeroconf paket betigi .NeedInstall birakir; pmcd baslarken kilit
+        # pmda.auto.update + .NeedInstall.pending ile kurar) suruyorsa bitmesi beklenir - yoksa kaldirilan PMDA
+        # kurulum bitince pmcd.conf icine geri yazilir (sifir sunucuda gozlendi). Ust sinir 180 sn.
+        for _ in $(seq 1 90); do
+            [ -e "$P/pmda.auto.update" ] || ls "$P"/*/.NeedInstall.pending >/dev/null 2>&1 || break
+            sleep 2
+        done
+        [ -e "$P/pmda.auto.update" ] && echo "UYARI: pmcd PMDA kurulumu 180 sn icinde bitmedi ($P/pmda.auto.update)"
+        for m in {{ pcp_kapali_pmdalar | map('quote') | join(' ') }}; do
+            # .NeedInstall = bekleyen, .pending = yarida kalmis, .failed = her pmcd baslangicinda YENIDEN denenir
+            for e in "" .pending .failed; do
+                [ -e "$P/$m/.NeedInstall$e" ] || continue
+                h="$KOK$P/$m/.NeedInstall$e-$DAMGA"
+                mkdir -p "$(dirname "$h")"; chmod 0700 "$KOK"
+                mv "$P/$m/.NeedInstall$e" "$h" && printf '%s  %s (bekleyen kurulum)  %s\n' bos "$P/$m/.NeedInstall$e" "$h" >> "$KOK/_kosum-$DAMGA.txt"
+                echo "tasindi: $P/$m/.NeedInstall$e"; DEGISTI=1
+            done
+            if grep -qE "^$m[[:space:]]" "$C"; then
+                if [ -x "$P/$m/Remove" ]; then
+                    # gunluk yedek agacinda (0700); basarida silinir. Remove pmcd surecine SIGHUP gonderir; ust sinir 120 sn
+                    L="$KOK/_remove-$m-$DAMGA.log"; mkdir -p "$KOK"; chmod 0700 "$KOK"
+                    ( cd "$P/$m" && timeout 120 ./Remove ) > "$L" 2>&1 || true
+                    if grep -qE "^$m[[:space:]]" "$C"; then
+                        echo "SORUN: $m pmcd.conf icinden kaldirilamadi (gunluk: $L)"
+                    else
+                        echo "kaldirildi: $m"; DEGISTI=1; rm -f "$L"
+                    fi
+                else
+                    # paket kaldirilmis, pmcd.conf satiri kalmis: pmcd her baslangicta olmayan ajani dener.
+                    # Remove betiginin yaptigi is satiri silmektir (pmdaproc.sh _remove_pmda); dosya yedeklendi
+                    # R25: gecici dosya ayni dizinde (cp -a: sahiplik/SELinux baglami korunur), mv ile tek adimda yer degistirir -
+                    # eski 'cat > "$C"' dosyayi once kisaltiyordu (yarim yazim pmcd.conf dosyasini bozardi) ve hatayi gizliyordu
+                    G="$C.pcp-onlem.$$"
+                    if cp -a "$C" "$G" && { grep -vE "^$m[[:space:]]" "$C" || true; } > "$G" && mv -f "$G" "$C" \
+                        && ! grep -qE "^$m[[:space:]]" "$C"; then
+                        echo "kaldirildi: $m (Remove betigi yok - paket kaldirilmis; satir silindi)"; DEGISTI=1
+                    else
+                        rm -f "$G"; echo "SORUN: $m satiri pmcd.conf icinden silinemedi ($P/$m/Remove yok)"
+                    fi
+                fi
+            fi
+            # Yeniden kurulum isareti PMDA dizini olmasa da yazilir (bilerek): pcp-zeroconf paket betigi dmcache/
+            # prometheus gibi eski adlari eski PCP surumlerinde kurar; dizin paketle sonradan gelebilir.
+            if ! grep -qE "^#.*$m/pmda$m" "$C"; then
+                S="# pcp-onlem: $m/pmda$m KAPALI (yuk kurali) - bu satir pcp-zeroconf paket betiginin PMDA yi yeniden kurmasini engeller"
+                if grep -qE '^\[access\]' "$C"; then
+                    G="$C.pcp-onlem.$$"
+                    cp -a "$C" "$G" && awk -v s="$S" 'BEGIN{y=0} /^\[access\]/ && !y {print s; y=1} {print}' "$C" > "$G" \
+                        && mv -f "$G" "$C" || rm -f "$G"
+                else
+                    printf '%s\n' "$S" >> "$C" || true
+                fi
+                # R25: yazim sonucu dosyadan dogrulanir - basarisizlik "isaret" diye gizlenmez
+                if grep -qE "^#.*$m/pmda$m" "$C"; then echo "isaret: $m"; DEGISTI=1
+                else echo "SORUN: $m icin pmcd.conf isareti yazilamadi (dosya yazilabilir mi?)"; fi
+            fi
+        done
+        [ "$DEGISTI" -eq 1 ] && echo DEGISTI || true
+      register: pcp_pmda_kaldir
+      changed_when: "'DEGISTI' in pcp_pmda_kaldir.stdout"
+      when:
+        - pcp_pmda_kapat | bool
+        - not ansible_check_mode
+      tags: [pmda]
+
+    - name: PMDA - kapatma sonucu
+      ansible.builtin.debug:
+        msg: "{{ pcp_pmda_kaldir.stdout_lines | default([]) | reject('equalto', 'DEGISTI') | list }}"
+      when: pcp_pmda_kaldir is not skipped
+      tags: [pmda]
+
+    # Kayit grubu kapatma: grup dosyasi /var/backup agacina yedeklenir ve 'force exclude' yapilir; kayit
+    # yapilandirmasi bu gruplarin metriklerini iceriyorsa pmlogconf PCP KULLANICISIYLA yeniden uretilir (root olarak
+    # calisan pmlogconf yoklamada root degerlerini gorur ve slabinfo grubunu ACAR - olculdu) ve
+    # pmlogger yeniden baslatilir. YUK NOTU: pmlogconf her grup icin yoklama metrigini bir kez okur (kisa);
+    # pmlogger yeniden baslarken birkac saniye ornek kaybi. Yuk AZALTAN adimdir.
+    - name: Izleme - kesmeleri kapatan PCP kayit gruplarini kapat (pmlogconf force exclude)
+      ansible.builtin.shell: |
+        set -o pipefail
+        [ -f /etc/pcp.conf ] && . /etc/pcp.conf
+        GD=${PCP_VAR_DIR:-/var/lib/pcp}/config/pmlogconf
+        C=${PCP_VAR_DIR:-/var/lib/pcp}/config/pmlogger/config.default
+        [ -d "$GD" ] || { echo "pmlogconf grup dizini yok - atlandi"; exit 0; }
+        KOK={{ yedek_kok | quote }}
+        DAMGA={{ yedek_damga | quote }}
+        DEGISTI=0; METRIK=""; GECICI=""
+        trap 'rm -f $GECICI' EXIT
+        for g in {{ pcp_kapali_kayit_gruplari | map('quote') | join(' ') }}; do
+            f=$(readlink -f "$GD/$g" 2>/dev/null) || continue
+            [ -f "$f" ] || continue
+            METRIK="$METRIK $(awk '/^[[:space:]]+[a-z]/{print $1}' "$f" | tr '\n' ' ')"
+            grep -qE '^[[:space:]]*force[[:space:]]+exclude' "$f" && continue
+            h="$KOK$f-$DAMGA"; mkdir -p "$(dirname "$h")" "$KOK"; chmod 0700 "$KOK"
+            # yedek alinamazsa dosyaya DOKUNULMAZ (yedekleme ilkesi); gecici dosya ayni dizinde (cp -a: sahiplik ve SELinux
+            # baglami korunur), mv ile tek adimda yer degistirir; kesilen kosumda cikis tuzagi gecici dosyayi siler (grup
+            # dizininde kalan dosyayi pmlogconf ayri grup sanardi). Sonuc dosyadan dogrulanir.
+            if ! cp -a "$f" "$h"; then echo "SORUN: $f yedeklenemedi ($h) - $g grubu kapatilmadi"; continue; fi
+            printf '%s  %s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$f" "$h" >> "$KOK/_kosum-$DAMGA.txt"
+            NOT="# {{ playbook_adi }}: force exclude (yuk kurali) - kesmeleri kapatan bolge kilidi okumasi kayda alinmaz"
+            GT="$f.pcp-onlem.$$"; GECICI="$GECICI $GT"
+            if cp -a "$f" "$GT" && awk -v n="$NOT" 'NR==1{print; print n; next}
+                /^[[:space:]]*(probe|force)[[:space:]]/{if(!y){print "force exclude"; y=1}; next} {print}
+                END{if(!y) print "force exclude"}' "$h" > "$GT" && mv -f "$GT" "$f" \
+                && grep -qE '^[[:space:]]*force[[:space:]]+exclude' "$f"; then
+                echo "kapatildi: $g"; DEGISTI=1
+            else
+                rm -f "$GT"; echo "SORUN: $g grubu kapatilamadi ($f yazilamadi)"
+            fi
+        done
+        KALAN=0
+        for m in $METRIK; do grep -qE "^[[:space:]]+$m$" "$C" 2>/dev/null && KALAN=1; done
+        if [ "$KALAN" -eq 1 ]; then
+            h="$KOK$C-kayit-$DAMGA"; mkdir -p "$(dirname "$h")" "$KOK"; chmod 0700 "$KOK"
+            if ! cp -a "$C" "$h"; then
+                echo "SORUN: $C yedeklenemedi ($h) - kayit yapilandirmasi yenilenmedi"
+                [ "$DEGISTI" -eq 1 ] && echo DEGISTI; exit 0
+            fi
+            printf '%s  %s  %s\n' "$(sha256sum "$C" | awk '{print $1}')" "$C" "$h" >> "$KOK/_kosum-$DAMGA.txt"
+            # pmlogconf ACIK (y) grubu -r ile bile kapatmaz; grup 'n' yapilip blogu cikarilir, force exclude sayesinde
+            # sonraki her pmlogconf (pmlogger baslangicindaki -r -c -q dahil) grubu kapali tutar (olculdu)
+            G="{{ pcp_kapali_kayit_gruplari | join(' ') }}"
+            CT="$C.pcp-onlem.$$"; GECICI="$GECICI $CT"
+            if ! { cp -a "$C" "$CT" && awk -v g="$G" 'BEGIN{n=split(g,a," "); for(i=1;i<=n;i++) h[a[i]]=1}
+                /^#\+ /{split(substr($0,4),p,":"); if(p[1] in h){print "#+ " p[1] ":n:" p[3] ":"; atla=1; next}}
+                atla&&/^#----/{atla=0} !atla{print}' "$h" > "$CT" && mv -f "$CT" "$C"; }; then
+                rm -f "$CT"; echo "SORUN: $C yazilamadi - kayit yapilandirmasi yenilenmedi"
+                [ "$DEGISTI" -eq 1 ] && echo DEGISTI; exit 0
+            fi
+            timeout 120 runuser -u pcp -- pmlogconf -r -c -q "$C" </dev/null >/dev/null 2>&1 || echo "UYARI: pmlogconf basarisiz ya da 120 sn icinde bitmedi"
+            K2=0
+            for m in $METRIK; do grep -qE "^[[:space:]]+$m$" "$C" && K2=1; done
+            if [ "$K2" -eq 1 ]; then
+                echo "SORUN: kayit yapilandirmasinda kapatilan grup metrikleri kaldi ($C)"
+            else
+                echo "kayit yapilandirmasi yenilendi"; DEGISTI=1
+                timeout 90 systemctl restart pmlogger || echo "UYARI: pmlogger yeniden baslatilamadi"
+            fi
+        fi
+        [ "$DEGISTI" -eq 1 ] && echo DEGISTI || true
+      register: kayit_grubu_kapat
+      changed_when: "'DEGISTI' in kayit_grubu_kapat.stdout"
+      when:
+        - pt.PCP | default('0') == '1'
+        - kayit_grubu_kapatma_karari == 'uygula'
+        - not ansible_check_mode
+      tags: [kayit]
+
+    - name: Izleme - kayit grubu kapatma sonucu
+      ansible.builtin.debug:
+        msg: "{{ kayit_grubu_kapat.stdout_lines | default([]) | reject('equalto', 'DEGISTI') | list }}"
+      when: kayit_grubu_kapat is not skipped
+      tags: [kayit]
+
+    # Gece isleri yuk dagitimi (olcek kurali: ayni ayar 400-1000 VM). PCP zamanlayicilari paket varsayilaninda
+    # HER SUNUCUDA AYNI DAKIKADA calisir (pmlogger_daily 00:10, pmie_daily 00:08, pmlogger_check / pmie_check yarim saatte
+    # bir). Sunucunun KISA ADININ ozetinden sabit kaydirma: gunluk isler 00:10 + 0..yayma araligi dk, yarim saatlik isler 0..29 dk.
+    # Envanter adi / IP KULLANILMAZ (ayni sunucu farkli envanterde farkli adla kayitli - playbooklar birbirini ezerdi),
+    # machine-id KULLANILMAZ (klon VM lerde ayni). RandomizedDelaySec KULLANILMAZ: pmlogger -T24h10m ile calisir, her gece
+    # degisen gecikme iki calisma arasini 24 sa 10 dk ustune cikarip pmlogger i kapatir (ertesi gece tam birlestirme).
+    # Gece raporu (pcp-zeroconf pmlogger_daily_report) KAPATILIR: tum gun arsivini /var/tmp altina acar (olculdu:
+    # isletim sistemi diski 60 sn yuzde 100, yazma beklemesi 2,7 sn); analiz araclari bu raporu kullanmaz. -D yalniz
+    # kurulu pmlogger_daily --noreport taniyorsa yazilir (karisik surum). Zamanlayicilar YENIDEN BASLATILMAZ:
+    # pmlogger.service BindsTo ile zamanlayicilara bagli, yeniden baslatma pmlogger i durdurur; yalniz daemon-reload.
+    # YUK NOTU: drop-in yazimi + daemon-reload (kisa); yuk AZALTAN adimdir. GECIS: kaydirmasi 10 dk yi asan sunucuda ilk
+    # gecelerde pmlogger -T suresi dolunca kendiliginden yeniden baslar (gunde bir, birkac sn ornek kaybi); baslangic
+    # her gun 10 dk kayar ve kaydirma saatine yetisince durur (en cok yayma araligi / 10 gun). Uygulama aninda daemon-reload gunluk
+    # isleri hemen bir kez calistirirdi (yeni saat son tetiklemeden sonra ve simdiden onceyse); GECIS KAPISI (51-gecis-kapisi.conf
+    # + /run/pcp-gece-gecis isareti yalniz reload suresince) bunu onler - dalgada toplu gece isi ve PCP 5.3 birlestirme cakismasi yok.
+    - name: Izleme - PCP gece islerini sunucuya ozgu saate yay ve gece raporunu kapat
+      ansible.builtin.shell: |
+        # PCP_GECE_YAYMA (rol playbooklarinda birebir ayni)
+        set -o pipefail
+        [ -f /etc/pcp.conf ] && . /etc/pcp.conf
+        BIN=${PCP_BINADM_DIR:-/usr/libexec/pcp/bin}
+        SD=/etc/systemd/system
+        DOSYA=50-yuk-dagitimi.conf
+        KOK={{ yedek_kok | quote }}
+        DAMGA={{ yedek_damga | quote }}
+        PG={{ pcp_gece_pencere_dk | int }}
+        PK={{ pcp_kontrol_pencere_dk | int }}
+        [ -x "$BIN/pmlogger_daily" ] || { echo "PCP kurulu degil - atlandi"; exit 0; }
+        # Pencere 0 KABUL EDILMEZ (kalite denetimi R20): PG=0 tum sunucularin gunluk isini ayni saniyeye, PK=0 yarim
+        # saatlik isleri ayni dakikaya dusurur - olcek kurali bozulur. En az gece 30 dk (1000 VM icin dakikada ~33), kontrol 5 dk.
+        if [ "$PG" -lt 30 ] || [ "$PG" -gt 600 ] || [ "$PK" -lt 5 ] || [ "$PK" -gt 29 ]; then
+            echo "SORUN: pencere degeri gecersiz (gece 30-600 dk, kontrol 5-29 dk; 0 = tum sunucular ayni anda) - dokunulmadi"; exit 0
+        fi
+        if [ -f /etc/cron.d/pcp-pmlogger ]; then
+            echo "BILGI: PCP gece isleri cron ile calisiyor (/etc/cron.d/pcp-pmlogger) - systemd zamanlayicilarina dokunulmadi"; exit 0
+        fi
+        AD=$(hostname -s 2>/dev/null || true)
+        [ -n "$AD" ] || AD=$(cut -d. -f1 /proc/sys/kernel/hostname 2>/dev/null)
+        [ -n "$AD" ] || { echo "SORUN: sunucu kisa adi okunamadi - kaydirma hesaplanamaz, dokunulmadi"; exit 0; }
+        # Makine adi ayarlanmamis sunucu (R21): 'localhost' ozeti her yerde ayni -> bu sunucularin hepsi ayni saate duser
+        case "$AD" in
+            localhost|localhost.localdomain|localhost4|localhost6)
+                echo "SORUN: sunucu kisa adi '$AD' (makine adi ayarlanmamis) - kaydirma tum bu sunucularda ayni cikar," \
+                     "dokunulmadi (hostnamectl set-hostname)"; exit 0 ;;
+        esac
+        oz() { printf '%s' "$1" | md5sum | cut -c1-8; }
+        G=$(( 16#$(oz "$AD-gece") % (PG * 60 + 1) ))
+        K=$(( 16#$(oz "$AD-kontrol") % (PK * 60 + 1) ))
+        KI=$(( (K + 180) % (PK * 60 + 1) ))
+        sa() { printf '%02d:%02d:%02d' $(( $1 / 3600 )) $(( $1 % 3600 / 60 )) $(( $1 % 60 )); }
+        dk() { printf '%02d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
+        BAS="# PCP gece isleri yuk dagitimi (olcek kurali): sunucu kisa adindan sabit kaydirma - PCP rol playbooklari yazar, elle degistirmeyin"
+        DEGISTI=0; RELOAD=0
+        # yaz/kaldir: her adim denetlenir (R26 - eski surum basarisiz yazimda da "yazildi" diyordu); yedek alinamazsa dosyaya
+        # DOKUNULMAZ (yedekleme ilkesi); yeni olusturulan dosya manifeste "OLUSTURULDU  <dosya>  -" satiriyla girer (R13 - geri
+        # almada bu dosyalar /var/backup agacina tasinir; _kosum- manifesti degisiklik ONCESI durumun tam listesidir)
+        yaz() {
+            d="$SD/$1.d"; f="$d/${3:-$DOSYA}"
+            if [ -f "$f" ] && [ "$(cat "$f")" = "$2" ]; then return 0; fi
+            mkdir -p "$d" "$KOK" || { echo "SORUN: $d ya da $KOK olusturulamadi - $f yazilmadi"; return 1; }
+            chmod 0700 "$KOK"
+            YENI=1
+            if [ -f "$f" ]; then
+                YENI=0; h="$KOK$f-$DAMGA"; mkdir -p "$(dirname "$h")"
+                cp -a "$f" "$h" || { echo "SORUN: $f yedeklenemedi ($h) - dosyaya dokunulmadi"; return 1; }
+                printf '%s  %s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$f" "$h" >> "$KOK/_kosum-$DAMGA.txt"
+            fi
+            if printf '%s\n' "$2" > "$f.tmp.$$" && chmod 0644 "$f.tmp.$$" && mv -f "$f.tmp.$$" "$f"; then
+                [ "$YENI" -eq 1 ] && printf 'OLUSTURULDU  %s  -\n' "$f" >> "$KOK/_kosum-$DAMGA.txt"
+                echo "yazildi: $f"; DEGISTI=1; RELOAD=1
+            else
+                rm -f "$f.tmp.$$"; echo "SORUN: $f yazilamadi (dosya sistemi salt okunur ya da dolu?)"; return 1
+            fi
+        }
+        kaldir() {
+            f="$SD/$1.d/$DOSYA"; [ -f "$f" ] || return 0
+            h="$KOK$f-$DAMGA"; mkdir -p "$(dirname "$h")" "$KOK"; chmod 0700 "$KOK"
+            if mv -f "$f" "$h"; then
+                printf '%s  %s  %s\n' "tasindi" "$f" "$h" >> "$KOK/_kosum-$DAMGA.txt"
+                echo "tasindi (artik gereksiz): $f"; DEGISTI=1; RELOAD=1
+            else
+                echo "SORUN: $f /var/backup agacina tasinamadi ($h) - dosya yerinde kaldi"; return 1
+            fi
+        }
+        # zam <birim> <gunluk:1|0> <takvim...>. Gunluk islerde (pmlogger_daily, pmie_daily) Persistent=false yazilir: sunucu gece
+        # isi saatinde kapaliysa (bakim, kaza) acilista is HEMEN calismaz, ertesi gece kendi saatinde iki gunu birlestirir. Paket
+        # varsayilani Persistent=true toplu acilista tum sunucularda ayni anda birlestirme demektir (olculdu: paket varsayilaniyla
+        # kacirilan is acilistan 8 sn sonra calisti, Persistent=false ile calismadi). daemon-reload yakalamasini bu ayar ONLEMEZ - onu
+        # gecis kapisi karsilar. Yarim saatlik isler dokunulmaz.
+        zam() {
+            b=$1; g=$2; shift 2
+            systemctl cat "$b" >/dev/null 2>&1 || { echo "BILGI: $b yok - atlandi"; return 0; }
+            i=$(printf '%s\n[Timer]\nOnCalendar=' "$BAS")
+            for c in "$@"; do i=$(printf '%s\nOnCalendar=%s' "$i" "$c"); done
+            [ "$g" = 1 ] && i=$(printf '%s\nPersistent=false' "$i")
+            yaz "$b" "$i"
+        }
+        # Gunluk gece zaman diliminin baslangici: RHEL 9/10 00:10; RHEL 8 ailesi (PCP 5.3) 03:10 (yapilandirma karari). PCP 5.3 pmlogger yeniden
+        # yuklemede (SIGUSR2) arsiv adini UTC ile yazar (TZ=+03-3; olculdu: Oracle Linux 8.10): gece isi UTC gece yarisindan
+        # once calisirsa yeni arsiv onceki gune duser ve her gece birlestirme olur. 03:10 (+03) = 00:10 UTC.
+        OSR=/etc/os-release
+        TABAN=600
+        PV=$(rpm -q --qf '%{VERSION}' pcp 2>/dev/null | cut -d. -f1)
+        if [ "$(. "$OSR" 2>/dev/null; echo "${VERSION_ID%%.*}")" = 8 ] || { [ -n "$PV" ] && [ "$PV" -lt 6 ] 2>/dev/null; }; then
+            TABAN=11400
+        fi
+        zam pmlogger_daily.timer 1 "*-*-* $(sa $(( TABAN + G )))"
+        zam pmie_daily.timer 1 "*-*-* $(sa $(( TABAN - 120 + G )))"
+        zam pmlogger_check.timer 0 "*-*-* *:$(dk "$K")" "*-*-* *:$(dk $(( K + 1800 )))"
+        zam pmie_check.timer 0 "*-*-* *:$(dk "$KI")" "*-*-* *:$(dk $(( KI + 1800 )))"
+        zam pmlogger_farm_check.timer 0 "*-*-* *:$(dk $(( K + 10 )))" "*-*-* *:$(dk $(( K + 1810 )))"
+        zam pmie_farm_check.timer 0 "*-*-* *:$(dk $(( KI + 10 )))" "*-*-* *:$(dk $(( KI + 1810 )))"
+        # Gecis kapisi: daemon-reload, yeni takvimin son tetiklemeden sonra ve simdiden once kalan saatini kacirilmis sayip
+        # gunluk isi HEMEN calistirir (systemd son tetiklemeyi bellekte tutar; Persistent=false da onlemez - olculdu, systemd
+        # 239/252/257). Uygulama aninda bu calisma 400-1000 VM dalgasinda ayni anda gece isi demektir; PCP 5.3 te UTC adli etkin
+        # arsivle birlestirme cakismasi da uretir ("output archive already exists": o gun birlesmez, sonraki geceler atlanir).
+        # Isaret varken servis CALISMAZ; zamanlayici yine tetiklenir, sonraki calisma yeni saatine kayar. Isaret /run altinda.
+        GECIS=/run/pcp-gece-gecis
+        # Onceki kosum isaret ile reload arasinda kesildiyse (AWX zaman asimi, baglanti kopmasi) isaret takili kalir ve gece
+        # isleri acilisa kadar CALISMAZ; her kosumda kaldirilir.
+        if [ -e "$GECIS" ]; then
+            rm -f "$GECIS" && echo "BILGI: takili gecis isareti kaldirildi ($GECIS - onceki kosum yarida kalmis)"; DEGISTI=1
+        fi
+        for b in pmlogger_daily.service pmie_daily.service; do
+            systemctl cat "$b" >/dev/null 2>&1 || continue
+            yaz "$b" "$(printf '%s\n[Unit]\nConditionPathExists=!%s' "$BAS" "$GECIS")" 51-gecis-kapisi.conf
+        done
+        # RHEL 8 (PCP 5.3): gece raporu pmlogger_daily icinden degil pcp-zeroconf AYRI zamanlayicisiyla (her gece 02:00,
+        # tum sunucularda ayni an) calisir ve -D yoktur. Servise kosul drop-in: rapor calismaz; zamanlayici durumuna
+        # dokunulmaz (disable/stop yok), paket guncellemesinde kalir. Yeniden acmak: touch /etc/pcp/pmlogger_daily_report.acik
+        RAPOR=0
+        if systemctl cat pmlogger_daily_report.service >/dev/null 2>&1; then
+            yaz pmlogger_daily_report.service "$(printf '%s\n[Unit]\nConditionPathExists=/etc/pcp/pmlogger_daily_report.acik' "$BAS")"
+            RAPOR=1
+        fi
+        # Gece raporu: ExecStart satiri sunucudaki PAKET biriminden okunur (RHEL 9 ve 10 satirlari farkli), -D eklenir
+        if grep -q -- '--noreport' "$BIN/pmlogger_daily" 2>/dev/null; then
+            U=$(systemctl show -p FragmentPath --value pmlogger_daily.service 2>/dev/null)
+            E=$(grep -E '^ExecStart=' "$U" 2>/dev/null | tail -1)
+            case "$E" in
+                *" -D "*|*" -D"|*--noreport*) echo "BILGI: paket birimi gece raporunu zaten kapatiyor"; kaldir pmlogger_daily.service ;;
+                ExecStart=*pmlogger_daily*)
+                    Y=$(printf '%s\n' "$E" | sed -E 's#^(ExecStart=[^ ]*pmlogger_daily)#\1 -D#')
+                    yaz pmlogger_daily.service "$(printf '%s\n[Service]\nExecStart=\n%s' "$BAS" "$Y")" ;;
+                *) echo "SORUN: pmlogger_daily.service ExecStart satiri okunamadi ($U) - gece raporu kapatilamadi" ;;
+            esac
+        elif [ "$RAPOR" -eq 0 ]; then
+            echo "BILGI: kurulu pmlogger_daily -D/--noreport tanimiyor ve ayri rapor servisi yok - gece raporu bu surumde kapatilamadi"
+        fi
+        for b in pmlogger_daily.timer pmie_daily.timer pmlogger_check.timer pmie_check.timer pmlogger_farm_check.timer \
+                 pmie_farm_check.timer pmlogger_daily.service pmie_daily.service pmlogger_daily_report.service; do
+            if [ "$RELOAD" -eq 0 ] && [ "$(systemctl show -p NeedDaemonReload --value "$b" 2>/dev/null)" = yes ]; then
+                echo "BILGI: $b icin bekleyen daemon-reload (onceki kosum yuklememis)"; RELOAD=1; DEGISTI=1
+            fi
+        done
+        if [ "$RELOAD" -eq 1 ]; then
+            # zamanlayici YENIDEN BASLATILMAZ (pmlogger.service BindsTo); yeni saat daemon-reload ile hesaplanir.
+            # Gecis kapisi isareti yalniz reload suresince; komut kesilse de cikis tuzagi kaldirir.
+            touch "$GECIS"; trap 'rm -f "$GECIS"' EXIT
+            # R23: takilan systemd icin sonsuz bekleme olmasin (120 sn); kesilse de isaret cikis tuzagiyla kaldirilir
+            timeout 120 systemctl daemon-reload || echo "SORUN: systemctl daemon-reload basarisiz ya da 120 sn icinde bitmedi"
+            sleep 5; rm -f "$GECIS"
+        fi
+        # pmlogger sure denetimi: pmlogger -T24h10m ile calisir; sure dolunca systemd ayni anda yeniden baslatir
+        # (Restart=always). Gece isi saati kayinca eski surenin bitisi yeni gece isinden ONCE kalir: o gece dalgadaki tum sunucular
+        # ayni dakikada yeniden baslar, RHEL 9/10 da (PCP 6.3/7.0 gunluk is bugunun arsivinde sinyali atlar) bu her gece 10 dk kayarak
+        # ~12 gece surer. Cozum: uygulama aninda, sure bir sonraki gece isinden once dolacaksa pmlogger a SIGUSR2 gonderilir (gece
+        # isinin kendisinin yaptigi yeniden yukleme: ayni surec, sure sifirlanir, yeni arsiv parcasi; olculen ornek boslugu 0,25 sn).
+        # Gece saatlerinde (00:00-05:59) gonderilmez - gece isleriyle cakismasin. Ikinci kosumda sure gece isinden sonraya kalir: sinyal yok.
+        # YUK NOTU: okumalar yalniz surecin komut satiri, acik dosya listesi ve arsiv etiketi (pmdumplog -l); sinyal o gece arsiv
+        # parcalarini birlestirmeye neden olur (sunucunun kendi gece isi saatinde, olculdu ~1,3 GB yazma / 7 sn).
+        sure_denetle() {
+            local P T TS M L AB SIMDI BITIS GUNLUK GECE Y
+            P=$(systemctl show -p MainPID --value pmlogger.service 2>/dev/null)
+            case "$P" in ''|0|*[!0-9]*) echo "BILGI: pmlogger calismiyor - sure denetimi atlandi"; return 0 ;; esac
+            T=$(tr '\0' '\n' < "/proc/$P/cmdline" 2>/dev/null | sed -n 's/^-T//p' | head -1)
+            [ -n "$T" ] || { echo "BILGI: pmlogger -T suresi yok - sure denetimi gerekmiyor"; return 0; }
+            # yalniz paketin yazdigi bicim (24h10m, 24h): baska bicimde hesap yapilmaz
+            if [[ "$T" =~ ^([0-9]{1,3})h(([0-9]{1,2})m)?$ ]]; then
+                TS=$(( 10#${BASH_REMATCH[1]} * 3600 + 10#${BASH_REMATCH[3]:-0} * 60 ))
+            else
+                echo "BILGI: pmlogger -T degeri taninmadi ($T) - sure denetimi atlandi"; return 0
+            fi
+            M=$(ls -l "/proc/$P/fd" 2>/dev/null | awk '{print $NF}' | grep '\.meta$' | head -1)
+            [ -n "$M" ] || { echo "BILGI: pmlogger acik arsivi bulunamadi - sure denetimi atlandi"; return 0; }
+            L=$(timeout 30 "${PCP_BIN_DIR:-/usr/bin}/pmdumplog" -l -Z UTC "${M%.meta}" 2>/dev/null | awk '$1=="commencing"{print $3, $4, $6, $5; exit}')
+            AB=$(TZ=UTC date -d "${L%.*}" +%s 2>/dev/null)
+            [ -n "$AB" ] || { echo "BILGI: arsiv baslangici okunamadi ($M) - sure denetimi atlandi"; return 0; }
+            SIMDI=$(date +%s); BITIS=$(( AB + TS ))
+            GUNLUK=$(( TABAN + G )); GECE=$(( $(date -d 'today 00:00' +%s) + GUNLUK ))
+            [ "$GECE" -le "$SIMDI" ] && GECE=$(( $(date -d 'tomorrow 00:00' +%s) + GUNLUK ))
+            if [ "$BITIS" -ge $(( GECE + 600 )) ]; then
+                echo "pmlogger suresi gece isinden sonra doluyor ($(date -d "@$BITIS" '+%F %T')) - sinyal gerekmiyor"; return 0
+            fi
+            if [ "$(( 10#$(date +%H) ))" -lt 6 ]; then
+                echo "UYARI: pmlogger suresi gece isinden once doluyor ($(date -d "@$BITIS" '+%F %T')); gece saatlerinde sinyal gonderilmez" \
+                     "- bu gece pmlogger kendiliginden yeniden baslayabilir; 06:00 sonrasi tekrar kosum duzeltir"; return 0
+            fi
+            if kill -USR2 "$P" 2>/dev/null; then
+                sleep 3
+                Y=$(systemctl show -p MainPID --value pmlogger.service 2>/dev/null)
+                if [ "$Y" = "$P" ]; then
+                    echo "pmlogger yeniden yuklendi (SIGUSR2, ayni surec $P): sure $(date -d "@$BITIS" '+%F %T') yerine yarina kaydi"
+                else
+                    echo "UYARI: SIGUSR2 sonrasi pmlogger sureci degisti ($P -> ${Y:-yok}) - systemctl status pmlogger ile denetleyin"
+                fi
+                DEGISTI=1
+            else
+                echo "SORUN: pmlogger a SIGUSR2 gonderilemedi (surec $P)"
+            fi
+        }
+        sure_denetle
+        echo "kaydirma: gunluk +$G sn, yarim saatlik +$K sn (kisa ad $AD)"
+        for b in pmlogger_daily.timer pmlogger_check.timer; do
+            echo "sonraki: $b $(systemctl show -p NextElapseUSecRealtime --value "$b" 2>/dev/null)"
+        done
+        [ "$DEGISTI" -eq 1 ] && echo DEGISTI || true
+      register: pcp_gece_yay
+      changed_when: "'DEGISTI' in pcp_gece_yay.stdout"
+      when:
+        - pt.PCP | default('0') == '1'
+        - pcp_gece_karari == 'uygula'
+        - not ansible_check_mode
+      tags: [kayit]
+
+    - name: Izleme - PCP gece isleri yayma sonucu
+      ansible.builtin.debug:
+        msg: "{{ pcp_gece_yay.stdout_lines | default([]) | reject('equalto', 'DEGISTI') | list }}"
+      when: pcp_gece_yay is not skipped
+      tags: [kayit]
+
+    - name: Proc - proc PMDA satirina -A ekle (gorunurluk olculerek eksik)
+      ansible.builtin.replace:
+        path: "{{ pt.PMCDCONF }}"
+        regexp: '^(proc[ \t].*pmdaproc.*?)[ \t]*$'
+        replace: '\g<1> -A'
+      register: pcp_a_degisti
+      when: pcp_a_yaz | bool
+      tags: [proc]
+
+    - name: Proc - -A karari bilgisi
+      ansible.builtin.debug:
+        msg: >-
+          {{ ('-A eklendi: pcp kullanicisi surec basina G/C degerinin ' ~ pt.IO_PCP ~ ' / ' ~ pt.IO_ROOT ~ ' kadarini goruyordu.'
+              ~ ' pmcd yalniz yerel, pmproxy calismiyor; kayitta smaps/maps/environ yok.')
+             if pcp_a_yaz | bool else
+             ('-A eklenmedi: ' ~ ('karar dokunma/rapor' if proc_tum_surec_karari != 'gerekirse'
+               else ('zaten var' if pt.PROC_A | default('0') == '1'
+               else ('proc satiri yok' if pt.PROC_SATIR | default('0') != '1'
+               else ('pmcd calismiyor, gorunurluk olculemedi' if (pt.IO_ROOT | default(0) | int) == 0
+               else ('gorunurluk yeterli (G/C pcp ' ~ pt.IO_PCP ~ ' / root ' ~ pt.IO_ROOT ~ ')' if not (pcp_gorunurluk_eksik | bool)
+               else ('GUVENLIK KAPISI: pmcd uzak baglanti kabul edebilir (' ~ pcp_ayar_dizin ~ '/pmcd PMCD_LOCAL=1 satiri '
+                     ~ pt.PMCD_LOCAL_SATIR | default('yok') ~ '; acilmasi yapilandirma karari); surec G/C verisi EKSIK kalir'
+                     if pt.PMCD_YEREL | default('0') != '1'
+               else ('GUVENLIK KAPISI: pmproxy calisiyor (uzak istemci pmcd verisine ulasabilir); surec G/C verisi EKSIK kalir'
+                     if pt.PMPROXY | default('0') == '1'
+               else 'GUVENLIK/YUK KAPISI: kayitta ' ~ pt.RISKLI_KAYIT ~ 'var; surec G/C verisi EKSIK kalir')))))))) }}
+      tags: [proc]
+
+    - name: Hotproc - filtre dosyasi (mevcut dosyanin uzerine yazilmaz)
+      ansible.builtin.copy:
+        src: pcp_files/hotproc.conf
+        dest: "{{ pt.PMDAS }}/proc/hotproc.conf"
+        owner: root
+        group: root
+        mode: '0644'
+        force: false
+      register: pcp_hotproc
+      when:
+        - hotproc_karari == 'uygula'
+        - pcp_var | bool
+      tags: [hotproc]
+
+    - name: PMDA - ek PMDA dizinleri, kayit ve onceki basarisiz kurulum
+      ansible.builtin.shell: |
+        set -o pipefail
+        P={{ pt.PMDAS | default('/var/lib/pcp/pmdas') | quote }}
+        C={{ pt.PMCDCONF | default('/etc/pcp/pmcd/pmcd.conf') | quote }}
+        for m in {{ pcp_ek_pmdalar | map('quote') | join(' ') }}; do
+            if [ ! -d "$P/$m" ]; then echo "$m=dizin-yok"
+            elif grep -qE "^$m[[:space:]]" "$C" 2>/dev/null; then echo "$m=kayitli"
+            elif [ -e "$P/$m/.NeedInstall.failed" ]; then echo "$m=onceki-kurulum-basarisiz"
+            else echo "$m=kurulacak"; fi
+        done
+      register: pcp_pmda_durum
+      changed_when: false
+      check_mode: false
+      when: pcp_ek_pmdalar | length > 0
+      tags: [pmda]
+
+    # .NeedInstall birakilir; pmcd yeniden baslarken PMDA'yi kendisi kurar ve dosyayi siler
+    - name: PMDA - kurulacak PMDA'lar icin .NeedInstall birak
+      ansible.builtin.copy:
+        content: ""
+        dest: "{{ pt.PMDAS }}/{{ item | regex_replace('=.*$', '') }}/.NeedInstall"
+        force: false
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ pcp_pmda_durum.stdout_lines | default([]) | select('match', '^[a-z0-9_]+=kurulacak$') | list }}"
+      register: pcp_needinstall
+      tags: [pmda]
+
+    - name: PMDA - atlanan PMDA'lar
+      ansible.builtin.debug:
+        msg: >-
+          BILGI: PMDA {{ item }} (dizin-yok: paket kurulu degil; onceki-kurulum-basarisiz: donanim
+          destegi yok olabilir, .NeedInstall.failed silinirse yeniden denenir)
+      loop: "{{ pcp_pmda_durum.stdout_lines | default([]) | reject('match', '^[a-z0-9_]+=(kurulacak|kayitli)$') | list }}"
+      tags: [pmda]
+
+    - name: PMCD - yeniden baslat ve PMDA kurulumlarini bekle (yalniz degisiklik varsa)
+      ansible.builtin.shell: |
+        set -o pipefail
+        [ -f /etc/pcp.conf ] && . /etc/pcp.conf
+        systemctl reset-failed pmcd >/dev/null 2>&1 || true
+        timeout 90 systemctl restart pmcd || echo "UYARI: pmcd yeniden baslatma 90 sn icinde bitmedi"
+        "${PCP_BINADM_DIR:-/usr/libexec/pcp/bin}/pmcd_wait" -t 60 || echo "UYARI: pmcd 60 sn icinde hazir olmadi"
+        # .NeedInstall kurulumlari pmcd basladiktan sonra arka planda surebilir (ust sinir 120 sn)
+        P={{ pt.PMDAS | default('/var/lib/pcp/pmdas') | quote }}
+        for i in $(seq 1 60); do
+            ls "$P"/*/.NeedInstall >/dev/null 2>&1 && { sleep 2; continue; }
+            pgrep -f "$P/.*/Install" >/dev/null 2>&1 && { sleep 2; continue; }
+            break
+        done
+        systemctl reset-failed pmlogger >/dev/null 2>&1 || true
+        # PMDA kaldirildiysa pmlogger kayit listesindeki adlari yeniden cozsun (yoksa her ornekte
+        # PM_ERR_NOAGENT); yeni arsiv parcasi acilir
+        {% if 'kaldirildi:' in (pcp_pmda_kaldir.stdout | default('')) %}
+        timeout 90 systemctl restart pmlogger || echo "UYARI: pmlogger yeniden baslatilamadi"
+        {% endif %}
+        systemctl is-active --quiet pmlogger || systemctl start pmlogger || echo "UYARI: pmlogger baslatilamadi"
+        echo "pmcd yeniden baslatildi"
+      register: pcp_pmcd_restart
+      changed_when: true
+      # Etiketli kosumda (--tags proc|hotproc|pmda) diger etiketin register degiskeni tanimsizdir -> default({});
+      # PMDA icin yalniz GERCEK kaldirma (yorum isareti yazilmasi pmcd/pmlogger yeniden baslatmasi gerektirmez)
+      when:
+        - not ansible_check_mode
+        - ((pcp_a_degisti | default({})) is changed) or ((pcp_needinstall | default({})) is changed)
+          or ((pcp_hotproc | default({})) is changed) or ('kaldirildi:' in ((pcp_pmda_kaldir | default({})).stdout | default('')))
+      tags: [proc, hotproc, pmda]
+
+    # =====================================================================
+    # KAYIT PROFILI (varsayilan dokunma)
+    # =====================================================================
+    - name: Profil - tam profil reddedildi bilgisi
+      ansible.builtin.debug:
+        msg: >-
+          kayit_profili=tam UYGULANMADI: {{ ('pmlogger kayit yapilandirmasini ' ~ pt.KAYIT_SAHIP ~ ' yonetiyor (pmlogconf grup '
+          ~ 'eklemeleri config.default uzerinde); ayni sunucuda iki kayit sahibi olmaz')
+          if pt.KAYIT_SAHIP | default('') | length > 0 else 'birincil pmlogger kontrol satiri bulunamadi' }}.
+      when: kayit_profili == 'tam' and not (pcp_profil_tam | bool)
+      tags: [profil]
+
+    # Metrik listeleri canli metrik agacindan (pminfo -m yalniz ad uzayini okur)
+    - name: Profil - tam profil metrik listeleri
+      ansible.builtin.shell: |
+        set -o pipefail
+        pminfo -m {{ item.ifade }} 2>/dev/null \
+          | awk '$2 == "PMID:" && $3 !~ /^511\./ && $1 !~ /environ/ && $1 != "proc.memory.maps"' \
+          | awk '$1 !~ /^mem\.(zoneinfo|buddyinfo|slabinfo)\./ { print "    " $1 }' \
+          | sort -u || true
+      loop:
+        - {grup: devnet, ifade: disk network}
+        - {grup: sys, ifade: kernel.all kernel.percpu kernel.pernode mem swap filesys vfs nfs nfs4 rpc proc.nprocs proc.runq}
+        - {grup: proc, ifade: proc.psinfo proc.id proc.memory proc.io proc.schedstat proc.fd.count}
+        - {grup: hw, ifade: lmsensors smart}
+        - {grup: hinv, ifade: hinv kernel.uname}
+      loop_control:
+        label: "{{ item.grup }}"
+      register: pcp_tam_cikti
+      changed_when: false
+      check_mode: false
+      when: pcp_profil_tam | bool
+      tags: [profil]
+
+    - name: Profil - metrik listelerini ata
+      ansible.builtin.set_fact:
+        pcp_tam_metrik: >-
+          {{ dict(pcp_tam_cikti.results | map(attribute='item.grup')
+                  | zip(pcp_tam_cikti.results | map(attribute='stdout'))) }}
+      when: pcp_profil_tam | bool
+      tags: [profil]
+
+    - name: Profil - metrik listesi bos ise dur (pmcd/proc PMDA sorunu)
+      ansible.builtin.assert:
+        that:
+          - pcp_tam_metrik.devnet | trim | length > 0
+          - pcp_tam_metrik.sys | trim | length > 0
+          - pcp_tam_metrik.proc | trim | length > 0
+        fail_msg: >-
+          Tam profil metrik listesi uretilemedi (pmcd calismiyor ya da proc PMDA sorunlu);
+          kayit yapilandirmasina DOKUNULMADI. 'systemctl status pmcd' ve 'pminfo proc' ile kontrol edin.
+        quiet: true
+      when: pcp_profil_tam | bool
+      tags: [profil]
+
+    # mode 0644 sart: sikilastirilmis sistemlerde (umask 027) dar izinli yapilandirmayi
+    # 'pcp' kullanicisi okuyamaz ve pmlogger durmadan yeniden baslar
+    - name: Profil - tam kayit yapilandirmasini yaz
+      ansible.builtin.template:
+        src: pcp_templates/config.pcp-tam.j2
+        dest: "{{ pcp_pmlogger_dizin }}/{{ pcp_tam_ad }}"
+        owner: root
+        group: root
+        mode: '0644'
+      register: pcp_tam_yaz
+      when: pcp_profil_tam | bool
+      tags: [profil]
+
+    - name: Profil - birincil pmlogger kontrol satirini yonlendir
+      ansible.builtin.replace:
+        path: "{{ pt.CTRL }}"
+        regexp: '^([^#\n]*LOCALHOSTNAME.*?)-c[ \t]+\S+'
+        replace: "\\g<1>-c {{ pcp_tam_ad if pcp_profil_tam | bool else 'config.default' }}"
+      register: pcp_ctrl_yaz
+      when: pcp_profil_tam | bool or pcp_profil_varsayilan | bool
+      tags: [profil]
+
+    - name: Profil - pmlogger yeniden baslat (kayit yapilandirmasi degisti)
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl reset-failed pmlogger >/dev/null 2>&1 || true
+        systemctl reset-failed pmlogger_farm >/dev/null 2>&1 || true
+        systemctl restart pmlogger
+        echo "pmlogger yeniden baslatildi"
+      register: pcp_pmlogger_restart
+      changed_when: true
+      when:
+        - not ansible_check_mode
+        - (pcp_tam_yaz is changed) or (pcp_ctrl_yaz is changed)
+      tags: [profil]
+
+    # =====================================================================
+    # SAKLAMA (tek sahip ilkesi)
+    # =====================================================================
+    - name: Saklama - pmlogger_daily saklama ve sikistirma (baska sahip yoksa)
+      ansible.builtin.lineinfile:
+        path: "{{ pcp_timers_dosya }}"
+        regexp: '^#?\s*PMLOGGER_DAILY_PARAMS='
+        line: 'PMLOGGER_DAILY_PARAMS="-E -x 1 -k {{ pcp_saklama_gun }}"'
+        owner: root
+        group: root
+        mode: '0644'
+      when: pcp_saklama_yaz | bool
+      tags: [saklama]
+
+    - name: Saklama - bilgi
+      ansible.builtin.debug:
+        msg: >-
+          {{ ('PMLOGGER_DAILY_PARAMS="-E -x 1 -k ' ~ pcp_saklama_gun ~ '" (' ~ pcp_saklama_notu ~ '); yedek izi '
+              ~ yedek_kok ~ pcp_ayar_dizin ~ '/ altinda - log-saklama bu dosyaya dokunmaz')
+             if pcp_saklama_yaz | bool else
+             ('Saklama YAZILMADI: ' ~ ('sahip ' ~ pt.SAHIP ~ ' (tek sahip ilkesi; bu playbook yalniz raporlar)'
+               if pt.SAHIP | default('') | length > 0 else
+               ('pmlogger_timers yok' if pt.TIMERS | default('0') != '1' else 'karar dokunma/rapor'))
+              ~ '. Mevcut: "' ~ pt.DAILY | default('') ~ '"; bu playbook kurali ' ~ pcp_saklama_gun ~ ' gun.') }}
+      tags: [saklama]
+
+    # =====================================================================
+    # INCELEME SABLONLARI + DOGRULAMA BETIGI
+    # =====================================================================
+    - name: Sablon - pmrep inceleme sablonlari (:canli :obur :agirlik)
+      ansible.builtin.copy:
+        src: pcp_files/ozel.conf
+        dest: /etc/pcp/pmrep/ozel.conf
+        owner: root
+        group: root
+        mode: '0644'
+      when:
+        - pmrep_sablon_karari == 'uygula'
+        - pt.PMREP_DIZIN | default('0') == '1'
+      tags: [sablon]
+
+    - name: Sablon - dogrulama betigi (salt okunur; -y secenegi YUK uretir)
+      ansible.builtin.copy:
+        src: pcp_files/pcp-dogrula.sh
+        dest: "{{ pcp_dogrula_yol }}"
+        owner: root
+        group: root
+        mode: '0755'
+      when:
+        - dogrula_betigi_karari == 'uygula'
+        - pcp_var | bool
+      tags: [sablon]
+
+    # =====================================================================
+    # PMIE ESIK ALARMLARI (varsayilan dokunma; pmieconf hazir kural kutuphanesi)
+    # =====================================================================
+    # Temiz kurulumda config.default yoktur: pmie ilk basladiginda pmie_check uretir.
+    # Bekleme kabuk icinde ust sinirli (until/retries kullanilmaz - dogrulama bilgi kipi).
+    - name: Pmie - yapilandirma dosyasini hazirla
+      ansible.builtin.shell: |
+        set -o pipefail
+        F={{ pcp_pmie_yapilandirma | quote }}
+        [ -f "$F" ] && { echo VAR; exit 0; }
+        systemctl enable --now pmie >/dev/null 2>&1 || true
+        for i in $(seq 1 15); do [ -f "$F" ] && break; sleep 2; done
+        [ -f "$F" ] || pmieconf -f "$F" rules >/dev/null 2>&1 || true
+        [ -f "$F" ] && echo URETILDI || echo YOK
+      register: pcp_pmie_hazir
+      changed_when: "'URETILDI' in pcp_pmie_hazir.stdout"
+      when:
+        - pmie_karari == 'uygula'
+        - pcp_var | bool
+        - not ansible_check_mode
+      tags: [pmie]
+
+    # pmieconf enable/modify her calismada basarili doner, degisti mi bildirmez:
+    # once MEVCUT durum okunur, yalniz farkli olanlar uygulanir.
+    - name: Pmie - kurallari ve esikleri uygula (yalniz farkli olanlar)
+      ansible.builtin.shell: |
+        set -o pipefail
+        F={{ pcp_pmie_yapilandirma | quote }}
+        DEGISTI=0
+        ETKIN=$(pmieconf -f "$F" rules enabled 2>/dev/null || true)
+        for k in {{ pcp_pmie_kurallari | map('quote') | join(' ') }}; do
+            if ! printf '%s\n' "$ETKIN" | grep -qE "^[[:space:]]+$(printf '%s' "$k" | sed 's/\./\\./g')[[:space:]]"; then
+                pmieconf -f "$F" enable "$k" >/dev/null 2>&1 && { echo "etkinlestirildi: $k"; DEGISTI=1; }
+            fi
+        done
+        {% for e in pcp_pmie_esikleri %}
+        M=$(pmieconf -f "$F" list {{ e.kural | quote }} {{ e.degisken | quote }} 2>/dev/null || true)
+        if ! printf '%s\n' "$M" | grep -qE "{{ e.degisken }}[[:space:]]*=[[:space:]]*{{ e.deger | regex_escape }}[[:space:]]*$"; then
+            pmieconf -f "$F" modify {{ e.kural | quote }} {{ e.degisken | quote }} {{ e.deger | quote }} >/dev/null 2>&1 \
+                && { echo "esik: {{ e.kural }}.{{ e.degisken }}={{ e.deger }}"; DEGISTI=1; }
+        fi
+        {% endfor %}
+        if [ "$DEGISTI" -eq 1 ]; then systemctl restart pmie && echo DEGISTI; else systemctl enable --now pmie >/dev/null 2>&1 || true; fi
+      register: pcp_pmie_uygula
+      changed_when: "'DEGISTI' in pcp_pmie_uygula.stdout"
+      when:
+        - pmie_karari == 'uygula'
+        - pcp_var | bool
+        - not ansible_check_mode
+        - "'YOK' not in (pcp_pmie_hazir.stdout | default(''))"
+      tags: [pmie]
+
+    # =====================================================================
+    # DOGRULAMA (salt okuma; sapmalar kosumu DURDURMAZ - bilgi kipi)
+    # =====================================================================
+    - name: Bekleyen isleyicileri dogrulamadan once calistir
+      ansible.builtin.meta: flush_handlers
+
+    - name: Dogrulama bloku
+      tags: [dogrula]
+      block:
+        - name: Dogrula - PCP kalemleri
+          ansible.builtin.shell: |
+            set -o pipefail
+            {% if pcp_aile == 'Debian' %}
+            paket_var() { [ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" = "install ok installed" ]; }
+            paket_surum() { paket_var "$1" && dpkg-query -W -f='${Version}' "$1" 2>/dev/null; }
+            {% else %}
+            paket_var() { rpm -q "$1" >/dev/null 2>&1; }
+            paket_surum() { rpm -q --qf '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null; }
+            {% endif %}
+            if ! paket_var pcp; then echo "SORUN: pcp kurulu degil (rapor modu ya da depo yok)"; exit 0; fi
+            [ -f /etc/pcp.conf ] && . /etc/pcp.conf
+            SYSCONF=${PCP_SYSCONF_DIR:-/etc/pcp}
+            SCD=${PCP_SYSCONFIG_DIR:-{{ pcp_ayar_dizin }}}
+            for s in pmcd pmlogger; do
+                d=$(systemctl is-active "$s" 2>/dev/null || true)
+                if [ "$d" = active ]; then echo "$s: active"; else echo "SORUN: $s etkin degil ($d)"; fi
+            done
+            # pmlogger -T24h10m suresi dolunca temiz cikar (cikis 0) ve Restart=always ile yeniden baslar: gece isi saati
+            # kaydirilinca ilk gecelerde gunde bir BEKLENEN yeniden baslatmadir, NRestarts tek basina hata degildir.
+            # SORUN = son 24 saatte basarisiz sonuc / sinyalle, dokumle ya da sifir olmayan kodla cikis.
+            NR=$(systemctl show pmlogger -p NRestarts --value 2>/dev/null || true)
+            HATA=$(timeout 60 journalctl -u pmlogger.service --since -24h --no-pager -o cat 2>/dev/null \
+                | grep -cE 'Failed with result|code=(killed|dumped)|status=[1-9]' || true)
+            if [ "${HATA:-0}" -gt 0 ] || [ "$(systemctl show pmlogger -p Result --value 2>/dev/null)" != success ]; then
+                echo "SORUN: pmlogger son 24 saatte hatayla cikti ($HATA kayit; NRestarts $NR) - pmlogger.log incelenmeli"
+            elif [ -n "$NR" ] && [ "$NR" != "0" ]; then
+                echo "BILGI: pmlogger $NR kez yeniden basladi, hata kaydi yok (-T24h10m sure sonu olabilir)"
+            fi
+            for t in pmlogger_daily.timer pmlogger_check.timer; do
+                [ "$(systemctl is-active "$t" 2>/dev/null || true)" = active ] || echo "SORUN: $t etkin degil (gunluk dondurme/sikistirma calismaz)"
+            done
+            # Arsiv tazeligi (son 15 dk)
+            SON=$(find /var/log/pcp/pmlogger -type f -name '[0-9]*' -newermt '-15 minutes' 2>/dev/null | head -1)
+            if [ -n "$SON" ]; then echo "arsiv taze: $SON"; else echo "SORUN: son 15 dakikada PCP arsivi yazilmamis"; fi
+            # Surec basina G/C gorunurlugu (/proc/<pid>/io yalniz sahibine acik; surec SAYISI yetmez)
+            if systemctl is-active --quiet pmcd; then
+                R=$(timeout 60 pminfo -f proc.io.read_bytes 2>/dev/null | grep -c 'inst \[' || true)
+                P=$(timeout 60 runuser -u pcp -- pminfo -f proc.io.read_bytes 2>/dev/null | grep -c 'inst \[' || true)
+                if [ "${R:-0}" -gt 0 ] && [ $(( ${P:-0} * 100 )) -lt $(( R * {{ pcp_gorunurluk_orani | int }} )) ]; then
+                    D={{ 'SORUN' if proc_tum_surec_karari == 'gerekirse' else 'BILGI' }}
+                    echo "$D: pcp kullanicisi surec basina G/C degerinin ${P:-0} / $R kadarini goruyor - arsivde surec G/C verisi eksik"
+                else echo "surec G/C gorunurlugu: pcp ${P:-0} / root ${R:-0}"; fi
+            fi
+            # -A varken guvenlik/yuk kapilari
+            if grep -E '^proc[[:space:]].*pmdaproc' "$SYSCONF/pmcd/pmcd.conf" 2>/dev/null | grep -qE '[[:space:]]-A([[:space:]]|$)'; then
+                grep -qE '^[[:space:]]*PMCD_LOCAL=1' "$SCD/pmcd" 2>/dev/null \
+                    || echo "SORUN: proc -A var ama pmcd yalniz yerel degil (PMCD_LOCAL=1 yok) - uzak istemci tum surec ayrintilarini okuyabilir"
+                systemctl is-active --quiet pmproxy 2>/dev/null \
+                    && echo "SORUN: proc -A var ve pmproxy calisiyor - uzak istemci pmproxy uzerinden tum surec ayrintilarini okuyabilir"
+                # tespit ile ayni kume: birincil pmlogger -c dosyasi SORUN, kullanilmayan dosya BILGI
+                CF={{ (pt.CTRL_C | default('')) | quote }}; case "$CF" in /*|"") ;; *) CF={{ pcp_pmlogger_dizin | quote }}/"$CF" ;; esac
+                for f in {{ pcp_pmlogger_dizin | quote }}/*; do
+                    [ -f "$f" ] || continue
+                    grep -qE {{ pcp_a_riskli_desen | quote }} "$f" || continue
+                    if [ "$f" = "$CF" ]; then echo "SORUN: proc -A var ve kayit yapilandirmasi $f smaps/maps/environ iceriyor (mmap_lock / gizli bilgi)"
+                    else echo "BILGI: $f smaps/maps/environ iceriyor (birincil kayitta kullanilmiyor; eski dosya olabilir)"; fi
+                done
+            fi
+            # pmproxy acilista baslayacak mi (Debian paketi etkin birakir): calisinca -A kapisi kapanir, uzak erisim acilir
+            if [ "$(systemctl is-enabled pmproxy 2>/dev/null || true)" = enabled ] && ! systemctl is-active --quiet pmproxy 2>/dev/null; then
+                echo "BILGI: pmproxy acilista baslayacak (enabled, su an calismiyor) - calisinca uzak istemci pmcd verisine ulasir (systemctl disable pmproxy)"
+            fi
+            # Kapatilan PMDA listesi: etkin satir / bekleyen kurulum = SORUN, isaret yoksa BILGI
+            P=${PCP_PMDAS_DIR:-/var/lib/pcp/pmdas}
+            for m in {{ pcp_kapali_pmdalar | map('quote') | join(' ') }}; do
+                grep -qE "^$m[[:space:]]" "$SYSCONF/pmcd/pmcd.conf" 2>/dev/null \
+                    && echo "SORUN: $m PMDA etkin (kapatilacaklar listesinde) - pmda_kapatma_karari=uygula ile kaldirilir"
+                ls "$P/$m"/.NeedInstall* >/dev/null 2>&1 && echo "SORUN: $m icin bekleyen kurulum isareti (pmcd baslarken PMDA kurulur)"
+                [ -d "$P/$m" ] && ! grep -qE "^#.*$m/pmda$m" "$SYSCONF/pmcd/pmcd.conf" 2>/dev/null \
+                    && echo "BILGI: $m icin yeniden kurulum isareti yok (pcp-zeroconf guncellemesi PMDA yi geri kurabilir)"
+            done
+            # Kesmeleri kapatan kayit gruplari: force exclude yok ya da metrikler kayitta = SORUN
+            GD=${PCP_VAR_DIR:-/var/lib/pcp}/config/pmlogconf
+            for g in {{ pcp_kapali_kayit_gruplari | map('quote') | join(' ') }}; do
+                f=$(readlink -f "$GD/$g" 2>/dev/null); [ -f "$f" ] || continue
+                grep -qE '^[[:space:]]*force[[:space:]]+exclude' "$f" || echo "SORUN: $g grup dosyasi force exclude degil (kayda alinabilir)"
+                for m in $(awk '/^[[:space:]]+[a-z]/{print $1}' "$f"); do
+                    grep -qE "^[[:space:]]+$m$" {{ (pcp_pmlogger_dizin ~ '/config.default') | quote }} 2>/dev/null \
+                        && { echo "SORUN: $g metrigi $m kayit yapilandirmasinda"; break; }
+                done
+            done
+            # Saklama alt siniri (yapilandirma kurali en az gun)
+            K=$(grep -E '^PMLOGGER_DAILY_PARAMS=' "$SCD/pmlogger_timers" 2>/dev/null | tail -1 | grep -oE -- '-k[ =]?[0-9]+' | tr -dc '0-9')
+            if [ -z "$K" ]; then echo "BILGI: PMLOGGER_DAILY_PARAMS icinde -k yok (PCP varsayilani 14 gun)"
+            elif [ "$K" -lt {{ pcp_saklama_en_az_gun | int }} ]; then echo "SORUN: pmlogger -k $K < en az {{ pcp_saklama_en_az_gun }} gun"
+            else echo "saklama: -k $K gun"; fi
+            # pmlogger.log tasmasi (turetilmis metrik dongusu belirtisi)
+            for lf in /var/log/pcp/pmlogger/*/pmlogger.log; do
+                [ -f "$lf" ] || continue
+                S=$(stat -c %s "$lf"); [ "$S" -ge 5242880 ] && echo "SORUN: $lf $(( S / 1048576 )) MB - dogrulama dongusu olabilir"
+            done
+            # control.d altinda artik dosya (PCP 7 Duplicate pmlogger instances)
+            A=$(find "$SYSCONF/pmlogger/control.d" -maxdepth 1 -type f 2>/dev/null | grep -E '\.(orig|bak|old|rpmsave|rpmnew)$|~$' | tr '\n' ' ' || true)
+            [ -n "$A" ] && echo "SORUN: control.d altinda artik dosya (pmlogger_check kontrol dosyasi sanar): $A"
+            # Tek silici ilkesi
+            if systemctl is-active --quiet pcp-log-guard.timer 2>/dev/null && [ -x /usr/local/sbin/log-saklama-bekci ]; then
+                echo "SORUN: pcp-log-guard ve log-saklama bekcisi ayni anda etkin (iki silici) - eski_kurulum_karari=otomatik ile uygula"
+            fi
+            # Ev dizinindeki pmrep.conf hazir sablonlari gizler
+            [ -f /root/.pcp/pmrep.conf ] && echo "SORUN: /root/.pcp/pmrep.conf /etc/pcp/pmrep altindaki hazir sablonlari gizliyor"
+            [ -f "$SYSCONF/pmrep/ozel.conf" ] && echo "sablonlar: $SYSCONF/pmrep/ozel.conf var"
+            true
+          register: d_pcp
+          changed_when: false
+          check_mode: false
+          failed_when: false
+
+        # Gece isleri yayma (salt okuma): paket varsayilaninda kalan zamanlayici ya da acik gece raporu = SORUN
+        - name: Dogrula - PCP gece isleri yayma ve gece raporu (olcek kurali)
+          ansible.builtin.shell: |
+            # PCP_GECE_DOGRULA (rol playbooklarinda birebir ayni)
+            set -o pipefail
+            [ -f /etc/pcp.conf ] && . /etc/pcp.conf
+            BIN=${PCP_BINADM_DIR:-/usr/libexec/pcp/bin}
+            [ -x "$BIN/pmlogger_daily" ] || { echo "PCP kurulu degil"; exit 0; }
+            [ -f /etc/cron.d/pcp-pmlogger ] && { echo "BILGI: PCP gece isleri cron ile calisiyor - denetlenmedi"; exit 0; }
+            AD=$(hostname -s 2>/dev/null || true)
+            case "$AD" in localhost|localhost.localdomain|localhost4|localhost6|"")
+                echo "SORUN: sunucu kisa adi '${AD:-bos}' - PCP gece isi kaydirmasi hesaplanamaz, tum bu sunucular ayni saate duser" \
+                     "(hostnamectl set-hostname)" ;; esac
+            for b in pmlogger_daily.timer pmie_daily.timer pmlogger_check.timer pmie_check.timer pmlogger_farm_check.timer \
+                     pmie_farm_check.timer; do
+                systemctl cat "$b" >/dev/null 2>&1 || continue
+                [ -f "/etc/systemd/system/$b.d/50-yuk-dagitimi.conf" ] \
+                    || echo "SORUN: $b paket varsayilaninda (tum sunucularda ayni dakika) - pcp_gece_karari=uygula ile yayilir"
+                [ "$(systemctl show -p NeedDaemonReload --value "$b" 2>/dev/null)" = yes ] \
+                    && echo "SORUN: $b drop-in diskte ama yuklenmemis (daemon-reload bekliyor)"
+                case "$b" in pmlogger_daily.timer|pmie_daily.timer)
+                    [ -f "/etc/systemd/system/$b.d/50-yuk-dagitimi.conf" ] && ! grep -qx 'Persistent=false' "/etc/systemd/system/$b.d/50-yuk-dagitimi.conf" \
+                        && echo "SORUN: $b Persistent=false yok - sunucu gece isi saatinde kapaliysa is acilista hemen calisir (toplu acilista ayni anda)" ;;
+                esac
+            done
+            for b in pmlogger_daily.service pmie_daily.service; do
+                systemctl cat "$b" >/dev/null 2>&1 || continue
+                grep -qs '^ConditionPathExists=!/run/pcp-gece-gecis$' "/etc/systemd/system/$b.d/51-gecis-kapisi.conf" \
+                    || echo "SORUN: $b gecis kapisi yok (uygulama aninda gece isi hemen calisir) - pcp_gece_karari=uygula ile yazilir"
+            done
+            [ -e /run/pcp-gece-gecis ] \
+                && echo "SORUN: /run/pcp-gece-gecis takili kalmis - PCP gece isleri calismaz (rm -f /run/pcp-gece-gecis)"
+            if systemctl cat pmlogger_daily_report.service >/dev/null 2>&1; then
+                grep -qs '^ConditionPathExists=/etc/pcp/pmlogger_daily_report.acik' \
+                    /etc/systemd/system/pmlogger_daily_report.service.d/50-yuk-dagitimi.conf \
+                    || echo "SORUN: ayri gece raporu servisi (pmlogger_daily_report, RHEL 8 / PCP 5.3) kapali degil - her gece 02:00 tum gun arsivini okur"
+            fi
+            if grep -q -- '--noreport' "$BIN/pmlogger_daily" 2>/dev/null; then
+                systemctl show -p ExecStart --value pmlogger_daily.service 2>/dev/null \
+                    | grep -qE 'argv\[\]=[^;]*[[:space:]](-D|--noreport)([[:space:]]|;|$)' \
+                    || echo "SORUN: gece raporu acik (pmlogger_daily -D yok) - her gece tum gun arsivi /var/tmp altina acilir"
+                U=$(systemctl show -p FragmentPath --value pmlogger_daily.service 2>/dev/null)
+                PE=$(grep -E '^ExecStart=' "$U" 2>/dev/null | tail -1 | sed -E 's#^ExecStart=##')
+                DE=$(grep -E '^ExecStart=.+' /etc/systemd/system/pmlogger_daily.service.d/50-yuk-dagitimi.conf 2>/dev/null \
+                    | tail -1 | sed -E 's#^ExecStart=##; s# -D##')
+                [ -n "$DE" ] && [ "$DE" != "$PE" ] \
+                    && echo "SORUN: paket birimi ExecStart satiri degismis (paket: $PE / drop-in: $DE) - playbook yeniden kosulmali"
+            elif ! systemctl cat pmlogger_daily_report.service >/dev/null 2>&1; then
+                echo "BILGI: kurulu pmlogger_daily -D/--noreport tanimiyor ve ayri rapor servisi yok"
+            fi
+            R=$(systemctl show -p Result --value pmlogger_daily.service 2>/dev/null)
+            [ -n "$R" ] && [ "$R" != success ] && echo "SORUN: pmlogger_daily son calisma sonucu $R"
+            echo "pmlogger_daily sonraki: $(systemctl show -p NextElapseUSecRealtime --value pmlogger_daily.timer 2>/dev/null)"
+          register: d_pcp_gece
+          changed_when: false
+          check_mode: false
+          failed_when: false
+
+        # PCP saklama alana sigiyor mu (salt okuma): SORUN = -k yok / en az altinda / hedef ustunde /
+        # 2 ham gun + (k-2) xz gun > LV x pay (yapilandirma kurali; tam gun olcumu)
+        - name: Dogrula - PCP saklama alana sigiyor
+          check_mode: false   # salt okunur: --check ile de GERCEKTEN kosmali
+          ansible.builtin.shell: |
+            # PCP_SAKLAMA_DOGRULA (rol playbooklarinda birebir ayni) - olcum Izleme/Logaltyapi gorevi ile AYNI kural
+            # (tam gunler; bugun ve en eski gun sayilmaz; 2 tam gun yoksa olcum yok); '--tags dogrula' tek basina
+            # kosulunca olcum olgusu tanimsiz oldugundan burada BAGIMSIZ yapilir.
+            set -o pipefail
+            ENAZ={{ pcp_saklama_en_az_gun | int }}; HEDEF={{ pcp_saklama_hedef_gun | int }}
+            ORAN={{ pcp_lv_doluluk_orani | default(0.8) | float }}
+            [ "$(findmnt --target /var/log/pcp -n -o TARGET 2>/dev/null)" = "/var/log/pcp" ] || ORAN={{ pcp_paylasimli_oran | default(0.25) | float }}
+            # pmlogger_timers yeri pcp.conf icindeki PCP_SYSCONFIG_DIR: RHEL /etc/sysconfig, Debian /etc/default; pcp.conf yoksa RHEL yolu
+            TM=$( [ -f /etc/pcp.conf ] && . /etc/pcp.conf; printf '%s' "${PCP_SYSCONFIG_DIR:-/etc/sysconfig}" )/pmlogger_timers
+            [ -f "$TM" ] || { echo "pmlogger_timers yok (PCP kurulu degil)"; exit 0; }
+            K=$(grep -E '^PMLOGGER_DAILY_PARAMS=' "$TM" 2>/dev/null | tail -1 | grep -oE -- '-k[ =]?[0-9]+' | tr -dc '0-9')
+            # systemd ortam dosyasi satir sonu yorumunu TANIMAZ: tirnaktan sonraki ek ya da tirnaksiz degerde '#' degerin
+            # parcasi olur (or. -k 28 # ... -> "-k value (28#)"), pmlogger_daily her gece hatayla durur (sikistirma/silme yok)
+            PL=$(grep -E '^PMLOGGER_DAILY_PARAMS=' "$TM" 2>/dev/null | tail -1)
+            DE='^PMLOGGER_DAILY_PARAMS=.*#|^PMLOGGER_DAILY_PARAMS="[^"]*"[[:space:]]*[^[:space:]]'
+            if printf '%s\n' "$PL" | grep -qE "$DE"; then
+                echo "SORUN: PMLOGGER_DAILY_PARAMS satirinda deger disi ek var (satir sonu yorumu?) - systemd degerin"\
+                     "parcasi sayar, pmlogger_daily hatayla durur: $PL"
+            fi
+            [ -n "$K" ] || { echo "SORUN: PMLOGGER_DAILY_PARAMS icinde -k yok (PCP varsayilani 14 gun, alana sigdirilmadi)"; exit 0; }
+            [ "$K" -ge "$ENAZ" ] || echo "SORUN: pmlogger -k $K < en az $ENAZ gun"
+            [ "$K" -le "$HEDEF" ] || echo "SORUN: pmlogger -k $K > hedef $HEDEF gun"
+            LV=$(df -Pm /var/log/pcp 2>/dev/null | awk 'NR==2{print $2}')
+            BOS=$(df -Pm /var/log/pcp 2>/dev/null | awk 'NR==2{print $4}'); KUL=$(du -sm /var/log/pcp 2>/dev/null | cut -f1)
+            D=/var/log/pcp/pmlogger/$(hostname)
+            [ -d "$D" ] || D=$(find /var/log/pcp/pmlogger -maxdepth 2 -name '*.index*' -printf '%h\n' 2>/dev/null | head -1)
+            HAM=0; XZ=0; GUN=0
+            if [ -n "$D" ] && [ -d "$D" ]; then
+                BUGUN=$(date +%Y%m%d)
+                PC=/etc/pcp/pmlogger
+                VOL=$(grep -hoE -- '-v[[:space:]]*[0-9]+[Mm][Bb]' $PC/control $PC/control.d/* 2>/dev/null | head -1 | tr -dc '0-9' || true)
+                VOL=${VOL:-100}
+                GUNLER=$(find "$D" -maxdepth 1 -mindepth 1 -printf '%f\n' | grep -oE '^[0-9]{8}' | sort -u | grep -vx "$BUGUN" || true)
+                GUN=$(printf '%s\n' "$GUNLER" | grep -c . || true)
+                if [ "$GUN" -ge 3 ]; then
+                    for p in $(printf '%s\n' "$GUNLER" | tail -n +2); do
+                        b=$(du -cm "$D"/"$p".* 2>/dev/null | tail -1 | cut -f1)
+                        PARCA=$(find "$D" -maxdepth 1 -name "$p.*" -printf '%f\n' 2>/dev/null | grep -vE '[.](index|meta)([.]|$)' \
+                            | grep -E '[.][0-9]+([.](xz|zst|gz|bz2|lzma))?$' || true)
+                        n=$(printf '%s\n' "$PARCA" | grep -c . || true)
+                        h=$((n * VOL)); [ "$b" -gt "$h" ] && h=$b
+                        [ "$h" -gt "$HAM" ] && HAM=$h
+                        if [ -n "$PARCA" ] && ! printf '%s\n' "$PARCA" | grep -qvE '[.](xz|zst|gz|bz2|lzma)$'; then
+                            [ "$b" -gt "$XZ" ] && XZ=$b
+                        fi
+                    done
+                fi
+            fi
+            [ "$XZ" -gt 0 ] || XZ=$HAM
+            if [ "${LV:-0}" -gt 0 ] && [ "$HAM" -gt 0 ]; then
+                # tavan (R2) = min(LV x pay, PCP kullanimi + bos alan - LV x 0,2): bolum yuzde 80 sinirini GECMEZ (ustun kural)
+                GEREK=$((2 * HAM + (K - 2) * XZ))
+                TAVAN=$(awk -v l="$LV" -v o="$ORAN" -v b="${BOS:-0}" -v k="${KUL:-0}" \
+                    'BEGIN{t=l*o; u=k+b-l*0.2; if ((b>0||k>0) && u<t) t=u; if (t<0) t=0; printf "%d", t}')
+                if [ "$GEREK" -le "$TAVAN" ]; then
+                    echo "pmlogger -k $K gun sigiyor: gerek ~$GEREK MB <= tavan $TAVAN MB (LV $LV MB, pay $ORAN, bos ${BOS:-0} MB; gun ham $HAM / xz $XZ MB)"
+                else
+                    echo "SORUN: pmlogger -k $K gun icin ~$GEREK MB gerekir, tavan $TAVAN MB (LV $LV MB, pay $ORAN, bos ${BOS:-0} MB)" \
+                         "- LV buyutulmeli ya da bekci silecek"
+                fi
+            else
+                echo "pmlogger -k $K gun (alan olcumu yok: $GUN tamamlanmis gun, en az 3 gerekir - sonraki kosumda olculur)"
+            fi
+          register: pcp_saklama_kontrol
+          changed_when: false
+          failed_when: false
+
+        - name: Dogrula - ozet (bilgi kipi; kosum durmaz)
+          ansible.builtin.debug:
+            # filtre '+' dan once baglanir: toplam parantez icinde olmali
+            msg: "{{ ['SORUN SAYISI: ' ~ (((d_pcp.stdout_lines | default([])) + (d_pcp_gece.stdout_lines | default([]))
+                                            + (pcp_saklama_kontrol.stdout_lines | default([])))
+                                            | select('match', '^SORUN') | list | length)]
+                     + (d_pcp.stdout_lines | default([])) + (d_pcp_gece.stdout_lines | default([]))
+                     + (pcp_saklama_kontrol.stdout_lines | default([])) }}"
+
+    # Kosum sonu: bu kosumun degistirdigi dosyalarin yeni hali isleyicilerden sonra hemen yedeklenir. Boylece sonraki
+    # kosum kendi ciktisini yeniden yedeklemez (ikinci kosum changed 0) ve her icerik durumu yedekte kalir (geri donus).
+    # Mantik bastaki yedek goreviyle ayni; yalniz yedek adi <dosya>-kosum-sonu-<damga>, kayit _durum-<damga>.txt (geri alma
+    # manifesti _kosum-<damga>.txt yalniz degisiklik ONCESI icerikleri tasir - kosum sonu satirlari ona KARISMAZ).
+    - name: Yedek - kosum sonu durumunu yedekle (sonraki kosum kendi ciktisini yeniden yedeklemesin)
+      vars:
+        # Playbook'un kendi kurdugu dosya kaynakla AYNIYSA yedeklenmez (ikinci kosum changed 0). config.pcp-tam
+        # sablonu hedefteki metrik listesinden uretildigi icin burada hesaplanamaz (tam profilde ikinci kosum yedek 1)
+        _kaynak_sha:
+          - "/etc/pcp/pmrep/ozel.conf {{ lookup('file', 'pcp_files/ozel.conf', rstrip=False) | hash('sha256') }}"
+          - "{{ pcp_dogrula_yol }} {{ lookup('file', 'pcp_files/pcp-dogrula.sh', rstrip=False) | hash('sha256') }}"
+      ansible.builtin.shell: |
+        set -o pipefail
+        KOK={{ yedek_kok | quote }}
+        DAMGA={{ yedek_damga | quote }}
+        MANIFEST="$KOK/_durum-$DAMGA.txt"
+        DEGISTI=0
+        HATA=0
+        # R13: kosum basinda var olmayan, simdi var olan dosyalar geri alma manifestine "OLUSTURULDU  <dosya>  -" yazilir
+        # (geri alma: dosya /var/backup agacina tasinir - talimat 6.2). Bos listede for dongusu sozdizimi bozulmasin: degisken.
+        YENI={{ (yedek_sonuc.stdout_lines | default([]) | select('match', '^YOK:') | map('regex_replace', '^YOK:', '') | join(' ')) | quote }}
+        for f in $YENI; do
+            [ -f "$f" ] || continue
+            grep -qsF "OLUSTURULDU  $f  " "$KOK/_kosum-$DAMGA.txt" && continue
+            if mkdir -p "$KOK" && chmod 0700 "$KOK" && printf 'OLUSTURULDU  %s  -\n' "$f" >> "$KOK/_kosum-$DAMGA.txt"; then
+                DEGISTI=1
+            else
+                echo "SORUN: geri alma manifestine yazilamadi ($KOK/_kosum-$DAMGA.txt: OLUSTURULDU $f)"; HATA=1
+            fi
+        done
+        for f in {{ pcp_yedeklenecek | map('quote') | join(' ') }}; do
+            [ -f "$f" ] || continue
+            KS=$(printf '%s\n' {{ _kaynak_sha | map('quote') | join(' ') }} | awk -v f="$f" '$1==f{print $2}')
+            [ -n "$KS" ] && [ "$(sha256sum "$f" | awk '{print $1}')" = "$KS" ] && continue
+            [ "$f" = {{ pcp_timers_dosya | quote }} ] && grep -qxF {{ ('PMLOGGER_DAILY_PARAMS="-E -x 1 -k ' ~ pcp_saklama_gun ~ '"') | quote }} "$f" && continue
+            h="$KOK$f"
+            zaten=0
+            for y in $(ls -1 "$h"-* 2>/dev/null | sort -r); do
+                [ -f "$y" ] || continue
+                if cmp -s "$f" "$y"; then zaten=1; break; fi
+            done
+            [ "$zaten" -eq 1 ] && continue
+            # yedek alinamazsa (/var/backup dolu, salt okunur...) manifeste satir yazilmaz, SORUN ve KOSUM_SONU_YEDEK_ALINAMADI isareti
+            if mkdir -p "$(dirname "$h")" && chmod 0700 "$KOK" && cp -aL "$f" "$h-kosum-sonu-$DAMGA" && cmp -s "$f" "$h-kosum-sonu-$DAMGA" \
+                && printf '%s  %s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$f" "$h-kosum-sonu-$DAMGA" >> "$MANIFEST"; then
+                DEGISTI=1
+            else
+                echo "SORUN: kosum sonu yedegi alinamadi: $f (hedef $KOK) - degisiklik yapildi, geri alma manifesti _kosum-$DAMGA.txt gecerli"
+                HATA=1
+            fi
+        done
+        [ "$DEGISTI" -eq 1 ] && echo DEGISTI
+        [ "$HATA" -eq 0 ] || echo KOSUM_SONU_YEDEK_ALINAMADI
+      register: yedek_son_sonuc
+      changed_when: "'DEGISTI' in yedek_son_sonuc.stdout"
+      when:
+        - uygulama_modu == 'uygula'
+        - not ansible_check_mode
+        - pcp_yedeklenecek | length > 0
+      tags: [always]
+
+    - name: Yedek - kosum sonu yedegi ALINAMADI (degisiklik yapildi; sonda ozet, is basarisiz gorunur)
+      ansible.builtin.set_fact:
+        yedek_kosum_sonu_sorunu: "kosum sonu yedegi alinamadi ({{ yedek_kok }}) - degisiklik yapildi, geri alma manifesti _kosum-{{ yedek_damga }}.txt gecerli"
+      when: "'KOSUM_SONU_YEDEK_ALINAMADI' in (yedek_son_sonuc.stdout | default(''))"
+      tags: [always]
+
+# Yedek ozeti: yedek alinamadigi icin ATLANAN ya da kosum sonu yedegi alinamayan sunucular burada listelenir ve is
+# basarisiz biter (diger sunucularda kosum tamamlanmistir). Ayni grup, serial 1; gorev yalniz ilk sunucuda,
+# kontrol makinesinde calisir (gather_facts yok, sunucuya baglanilmaz). Atlanan sunucu yedek alani duzeltilince
+# yeniden kosulur.
+- name: Ozet - yedek sorunu olan sunucular
+  hosts: pcp_sunucular
+  gather_facts: false
+  serial: 1
+  tasks:
+    - name: Ozet - yedek alinamadigi icin atlanan ya da kosum sonu yedegi alinamayan sunucular
+      vars:
+        _yedek_sorunlu: >-
+          {% set l = [] %}{% for h in ansible_play_hosts_all %}{% for k in ['yedek_atlandi', 'yedek_kosum_sonu_sorunu'] %}{%
+          if hostvars[h][k] is defined %}{% set _ = l.append(h ~ ': ' ~ hostvars[h][k]) %}{% endif %}{% endfor %}{% endfor %}{{ l }}
+      ansible.builtin.fail:
+        msg: "{{ _yedek_sorunlu }}"
+      when:
+        - inventory_hostname == ansible_play_hosts_all[0]
+        - _yedek_sorunlu | length > 0
+      tags: [always]

@@ -1,0 +1,115 @@
+# playbook-pcp - Sürüm notları
+
+Sürüm: **1.13** - Hazırlayan: Linux sistem destek ekibi
+
+## Bu sürümün özellikleri
+
+- Varsayılan rapor modu; uygulama yalnız `uygulama_modu: uygula` ile. AWX "check" iş tipi rapor verir.
+- PCP, pcp-system-tools ve pcp-zeroconf kurulumu (pcp-zeroconf ayrı adımda; depoda yoksa kurulum sürer).
+- Debian 13 (trixie) desteği: `pcp` ve `pcp-zeroconf` apt ile kurulur (apt paket listesi yalnız kurulacak paket varsa
+  ve 1 saatten eskiyse yenilenir); ayar dosyaları `/etc/default` altındadır. Debian paketi `pmproxy`'yi açılışta
+  başlayacak biçimde bırakır: PCP bu çalıştırmada kurulduysa `pmproxy` kapatılır, `pcp-zeroconf` bu çalıştırmada kurulduysa
+  `pmie` başlatılır (RHEL ile aynı son durum). Ubuntu ve Debian 12 ve öncesi desteklenmez.
+- Süreç başına disk G/Ç görünürlüğü ölçülür. Eksikse süreç eklentisine `-A` eklenir. Bunun için `pmcd`
+  yalnız yerel bağlantı kabul etmeli, `pmproxy` çalışmamalı ve kayıtta `smaps`, `maps` ya da `environ`
+  bulunmamalıdır.
+- Tek sahip ilkesi: saklama gününü bir rol playbook'u, merkezi PCP toplama betiği (pcp-merkezi) ya da
+  log-saklama yönetiyorsa dokunulmaz.
+  Kayıt yapılandırmasına varsayılan olarak dokunulmaz. Disk koruması log-saklama'nındır.
+- Saklama günü `/var/log/pcp` alanına sığdırılır (hedef 32, en az 8 gün). 32 gün: aylık periyodik yükler
+  bir önceki ayın aynı günüyle karşılaştırılabilsin (ay 28-31 gün + 1 gün pay).
+- Güvenlik: süreç eklentisine `-A` varsayılan olarak eklenmez (`-A` ile root olmayan yerel hesaplar tüm süreçlerin ortam
+  değişkenlerini okuyabilir); süreç G/Ç görünürlüğü eksikliği BİLGİ olarak raporlanır.
+- Yeni kurulum boş alan kapısı: PCP kurulu değilse ya da PCP kurulu olup `pcp-zeroconf` kurulacaksa (süreç kaydı
+  açılır, günlük arşiv büyür) ve `/var/log/pcp` bölümünde 1536 MB boş alan yoksa ya da kurulum sonrası bölüm %80'i
+  aşacaksa kurulum yapılmaz (SORUN); bölüm doldurulmaz. Ek paketler de bu kapıya ve kurulum kararına bağlıdır.
+- Karar değişkenleri (`uygulama_modu`, `*_karari`, `pcp_*`) yalnız ek değişkenle verilir (`-e` ya da AWX şablonunun
+  ek değişkenler alanı); envantere (sunucu ya da grup değişkeni) yazılan değer etkisizdir ve sessizce yok sayılır.
+- Saklama 8 günün altına yalnız test ortamı işaretiyle (`pcp_test_ortami`) iner.
+- Geçiş kapısı: playbook uygulanırken PCP günlük işi hemen çalışmaz (`pmlogger_daily` ve `pmie_daily`
+  servislerine `51-gecis-kapisi.conf`; `/run/pcp-gece-gecis` işareti yalnız yeniden yükleme süresince). Toplu
+  uygulamada aynı anda gece işi ve RHEL 8 ailesinde günlerin birleşmemesi önlenir.
+- Saklama satırı `PMLOGGER_DAILY_PARAMS="-E -x 1 -k N"`: `-E` paket varsayılanıdır. Aynı günün arşivleri
+  birleştirilirken tanımı tutarsız bir metrik (ör. gün ortasında PCP paket güncellemesi) birleştirmeyi durdurmaz,
+  yalnız o metrik o gün için atlanır. Disk okuma/yazma ve süre `-E` olmadan yapılan birleştirmeyle aynıdır.
+- Saklama tavanı gerçek alandan: tavan = min(bölüm x pay, PCP kullanımı + boş alan - bölüm x 0,2); bölüm %80'i geçmez.
+  pcp-zeroconf aynı çalıştırmada kurulduysa (ya da `-A`, hotproc, ek eklenti, tam profil) saklama hesabı ertelenir; 3 tam gün
+  sonra yeniden çalıştırma. Gece yayma aralığı 0 kabul edilmez (gece 30-600, kontrol 5-29 dk); kısa adı `localhost` olan sunucuda
+  kaydırma yazılmaz. İlk kez oluşturulan drop-in'ler geri alma manifestine `OLUSTURULDU` satırıyla girer.
+- Açılış koruması: günlük gece işlerinin zamanlayıcısına `Persistent=false` yazılır. Sunucu gece işi saatinde kapalıysa iş
+  açılışta hemen çalışmaz, ertesi gece kendi saatinde iki günü birleştirir (toplu açılışta tüm sunucular aynı anda
+  birleştirme yapmaz).
+- Kayıt süreci süre denetimi: PCP kayıt süreci (pmlogger) son yeniden yüklemeden 24 saat 10 dakika sonra kapanır ve
+  hemen yeniden başlar. Gece işi saati kaydırılınca bu süre yeni gece işinden önce dolabilir; o gece aynı gün güncellenen
+  sunucuların çoğunda kayıt süreci aynı dakikada yeniden başlardı. Uygulama anında süre bir sonraki gece işinden önce
+  dolacaksa kayıt sürecine `SIGUSR2` gönderilir (gece işinin her gece yaptığı yeniden yüklemenin aynısı: aynı süreç,
+  süre sıfırlanır, yeni arşiv parçası açılır, örnek boşluğu yaklaşık 0,25 sn). Gece saatlerinde (00:00-05:59)
+  gönderilmez, uyarı yazılır; 06:00'dan sonra tekrar çalıştırma düzeltir. O gece arşiv parçaları sunucunun kendi gece işi
+  saatinde birleştirilir.
+- Kayıt grubu kapatma güvenli yazım: yedek alınamazsa dosyaya dokunulmaz, dosya geçici kopya + `mv` ile tek adımda
+  değişir, yarıda kesilen çalıştırmada geçici dosya silinir; "kapatildi" yalnız dosyada `force exclude` görülünce yazılır.
+- Ölçüm eklentisi kapatma: `dm` (her device-mapper/multipath aygıtına periyodik sorgu), `kvm`, `nfsclient`,
+  `openmetrics` ve `opentelemetry` kaldırılır; pcp-zeroconf güncellemesinde geri kurulmamaları için `pmcd.conf`'a işaret
+  satırı yazılır.
+- Kesmeleri kapatan kayıt grupları (`memory/zoneinfo`, `memory/buddyinfo`) kayda alınmaz; ölçüm eklentisi kapatma
+  sıfır sunucuda eklenti kurulumunun bitmesini bekler.
+- Yükü ölçülmemiş adımlar varsayılan kapalı: tam kayıt profili, hotproc, ek ölçüm eklentileri, pmie
+  alarmları.
+- Yedek denetimi ve sunucu atlama: değişiklik öncesi ve çalıştırma sonu yedeğinde kopyanın alındığı, kaynakla aynı olduğu
+  ve geri alma kaydına yazıldığı denetlenir. Yedek alınamazsa (`/var/backup` dolu ya da yazılamaz) o sunucu **atlanır**:
+  yapılandırma dosyalarına dokunulmaz, sonraki sunuculara devam edilir. İşin sonundaki "Ozet - yedek sorunu olan
+  sunucular" adımı atlanan sunucuları listeler ve işi başarısız bitirir; bu sunucuların yedek alanı düzeltilip yalnız
+  onlar yeniden çalıştırılır. Çalıştırma sonu yedeği alınamazsa (değişiklik yapılmıştır, geri alma kaydı geçerlidir) aynı özette
+  listelenir.
+- Yedekler `/var/backup/pcp-onlem/` altında; hiçbir dosya silinmez. Koşumun değiştirdiği dosyanın yeni hali çalıştırma sonunda
+  `<dosya>-kosum-sonu-<damga>` olarak yedeklenir (kayıt `_durum-<damga>.txt`); ikinci çalıştırma değişiklik göstermez. Eski kurulumdan kalan yedek
+  dosyalar ve bekçi bu ağaca taşınır.
+- Doğrulamalar çalıştırması durdurmaz. Denetlenenler: servisler, son 15 dakikada arşiv yazımı, süreç G/Ç
+  görünürlüğü, `-A` varken güvenlik kapıları (pmcd yalnız yerel, pmproxy kapalı, kayıtta smaps/maps/environ
+  yok), kapatılan ölçüm eklentileri (etkin satır, bekleyen kurulum, yeniden kurulum işareti), kapatılan
+  kayıt grupları, saklama alt sınırı, kayıt günlüğü taşması, artık kontrol dosyası, iki bekçinin aynı
+  anda çalışması ve inceleme şablonu dosyası. Sunucudaki `pcp-dogrula.sh` (2.3) aynı eklenti ve kayıt
+  grubu kalemlerini de denetler.
+- Etiketli çalıştırma (`--tags proc`, `hotproc` ya da `pmda` tek başına) artık durmaz; pmcd ve pmlogger yalnız
+  gerçek eklenti kaldırmada yeniden başlar. Saklama günü her çalıştırmada günlük arşiv boyutundan yeniden hesaplanır ve
+  hesap günden güne 1-2 gün oynayabilir. Sunucudaki mevcut değer hesaptan en çok 2 gün küçükse ve en az günün altında
+  değilse dosya yeniden yazılmaz; böylece ikinci çalıştırmada değişiklik 0 olur. Değer daha çok sapmışsa dosya yeni değerle
+  yazılır.
+
+- **Gece işleri yayma:** PCP günlük ve yarım saatlik işleri sunucuya özgü sabit saate yayılır (günlük işler
+  00:10 + 0-120 dk, yarım saatlik işler 0-29 dk; RHEL 8 ailesinde günlük işler 03:10 + 0-120 dk, çünkü bu sürümün
+  kayıt yazılımı arşiv adını UTC saatiyle verir ve daha erken çalışan iş arşivi önceki güne düşürürdü); gece raporu (`pmlogger_daily_report`, her gece tüm gün
+  arşivini `/var/tmp` altına açar) kapatılır; RHEL 8'de ayrı rapor servisi (her gece 02:00) bir koşulla durdurulur. Karar `pcp_gece_karari` (varsayılan uygula; rapor modunda
+  dokunulmaz), yayma aralıkları `pcp_gece_pencere_dk` (120 dk) ve `pcp_kontrol_pencere_dk` (29 dk).
+- **Rapor modu koruması:** rapor modunda ek değişkenle (`-e` / AWX) bir değişiklik kararı verilirse çalıştırma başta
+  durur; rapor modunda hiçbir değişiklik yapılmaz.
+- **Yeniden başlatma doğrulaması:** kayıt servisinin süre sonu yeniden başlatması hata sayılmaz; yalnız son 24
+  saatteki hatalı çıkış SORUN'dur (sunucudaki doğrulama betiği 2.2).
+- **Saklama ölçümü:** gün başına arşiv boyutu yalnız tamamlanmış tam günlerden ölçülür (bugün ve en eski
+  gün sayılmaz; 3 tamamlanmış gün yoksa en az gün yazılır). Yeni doğrulama kalemleri: PCP gece işleri,
+  PCP saklama alana sığıyor.
+
+- Uygulama anında günlük işler bir kez hemen çalışır (zamanlayıcı yeni saate geçerken kaçırılmış sayar);
+  ölçülen: 0,6 saniye işlemci, gece raporu çalışmadı, kayıt yazılımı yeniden başlamadı.
+
+## Sınandığı ortam
+
+AWX 24.6.1, yürütme ortamı AWX EE 24.6.1 (ansible-core 2.15):
+
+- RHEL 9.8 (PCP 6.3.7): rapor modu, ardından uygulama. Uygulamada pcp-zeroconf kurulumu ve `-A` eklenmesi
+  test edildi; arşivde süreç G/Ç değeri olan süreç sayısı süreç işlemci kaydıyla eşitlendi. Tekrar çalıştırmada
+  değişiklik yok.
+- Oracle Linux 8.10 (PCP 5.3.7): sıfır sunucuda rapor modu, önizleme, uygulama (PCP ve pcp-zeroconf kurulumu,
+  eklenti kapatma, kayıt grubu kapatma, `-A`, gece işleri yayma, ayrı gece raporu servisinin durdurulması,
+  saklama 8 gün) ve tekrar çalıştırmada değişiklik yok.
+- RHEL 9.8, 32 çekirdek, 196 GB bellek, Couchbase 7.6.11 (veri süreci 132-136 GB): eklenti kapatma,
+  pcp-zeroconf yeniden kurulumunda eklentilerin geri gelmediği, tekrar çalıştırmada değişiklik olmadığı test edildi.
+  Aynı sunucuda saniyede ~242 000 işlemlik aşırı yük altında 30 dakika PCP açık / 10 dakika PCP kapalı
+  karşılaştırması yapıldı: istek hatası 0, 50 ms ve üzeri gecikme 0, iki dilim ayırt edilemedi; PCP
+  süreçlerinin toplam işlemci kullanımı tek çekirdeğin yüzde 0,6'sı.
+- Yedek denetimi ve sunucu atlama (ansible-core 2.16, doğrudan `ansible-playbook`): RHEL 9.8 x2 ve Oracle Linux 8.10;
+  ilk sunucunun yedek dizini yazılamaz yapıldığında o sunucu atlandı ve dosyası değişmedi, diğer iki sunucu işlendi,
+  iş sonunda özet atlanan sunucuyu listeleyip başarısız bitti; yedek dizini düzeltilince sunucu tamamlandı, sonraki
+  çalıştırmada değişiklik yok.
+- Ayrıca yalıtılmış konteynerde test edildi: tam kayıt profili ve varsayılana dönüş, hotproc, ek ölçüm
+  eklentisi, pmie, sahiplik kapıları, `-A` güvenlik kapıları, eski kurulum izlerinin taşınması.
